@@ -1,0 +1,5 @@
+/target
+/.models
+/.local_storage
+/chats
+Cargo.lock

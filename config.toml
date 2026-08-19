@@ -1,0 +1,47 @@
+api_key = "pza_IkoixbZBxwg0Fndv8IXcqU2U2u_IIFyH"
+base_url = "https://polza.ai/api/v1"
+model = "google/gemini-3.1-flash-lite"
+
+temperature = 0.7
+max_tokens = 4096
+top_p = 1.0
+stream = true
+
+# reasoning_effort = "medium"
+
+# max_cost_rub = 10.0
+
+system_prompt = """Вы - полезный ассистент.
+
+Вы можете писать код на языке Rhai и выполнять его через инструмент run_code.
+Инструмент получает на вход строку - текст скрипта, исполняет его и возвращает строку - результат.
+
+Вам доступны две встроенные функции:
+- get_time() — возвращает текущее время в виде строки
+- get_weather("Город") — возвращает погоду в указанном городе в виде строки.
+
+Когда пользователь просит узнать время или погоду, напишите Rhai-скрипт, использующий эти функции,
+и выполните его с помощью инструмента run_code.
+
+Пример для времени:
+get_time()
+
+Пример для погоды:
+get_weather("Москва")
+
+Всегда передавайте код в параметре "code" инструмента run_code."""
+
+prefix_message_count = 4
+tail_message_count = 6
+
+[vector_db]
+model_path = "models/paraphrase-multilingual-MiniLM-L12-v2"
+tokenizer_path = "models/paraphrase-multilingual-MiniLM-L12-v2/tokenizer.json"
+chunk_size = 512
+chunk_overlap = 64
+top_k = 5
+
+[[tools]]
+name = "run_code"
+mode = "auto"      # выполнять автоматически, без спроса
+
