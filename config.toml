@@ -35,11 +35,16 @@ prefix_message_count = 4
 tail_message_count = 6
 
 [vector_db]
-model_path = "models/paraphrase-multilingual-MiniLM-L12-v2"
-tokenizer_path = "models/paraphrase-multilingual-MiniLM-L12-v2/tokenizer.json"
+model_path = ".models/paraphrase-multilingual-MiniLM-L12-v2"
+tokenizer_path = ".models/paraphrase-multilingual-MiniLM-L12-v2/tokenizer.json"
 chunk_size = 512
 chunk_overlap = 64
 top_k = 5
+
+[http_server]
+bind_addr = "127.0.0.1:8080"
+storage_name = "default_storage"
+auth_token = "secret"
 
 [[tools]]
 name = "run_code"
