@@ -1,13 +1,5 @@
 // src/main.rs
 
-mod config;
-mod engine;
-mod local_storage;
-mod tools;
-
-use crate::config::{build_engine_config, TomlConfig};
-use crate::engine::{ChatEngine, Role};
-use crate::tools::execute_tool;
 use anyhow::Result;
 use clap::Parser;
 use reqwest::Client;
@@ -15,6 +7,10 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::time::Duration;
+
+use nano_harness::config::{build_engine_config, TomlConfig};
+use nano_harness::engine::{ChatEngine, Role};
+use nano_harness::tools::execute_tool;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "CLI чат с Polza AI")]

@@ -6,6 +6,7 @@ use std::path::PathBuf;
 
 use crate::engine::{EngineConfig, ToolExecutionConfig};
 use crate::local_storage::VectorDbConfig;
+use crate::local_storage_http_api::LocalStorageServerConfig;
 
 #[derive(Debug, Deserialize, Default)]
 pub struct TomlConfig {
@@ -27,6 +28,9 @@ pub struct TomlConfig {
 
     // Конфигурация векторной базы данных
     pub vector_db: Option<VectorDbConfig>,
+
+    // Конфигурация HTTP-сервера локального хранилища
+    pub http_server: Option<LocalStorageServerConfig>,
 }
 
 impl TomlConfig {

@@ -50,12 +50,25 @@ pub struct ChunkMeta {
     pub modified: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct SearchResult {
     pub file_path: PathBuf,
     pub chunk_index: u32,
     pub score: f32,
     pub content_fragment: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub enum Entry {
+    File {
+        name: String,
+        path: PathBuf,
+        size: u64,
+    },
+    Dir {
+        name: String,
+        path: PathBuf,
+    },
 }
 
 struct VectorDb {
@@ -315,15 +328,20 @@ impl VectorDb {
             self.entries.retain(|(l, _)| l != &label);
         }
 
-        let chunks = chunk_text(content, self.config.chunk_size, self.config.chunk_overlap);
+        let chunks_with_pos =
+            chunk_text(content, self.config.chunk_size, self.config.chunk_overlap);
+        let chunk_texts: Vec<String> = chunks_with_pos
+            .iter()
+            .map(|(text, _, _)| text.clone())
+            .collect();
         eprintln!(
             "🔄 Индексация файла {} ({} чанков)...",
             file_path.display(),
-            chunks.len()
+            chunk_texts.len()
         );
         let start = std::time::Instant::now();
 
-        let embeddings = self.embed_batch(&chunks)?;
+        let embeddings = self.embed_batch(&chunk_texts)?;
 
         let full_path = self.root.join(file_path);
         let (file_size, modified) = match fs::metadata(&full_path) {
@@ -339,7 +357,11 @@ impl VectorDb {
             Err(_) => (0, 0),
         };
 
-        for (i, (chunk, emb)) in chunks.into_iter().zip(embeddings.into_iter()).enumerate() {
+        for (i, ((chunk_text, start_byte, end_byte), emb)) in chunks_with_pos
+            .into_iter()
+            .zip(embeddings.into_iter())
+            .enumerate()
+        {
             let label = format!("{}#{}", file_path.to_string_lossy(), i);
             let id = self.next_id;
             self.next_id += 1;
@@ -350,9 +372,9 @@ impl VectorDb {
                 ChunkMeta {
                     file_path: file_path.to_path_buf(),
                     chunk_index: i as u32,
-                    start_byte: 0,
-                    end_byte: 0,
-                    content: chunk,
+                    start_byte,
+                    end_byte,
+                    content: chunk_text,
                     embedding: emb,
                     file_size,
                     modified,
@@ -429,31 +451,58 @@ impl VectorDb {
     }
 }
 
-fn chunk_text(text: &str, chunk_size: usize, overlap: usize) -> Vec<String> {
-    let words: Vec<&str> = text.split_whitespace().collect();
+fn chunk_text(text: &str, chunk_size: usize, overlap: usize) -> Vec<(String, u64, u64)> {
+    // Получаем слова и их байтовые позиции за один проход
+    let mut words: Vec<&str> = Vec::new();
+    let mut positions: Vec<u64> = Vec::new();
+
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    let len = bytes.len();
+
+    while i < len {
+        while i < len && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= len {
+            break;
+        }
+        let start = i;
+        while i < len && !bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let end = i;
+        let word = &text[start..end];
+        words.push(word);
+        positions.push(start as u64);
+    }
+
     let mut chunks = Vec::new();
-    let mut start = 0;
+    let mut start_idx = 0;
 
-    while start < words.len() {
-        let mut end = start;
+    while start_idx < words.len() {
+        let mut end_idx = start_idx;
         let mut current_len = 0;
-        while end < words.len() && current_len < chunk_size {
-            current_len += words[end].len() + 1;
-            end += 1;
+        while end_idx < words.len() && current_len < chunk_size {
+            current_len += words[end_idx].len() + 1; // +1 за пробел
+            end_idx += 1;
         }
-        if end == start {
-            end = start + 1;
+        if end_idx == start_idx {
+            end_idx = start_idx + 1;
         }
 
-        let chunk = words[start..end].join(" ");
-        chunks.push(chunk);
+        let chunk = words[start_idx..end_idx].join(" ");
+        let start_byte = positions[start_idx];
+        let end_byte = positions[end_idx - 1] + words[end_idx - 1].len() as u64;
 
-        if end >= words.len() {
+        chunks.push((chunk, start_byte, end_byte));
+
+        if end_idx >= words.len() {
             break;
         }
 
         let overlap_words = (overlap / 5).max(1);
-        start = end.saturating_sub(overlap_words);
+        start_idx = end_idx.saturating_sub(overlap_words);
     }
 
     chunks
@@ -481,19 +530,6 @@ fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) -> io::Result<()> {
 pub struct LocalStorage {
     root: PathBuf,
     vector_db: VectorDb,
-}
-
-#[derive(Debug, Clone)]
-pub enum Entry {
-    File {
-        name: String,
-        path: PathBuf,
-        size: u64,
-    },
-    Dir {
-        name: String,
-        path: PathBuf,
-    },
 }
 
 impl LocalStorage {
