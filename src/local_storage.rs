@@ -452,7 +452,6 @@ impl VectorDb {
 }
 
 fn chunk_text(text: &str, chunk_size: usize, overlap: usize) -> Vec<(String, u64, u64)> {
-    // Получаем слова и их байтовые позиции за один проход
     let mut words: Vec<&str> = Vec::new();
     let mut positions: Vec<u64> = Vec::new();
 
@@ -484,7 +483,7 @@ fn chunk_text(text: &str, chunk_size: usize, overlap: usize) -> Vec<(String, u64
         let mut end_idx = start_idx;
         let mut current_len = 0;
         while end_idx < words.len() && current_len < chunk_size {
-            current_len += words[end_idx].len() + 1; // +1 за пробел
+            current_len += words[end_idx].len() + 1;
             end_idx += 1;
         }
         if end_idx == start_idx {

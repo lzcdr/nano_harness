@@ -229,7 +229,6 @@ async fn write_summary(
     }
 }
 
-/// Запускает HTTP-сервер для работы с локальным хранилищем.
 pub async fn run_server(
     config: LocalStorageServerConfig,
     vector_db_config: VectorDbConfig,
