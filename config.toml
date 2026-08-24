@@ -41,12 +41,38 @@ chunk_size = 512
 chunk_overlap = 64
 top_k = 5
 
-[http_server]
+[local_storage_http_server]
 bind_addr = "127.0.0.1:8080"
 storage_name = "default_storage"
 auth_token = "secret"
 
+[[agents]]
+name = "assistant"
+bind_addr = "127.0.0.1:8081"
+auth_token = "agent_token_1"
+timeout_sec = 120
+max_iterations = 1
+tools = ["run_code", "local_storage"]
+system_prompt = """Ты помощник для работы с файлами.
+
+Ты можешь писать код на языке Rhai и выполнять его через инструмент run_code.
+Инструмент получает на вход строку - текст скрипта, исполняет его и возвращает строку - результат.
+
+Всегда передавай код в параметре "code" инструмента run_code."""
+api_key = "pza_IkoixbZBxwg0Fndv8IXcqU2U2u_IIFyH"
+base_url = "https://polza.ai/api/v1"
+model = "google/gemini-3.1-flash-lite"
+temperature = 0.7
+max_tokens = 4096
+top_p = 1.0
+stream = true
+prefix_message_count = 4
+tail_message_count = 6
+
 [[tools]]
 name = "run_code"
-mode = "auto"      # выполнять автоматически, без спроса
+mode = "auto"
 
+[[tools]]
+name = "local_storage"
+mode = "auto"

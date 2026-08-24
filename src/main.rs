@@ -84,10 +84,8 @@ fn write_log(file: &mut fs::File, role: &str, content: &str) -> Result<()> {
 async fn main() -> Result<()> {
     let args = Args::parse();
 
-    // 1. Загружаем TOML конфиг
     let toml_config = TomlConfig::load(&args.config_path)?;
 
-    // 2. Собираем EngineConfig
     let engine_config = build_engine_config(
         args.api_key,
         args.base_url,
@@ -102,15 +100,12 @@ async fn main() -> Result<()> {
         &toml_config,
     )?;
 
-    // 3. Создаем HTTP-клиент
     let client = Client::builder()
         .timeout(Duration::from_secs(args.timeout_sec))
         .build()?;
 
-    // 4. Создаем движок
-    let mut engine = ChatEngine::new(engine_config.clone(), client);
+    let mut engine = ChatEngine::new(engine_config.clone(), client.clone());
 
-    // 5. Устанавливаем callbacks для стриминга
     engine.on_token = Some(Box::new(|token| {
         print!("{}", token);
         let _ = io::stdout().flush();
@@ -121,17 +116,14 @@ async fn main() -> Result<()> {
         let _ = io::stdout().flush();
     }));
 
-    // 6. Добавляем системный промпт
     let system_prompt = args
         .system_prompt
         .or(toml_config.system_prompt)
         .unwrap_or_else(|| "Ты полезный ассистент. Отвечай кратко и по делу.".to_string());
     engine.add_message(Role::System, system_prompt.clone());
 
-    // 7. Создаём папку для логов
     fs::create_dir_all("chats")?;
 
-    // 8. Формируем имя файла лога
     let timestamp = chrono::Local::now().format("%Y-%m-%d_%H-%M-%S");
     let safe_model = sanitize_model_name(&engine_config.model);
     let log_path = format!("chats/{}_{}.txt", timestamp, safe_model);
@@ -143,10 +135,8 @@ async fn main() -> Result<()> {
 
     println!("📝 Лог чата: {}", log_path);
 
-    // 9. Логируем системный промпт
     write_log(&mut log_file, "system", &system_prompt)?;
 
-    // 10. Выводим информацию о запуске
     println!("🤖 Чат запущен");
     println!("   Модель: {}", engine_config.model);
     println!(
@@ -177,7 +167,18 @@ async fn main() -> Result<()> {
     println!("   Команды: /clear, /metrics, /system <текст>, /fix, /exit");
     println!();
 
-    // 11. Основной цикл
+    // Получаем параметры HTTP API хранилища из конфига
+    let storage_http_config = toml_config
+        .local_storage_http_server
+        .clone()
+        .unwrap_or_else(
+            || nano_harness::local_storage_http_api::LocalStorageServerConfig {
+                bind_addr: "127.0.0.1:8080".to_string(),
+                storage_name: "default_storage".to_string(),
+                auth_token: String::new(),
+            },
+        );
+
     let mut stdin = tokio::io::BufReader::new(tokio::io::stdin());
     let mut input = String::new();
 
@@ -250,7 +251,6 @@ async fn main() -> Result<()> {
         engine.add_message(Role::User, user_input.to_string());
         write_log(&mut log_file, "user", user_input)?;
 
-        // Отправляем запрос с обработкой ошибок
         let response = match engine.send().await {
             Ok(resp) => resp,
             Err(e) => {
@@ -261,9 +261,8 @@ async fn main() -> Result<()> {
             }
         };
 
-        println!(); // Перенос строки после стриминга
+        println!();
 
-        // Логируем ответ ассистента
         if !response.content.is_empty() {
             write_log(&mut log_file, "assistant", &response.content)?;
         }
@@ -271,12 +270,10 @@ async fn main() -> Result<()> {
             write_log(&mut log_file, "reasoning", &response.reasoning)?;
         }
 
-        // Показываем reasoning, если он есть
         if !response.reasoning.is_empty() {
             println!("\n\x1b[90m🧠 Reasoning:\n{}\x1b[0m\n", response.reasoning);
         }
 
-        // Обрабатываем tool calls
         if let Some(tool_calls) = response.tool_calls {
             println!("\n⚠️ Модель запросила инструменты:");
             for tc in &tool_calls {
@@ -304,7 +301,14 @@ async fn main() -> Result<()> {
                 }
 
                 if mode == "auto" {
-                    let result = execute_tool(name, &tc.function.arguments);
+                    let result = execute_tool(
+                        name,
+                        &tc.function.arguments,
+                        Some(&client),
+                        &storage_http_config.bind_addr,
+                        &storage_http_config.auth_token,
+                    )
+                    .await;
                     println!("✅ Автовыполнение: {}", result);
                     write_log(&mut log_file, "tool", &format!("{} -> {}", name, result))?;
                     engine.add_tool_result(tc.id.clone(), result);
@@ -315,7 +319,14 @@ async fn main() -> Result<()> {
                     let mut answer = String::new();
                     tokio::io::AsyncBufReadExt::read_line(&mut stdin, &mut answer).await?;
                     if answer.trim().eq_ignore_ascii_case("y") {
-                        let result = execute_tool(name, &tc.function.arguments);
+                        let result = execute_tool(
+                            name,
+                            &tc.function.arguments,
+                            Some(&client),
+                            &storage_http_config.bind_addr,
+                            &storage_http_config.auth_token,
+                        )
+                        .await;
                         println!("✅ Выполнено: {}", result);
                         write_log(&mut log_file, "tool", &format!("{} -> {}", name, result))?;
                         engine.add_tool_result(tc.id.clone(), result);
@@ -326,7 +337,6 @@ async fn main() -> Result<()> {
                 }
             }
 
-            // Повторный запрос с результатами инструментов
             println!("\nЗапрашиваю финальный ответ...");
             let final_response = match engine.send().await {
                 Ok(resp) => resp,
@@ -350,7 +360,6 @@ async fn main() -> Result<()> {
             }
         }
 
-        // Показываем метрики после каждого запроса
         println!(
             "\n\x1b[90m[Токены: {} prompt + {} completion | 💰 {:.6} RUB]\x1b[0m\n",
             engine.metrics.total_prompt_tokens,

@@ -1,3 +1,5 @@
+pub mod agent_core;
+pub mod agent_http_api;
 pub mod config;
 pub mod engine;
 pub mod local_storage;

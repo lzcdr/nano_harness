@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::path::PathBuf;
 
+use crate::agent_core::AgentConfig;
 use crate::engine::{EngineConfig, ToolExecutionConfig};
 use crate::local_storage::VectorDbConfig;
 use crate::local_storage_http_api::LocalStorageServerConfig;
@@ -26,11 +27,12 @@ pub struct TomlConfig {
     pub tail_message_count: Option<usize>,
     pub system_prompt: Option<String>,
 
-    // Конфигурация векторной базы данных
     pub vector_db: Option<VectorDbConfig>,
 
-    // Конфигурация HTTP-сервера локального хранилища
-    pub http_server: Option<LocalStorageServerConfig>,
+    pub local_storage_http_server: Option<LocalStorageServerConfig>,
+
+    #[serde(default)]
+    pub agents: Vec<AgentConfig>,
 }
 
 impl TomlConfig {
