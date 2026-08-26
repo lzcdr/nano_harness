@@ -1,5 +1,8 @@
+// src/tools.rs
+
 use crate::engine::{FunctionDefinition, ToolDefinition};
-use reqwest::Client;
+use reqwest::blocking::Client;
+use reqwest::Method;
 use rhai::{Dynamic, Engine};
 use serde_json::json;
 
@@ -10,9 +13,12 @@ pub fn available_tools() -> Vec<ToolDefinition> {
             function: FunctionDefinition {
                 name: "run_code".to_string(),
                 description: "Выполняет код на языке Rhai и возвращает результат. \
-                              В коде доступны функции: get_time() и get_weather(city). \
-                              Код должен быть корректным выражением Rhai. \
-                              Код должен возвращать строку."
+                              В коде доступны функции: get_time() и get_weather(city), \
+                              а также функции хранилища: storage_read_file, storage_write_file, \
+                              storage_delete_file, storage_create_dir, storage_list_dir, \
+                              storage_walk, storage_search_by_name, storage_search_similar, \
+                              storage_read_about, storage_write_about, storage_read_summary, \
+                              storage_write_summary."
                     .to_string(),
                 parameters: json!({
                     "type": "object",
@@ -59,7 +65,7 @@ pub fn available_tools() -> Vec<ToolDefinition> {
 pub async fn execute_tool(
     name: &str,
     args: &str,
-    http_client: Option<&Client>,
+    http_client: Option<&reqwest::Client>,
     storage_base_url: &str,
     storage_auth_token: &str,
 ) -> String {
@@ -67,8 +73,19 @@ pub async fn execute_tool(
         "run_code" => {
             let parsed: serde_json::Value =
                 serde_json::from_str(args).unwrap_or(json!({"code": ""}));
-            let code = parsed.get("code").and_then(|v| v.as_str()).unwrap_or("");
-            run_rhai_code(code)
+            let code = parsed
+                .get("code")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+
+            let base_url = storage_base_url.to_string();
+            let token = storage_auth_token.to_string();
+            match tokio::task::spawn_blocking(move || run_rhai_code(&code, &base_url, &token)).await
+            {
+                Ok(result) => result,
+                Err(e) => format!("Ошибка выполнения Rhai-кода: {}", e),
+            }
         }
         "local_storage" => {
             if let Some(client) = http_client {
@@ -81,8 +98,199 @@ pub async fn execute_tool(
     }
 }
 
-async fn execute_local_storage_tool(
+fn run_rhai_code(code: &str, storage_base_url: &str, storage_auth_token: &str) -> String {
+    let mut engine = Engine::new();
+    engine.set_max_operations(10_000);
+    engine.set_max_call_levels(32);
+    engine.set_max_string_size(1024 * 10);
+
+    engine.register_fn("get_time", || -> String {
+        chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
+    });
+    engine.register_fn("get_weather", |city: String| -> String {
+        format!("Погода в городе {}: солнечно, +22°C (заглушка)", city)
+    });
+
+    register_storage_functions(&mut engine, storage_base_url, storage_auth_token);
+
+    match engine.eval::<Dynamic>(code) {
+        Ok(result) => result.to_string(),
+        Err(e) => format!("Ошибка выполнения Rhai-кода: {}", e),
+    }
+}
+
+fn storage_request(
     client: &Client,
+    method: Method,
+    url: String,
+    token: &str,
+    query: Vec<(&str, String)>,
+    body: Option<String>,
+) -> String {
+    let mut req = client
+        .request(method, &url)
+        .header("Authorization", format!("Bearer {}", token));
+    if !query.is_empty() {
+        req = req.query(&query);
+    }
+    if let Some(b) = body {
+        req = req.body(b);
+    }
+    match req.send() {
+        Ok(resp) if resp.status().is_success() => {
+            // Для POST/DELETE обычно возвращается пустое тело, поэтому возвращаем "OK" если тело пустое.
+            // Для GET возвращаем текст.
+            let text = resp.text().unwrap_or_default();
+            if text.is_empty() {
+                "OK".to_string()
+            } else {
+                text
+            }
+        }
+        Ok(resp) => format!(
+            "HTTP ошибка {}: {}",
+            resp.status(),
+            resp.text().unwrap_or_default()
+        ),
+        Err(e) => format!("Ошибка запроса: {}", e),
+    }
+}
+
+macro_rules! register_storage_fn {
+    ($engine:expr, $client:expr, $base:expr, $token:expr,
+     $name:expr, $method:expr, $path:expr,
+     $($arg:ident : $ty:ty => $q:expr),* $(,)?) => {
+        {
+            let c = $client.clone();
+            let b = $base.clone();
+            let t = $token.clone();
+            $engine.register_fn($name, move |$($arg: $ty),*| -> String {
+                let mut query = Vec::new();
+                $( query.push($q); )*
+                storage_request(&c, $method, format!("{}{}", b.trim_end_matches('/'), $path), &t, query, None)
+            });
+        }
+    };
+}
+
+pub fn register_storage_functions(engine: &mut Engine, base_url: &str, auth_token: &str) {
+    let base = if base_url.starts_with("http://") || base_url.starts_with("https://") {
+        base_url.to_string()
+    } else {
+        format!("http://{}", base_url)
+    };
+    let token = auth_token.to_string();
+    let client = Client::new();
+
+    // GET /files
+    register_storage_fn!(engine, client, base, token,
+        "storage_read_file", Method::GET, "/files",
+        path: String => ("path", path));
+
+    // POST /files (с телом)
+    {
+        let c = client.clone();
+        let b = base.clone();
+        let t = token.clone();
+        engine.register_fn(
+            "storage_write_file",
+            move |path: String, content: String| -> String {
+                storage_request(
+                    &c,
+                    Method::POST,
+                    format!("{}/files", b.trim_end_matches('/')),
+                    &t,
+                    vec![("path", path)],
+                    Some(content),
+                )
+            },
+        );
+    }
+
+    // DELETE /files
+    register_storage_fn!(engine, client, base, token,
+        "storage_delete_file", Method::DELETE, "/files",
+        path: String => ("path", path));
+
+    // POST /dirs
+    register_storage_fn!(engine, client, base, token,
+        "storage_create_dir", Method::POST, "/dirs",
+        path: String => ("path", path));
+
+    // GET /list
+    register_storage_fn!(engine, client, base, token,
+        "storage_list_dir", Method::GET, "/list",
+        path: String => ("path", path));
+
+    // GET /walk
+    register_storage_fn!(engine, client, base, token,
+        "storage_walk", Method::GET, "/walk",
+        path: String => ("path", path));
+
+    // GET /search_name
+    register_storage_fn!(engine, client, base, token,
+        "storage_search_by_name", Method::GET, "/search_name",
+        pattern: String => ("pattern", pattern));
+
+    // GET /search
+    register_storage_fn!(engine, client, base, token,
+        "storage_search_similar", Method::GET, "/search",
+        query: String => ("query", query),
+        top_k: i64 => ("top_k", top_k.to_string()));
+
+    // GET /about
+    register_storage_fn!(engine, client, base, token,
+        "storage_read_about", Method::GET, "/about",
+        path: String => ("path", path));
+
+    // POST /about
+    {
+        let c = client.clone();
+        let b = base.clone();
+        let t = token.clone();
+        engine.register_fn(
+            "storage_write_about",
+            move |path: String, content: String| -> String {
+                storage_request(
+                    &c,
+                    Method::POST,
+                    format!("{}/about", b.trim_end_matches('/')),
+                    &t,
+                    vec![("path", path)],
+                    Some(content),
+                )
+            },
+        );
+    }
+
+    // GET /summary
+    register_storage_fn!(engine, client, base, token,
+        "storage_read_summary", Method::GET, "/summary",
+        path: String => ("path", path));
+
+    // POST /summary
+    {
+        let c = client.clone();
+        let b = base.clone();
+        let t = token.clone();
+        engine.register_fn(
+            "storage_write_summary",
+            move |path: String, content: String| -> String {
+                storage_request(
+                    &c,
+                    Method::POST,
+                    format!("{}/summary", b.trim_end_matches('/')),
+                    &t,
+                    vec![("path", path)],
+                    Some(content),
+                )
+            },
+        );
+    }
+}
+
+async fn execute_local_storage_tool(
+    client: &reqwest::Client,
     base_url: &str,
     auth_token: &str,
     args: &str,
@@ -123,7 +331,6 @@ async fn execute_local_storage_tool(
             .header("Authorization", format!("Bearer {}", auth_token)),
     };
 
-    // Добавляем query-параметры
     let mut query_params = Vec::new();
     match action {
         "read_file" | "write_file" | "delete_file" | "create_dir" | "walk" => {
@@ -151,7 +358,6 @@ async fn execute_local_storage_tool(
         request_builder = request_builder.query(&query_params);
     }
 
-    // Тело для записей
     if matches!(action, "write_file" | "write_about" | "write_summary") {
         request_builder = request_builder.body(content.to_string());
     }
@@ -184,26 +390,5 @@ fn endpoint_for_action(action: &str) -> &'static str {
         "read_about" | "write_about" => "/about",
         "read_summary" | "write_summary" => "/summary",
         _ => "/",
-    }
-}
-
-fn run_rhai_code(code: &str) -> String {
-    let mut engine = Engine::new();
-
-    engine.set_max_operations(10_000);
-    engine.set_max_call_levels(32);
-    engine.set_max_string_size(1024 * 10);
-
-    engine.register_fn("get_time", || -> String {
-        chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
-    });
-
-    engine.register_fn("get_weather", |city: String| -> String {
-        format!("Погода в городе {}: солнечно, +22°C (заглушка)", city)
-    });
-
-    match engine.eval::<Dynamic>(code) {
-        Ok(result) => result.to_string(),
-        Err(e) => format!("Ошибка выполнения Rhai-кода: {}", e),
     }
 }
