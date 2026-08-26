@@ -20,6 +20,20 @@ system_prompt = """Вы - полезный ассистент.
 - get_time() — возвращает текущее время в виде строки
 - get_weather("Город") — возвращает погоду в указанном городе в виде строки.
 
+Также внутри Rhai-кода можно работать с локальным хранилищем:
+- storage_read_file(path) — прочитать файл
+- storage_write_file(path, content) — записать файл
+- storage_delete_file(path) — удалить файл
+- storage_create_dir(path) — создать директорию
+- storage_list_dir(path) — список файлов и папок в директории
+- storage_walk(path) — рекурсивный обход директории
+- storage_search_by_name(pattern) — поиск файлов по имени
+- storage_search_similar(query, top_k) — поиск похожих файлов
+- storage_read_about(path) — прочитать .about директории
+- storage_write_about(path, content) — записать .about директории
+- storage_read_summary(path) — прочитать .summary директории
+- storage_write_summary(path, content) — записать .summary директории
+
 Когда пользователь просит узнать время или погоду, напишите Rhai-скрипт, использующий эти функции,
 и выполните его с помощью инструмента run_code.
 
@@ -28,6 +42,12 @@ get_time()
 
 Пример для погоды:
 get_weather("Москва")
+
+Пример чтения файла:
+storage_read_file("hello.txt")
+
+Пример записи файла:
+storage_write_file("hello.txt", "Привет")
 
 Всегда передавайте код в параметре "code" инструмента run_code."""
 
@@ -57,6 +77,26 @@ system_prompt = """Ты помощник для работы с файлами.
 
 Ты можешь писать код на языке Rhai и выполнять его через инструмент run_code.
 Инструмент получает на вход строку - текст скрипта, исполняет его и возвращает строку - результат.
+
+Также внутри Rhai-кода можно работать с локальным хранилищем:
+- storage_read_file(path) — прочитать файл
+- storage_write_file(path, content) — записать файл
+- storage_delete_file(path) — удалить файл
+- storage_create_dir(path) — создать директорию
+- storage_list_dir(path) — список файлов и папок в директории
+- storage_walk(path) — рекурсивный обход директории
+- storage_search_by_name(pattern) — поиск файлов по имени
+- storage_search_similar(query, top_k) — поиск похожих файлов
+- storage_read_about(path) — прочитать .about директории
+- storage_write_about(path, content) — записать .about директории
+- storage_read_summary(path) — прочитать .summary директории
+- storage_write_summary(path, content) — записать .summary директории
+
+Пример чтения файла:
+storage_read_file("hello.txt")
+
+Пример записи файла:
+storage_write_file("hello.txt", "Привет")
 
 Всегда передавай код в параметре "code" инструмента run_code."""
 api_key = "pza_IkoixbZBxwg0Fndv8IXcqU2U2u_IIFyH"

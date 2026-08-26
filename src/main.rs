@@ -134,7 +134,6 @@ async fn main() -> Result<()> {
         .open(&log_path)?;
 
     println!("📝 Лог чата: {}", log_path);
-
     write_log(&mut log_file, "system", &system_prompt)?;
 
     println!("🤖 Чат запущен");
@@ -278,6 +277,12 @@ async fn main() -> Result<()> {
             println!("\n⚠️ Модель запросила инструменты:");
             for tc in &tool_calls {
                 println!("   - {} ({})", tc.function.name, tc.function.arguments);
+                // Логируем запрос инструмента с аргументами
+                write_log(
+                    &mut log_file,
+                    "tool_request",
+                    &format!("{} ({})", tc.function.name, tc.function.arguments),
+                )?;
             }
 
             let allowed = &engine_config.allowed_tools;
@@ -297,6 +302,11 @@ async fn main() -> Result<()> {
                     .unwrap_or(false)
                 {
                     println!("⛔ Инструмент '{}' не разрешён, пропускаем.", name);
+                    write_log(
+                        &mut log_file,
+                        "tool_denied",
+                        &format!("{} ({})", name, tc.function.arguments),
+                    )?;
                     continue;
                 }
 
@@ -310,7 +320,11 @@ async fn main() -> Result<()> {
                     )
                     .await;
                     println!("✅ Автовыполнение: {}", result);
-                    write_log(&mut log_file, "tool", &format!("{} -> {}", name, result))?;
+                    write_log(
+                        &mut log_file,
+                        "tool_result",
+                        &format!("{} ({}) -> {}", name, tc.function.arguments, result),
+                    )?;
                     engine.add_tool_result(tc.id.clone(), result);
                 } else {
                     println!("❓ Выполнить инструмент '{}'? (y/n)", name);
@@ -328,11 +342,19 @@ async fn main() -> Result<()> {
                         )
                         .await;
                         println!("✅ Выполнено: {}", result);
-                        write_log(&mut log_file, "tool", &format!("{} -> {}", name, result))?;
+                        write_log(
+                            &mut log_file,
+                            "tool_result",
+                            &format!("{} ({}) -> {}", name, tc.function.arguments, result),
+                        )?;
                         engine.add_tool_result(tc.id.clone(), result);
                     } else {
                         println!("Пропущено.");
-                        write_log(&mut log_file, "tool", &format!("{} - пропущено", name))?;
+                        write_log(
+                            &mut log_file,
+                            "tool_skipped",
+                            &format!("{} ({})", name, tc.function.arguments),
+                        )?;
                     }
                 }
             }

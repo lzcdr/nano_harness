@@ -3,6 +3,8 @@
 use anyhow::{Context, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::time::Duration;
 use tokio::time::timeout;
 
@@ -81,17 +83,41 @@ impl AgentContext {
     }
 }
 
+fn write_log(file: &mut fs::File, role: &str, content: &str) -> Result<()> {
+    writeln!(
+        file,
+        "[{}] {}: {}",
+        chrono::Local::now().format("%H:%M:%S"),
+        role,
+        content
+    )?;
+    Ok(())
+}
+
 pub async fn run_agent(
     config: &AgentConfig,
     context: &AgentContext,
     request: AgentRequest,
 ) -> Result<AgentResponse> {
+    // Создаём директорию логов агента
+    let log_dir = format!("chats/{}", config.name);
+    fs::create_dir_all(&log_dir)?;
+    let timestamp = chrono::Local::now().format("%Y-%m-%d_%H-%M-%S");
+    let log_path = format!("{}/{}.txt", log_dir, timestamp);
+    let mut log_file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)?;
+
     let max_iterations = request.max_iterations.unwrap_or(config.max_iterations);
     let allowed_tools = request.tools.unwrap_or_else(|| config.tools.clone());
     let system_prompt = request
         .system_prompt
         .or_else(|| config.system_prompt.clone())
         .unwrap_or_else(|| "Вы - полезный ассистент.".to_string());
+
+    write_log(&mut log_file, "system", &system_prompt)?;
+    write_log(&mut log_file, "task", &request.prompt)?;
 
     eprintln!(
         "🚀 Агент '{}' получил задачу: {}",
@@ -147,11 +173,25 @@ pub async fn run_agent(
             eprintln!("⚠️ Модель запросила инструменты:");
             for tc in &tool_calls {
                 eprintln!("   - {} ({})", tc.function.name, tc.function.arguments);
+                write_log(
+                    &mut log_file,
+                    "tool_request",
+                    &format!("{} ({})", tc.function.name, tc.function.arguments),
+                )?;
             }
 
             for tc in &tool_calls {
                 let result = execute_agent_tool(context, tc).await?;
                 eprintln!("✅ Результат '{}': {}", tc.function.name, result);
+
+                write_log(
+                    &mut log_file,
+                    "tool_result",
+                    &format!(
+                        "{} ({}) -> {}",
+                        tc.function.name, tc.function.arguments, result
+                    ),
+                )?;
 
                 tool_calls_log.push(ToolCallLogEntry {
                     name: tc.function.name.clone(),
@@ -177,6 +217,21 @@ pub async fn run_agent(
     };
 
     eprintln!("🎯 Финальный ответ агента: {}", final_response.content);
+    write_log(&mut log_file, "assistant", &final_response.content)?;
+    if !final_response.reasoning.is_empty() {
+        write_log(&mut log_file, "reasoning", &final_response.reasoning)?;
+    }
+    write_log(
+        &mut log_file,
+        "metrics",
+        &format!(
+            "Prompt: {}, Completion: {}, Cost: {:.6} RUB, Calls: {}",
+            metrics.prompt_tokens,
+            metrics.completion_tokens,
+            metrics.cost_rub,
+            metrics.api_calls_count
+        ),
+    )?;
 
     Ok(AgentResponse {
         status: "completed".to_string(),
@@ -195,7 +250,6 @@ pub async fn run_agent(
 async fn execute_agent_tool(context: &AgentContext, tool_call: &ToolCall) -> Result<String> {
     match tool_call.function.name.as_str() {
         "run_code" => {
-            // Извлекаем код из JSON-аргумента
             let parsed: serde_json::Value = serde_json::from_str(&tool_call.function.arguments)
                 .unwrap_or(serde_json::json!({"code": ""}));
             let code = parsed
@@ -206,7 +260,6 @@ async fn execute_agent_tool(context: &AgentContext, tool_call: &ToolCall) -> Res
 
             let storage_base_url = context.storage_base_url.clone();
             let storage_auth_token = context.storage_auth_token.clone();
-            // Выполняем Rhai в отдельном блокирующем потоке
             let result = tokio::task::spawn_blocking(move || {
                 run_code_with_storage(storage_base_url, storage_auth_token, &code)
             })
@@ -229,24 +282,11 @@ async fn execute_agent_tool(context: &AgentContext, tool_call: &ToolCall) -> Res
     }
 }
 
-/// Синхронная функция выполнения Rhai-кода с функциями доступа к хранилищу через HTTP API.
-/// Вызывается в отдельном потоке через `spawn_blocking`.
 fn run_code_with_storage(
     storage_base_url: String,
     storage_auth_token: String,
     code: &str,
 ) -> Result<String> {
-    // Нормализуем URL
-    let base_url =
-        if storage_base_url.starts_with("http://") || storage_base_url.starts_with("https://") {
-            storage_base_url
-        } else {
-            format!("http://{}", storage_base_url)
-        };
-
-    // Создаём блокирующий HTTP-клиент
-    let blocking_client = reqwest::blocking::Client::new();
-
     let mut engine = rhai::Engine::new();
     engine.set_max_operations(10_000);
     engine.set_max_call_levels(32);
@@ -259,31 +299,7 @@ fn run_code_with_storage(
         format!("Погода в городе {}: солнечно, +22°C (заглушка)", city)
     });
 
-    // Регистрируем функции для работы с хранилищем через HTTP API
-    {
-        let client = blocking_client.clone();
-        let base = base_url.clone();
-        let token = storage_auth_token.clone();
-        engine.register_fn("storage_read_file", move |path: String| -> String {
-            let url = format!("{}/files", base.trim_end_matches('/'));
-            match client
-                .get(&url)
-                .header("Authorization", format!("Bearer {}", token))
-                .query(&[("path", &path)])
-                .send()
-            {
-                Ok(resp) if resp.status().is_success() => resp.text().unwrap_or_default(),
-                Ok(resp) => format!(
-                    "HTTP ошибка {}: {}",
-                    resp.status(),
-                    resp.text().unwrap_or_default()
-                ),
-                Err(e) => format!("Ошибка запроса: {}", e),
-            }
-        });
-    }
-
-    // При необходимости добавьте другие функции хранилища (storage_write_file, storage_list_dir и т.д.)
+    crate::tools::register_storage_functions(&mut engine, &storage_base_url, &storage_auth_token);
 
     match engine.eval::<rhai::Dynamic>(code) {
         Ok(result) => Ok(result.to_string()),
