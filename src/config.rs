@@ -27,8 +27,10 @@ pub struct TomlConfig {
     pub tail_message_count: Option<usize>,
     pub system_prompt: Option<String>,
 
-    pub vector_db: Option<VectorDbConfig>,
+    // Глобальный таймаут Rhai для CLI (чата), секунды
+    pub rhai_timeout_sec: Option<u64>,
 
+    pub vector_db: Option<VectorDbConfig>,
     pub local_storage_http_server: Option<LocalStorageServerConfig>,
 
     #[serde(default)]

@@ -5,6 +5,9 @@ use reqwest::blocking::Client;
 use reqwest::Method;
 use rhai::{Dynamic, Engine};
 use serde_json::json;
+use std::cell::RefCell;
+use std::rc::Rc;
+use std::time::Duration;
 
 pub fn available_tools() -> Vec<ToolDefinition> {
     vec![
@@ -62,12 +65,22 @@ pub fn available_tools() -> Vec<ToolDefinition> {
     ]
 }
 
+pub fn register_basic_functions(engine: &mut Engine) {
+    engine.register_fn("get_time", || -> String {
+        chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
+    });
+    engine.register_fn("get_weather", |city: String| -> String {
+        format!("Погода в городе {}: солнечно, +22°C (заглушка)", city)
+    });
+}
+
 pub async fn execute_tool(
     name: &str,
     args: &str,
     http_client: Option<&reqwest::Client>,
     storage_base_url: &str,
     storage_auth_token: &str,
+    rhai_timeout_sec: u64,
 ) -> String {
     match name {
         "run_code" => {
@@ -81,10 +94,17 @@ pub async fn execute_tool(
 
             let base_url = storage_base_url.to_string();
             let token = storage_auth_token.to_string();
-            match tokio::task::spawn_blocking(move || run_rhai_code(&code, &base_url, &token)).await
+            let timeout_duration = Duration::from_secs(rhai_timeout_sec);
+
+            match tokio::time::timeout(
+                timeout_duration,
+                tokio::task::spawn_blocking(move || run_rhai_code(&code, &base_url, &token)),
+            )
+            .await
             {
-                Ok(result) => result,
-                Err(e) => format!("Ошибка выполнения Rhai-кода: {}", e),
+                Ok(Ok(result)) => result,
+                Ok(Err(e)) => format!("Ошибка выполнения Rhai-кода: {}", e),
+                Err(_) => "Ошибка: превышено время выполнения Rhai-кода".to_string(),
             }
         }
         "local_storage" => {
@@ -104,17 +124,23 @@ fn run_rhai_code(code: &str, storage_base_url: &str, storage_auth_token: &str) -
     engine.set_max_call_levels(32);
     engine.set_max_string_size(1024 * 10);
 
-    engine.register_fn("get_time", || -> String {
-        chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
-    });
-    engine.register_fn("get_weather", |city: String| -> String {
-        format!("Погода в городе {}: солнечно, +22°C (заглушка)", city)
-    });
+    // Перехват вывода print
+    let output = Rc::new(RefCell::new(String::new()));
+    let output_clone = output.clone();
+    engine.on_print(move |s| output_clone.borrow_mut().push_str(s));
 
+    register_basic_functions(&mut engine);
     register_storage_functions(&mut engine, storage_base_url, storage_auth_token);
 
     match engine.eval::<Dynamic>(code) {
-        Ok(result) => result.to_string(),
+        Ok(result) => {
+            let printed = output.borrow().clone();
+            if !printed.is_empty() {
+                printed
+            } else {
+                result.to_string()
+            }
+        }
         Err(e) => format!("Ошибка выполнения Rhai-кода: {}", e),
     }
 }
@@ -138,8 +164,6 @@ fn storage_request(
     }
     match req.send() {
         Ok(resp) if resp.status().is_success() => {
-            // Для POST/DELETE обычно возвращается пустое тело, поэтому возвращаем "OK" если тело пустое.
-            // Для GET возвращаем текст.
             let text = resp.text().unwrap_or_default();
             if text.is_empty() {
                 "OK".to_string()

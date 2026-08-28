@@ -1,4 +1,3 @@
-
 // src/agent_http_api.rs
 
 use axum::{
@@ -64,10 +63,11 @@ async fn run_agent_handler(
     }
 }
 
-pub async fn run_server(
-    config: AgentConfig,
-    context: AgentContext,
-) -> anyhow::Result<()> {
+async fn shutdown_signal() {
+    let _ = tokio::signal::ctrl_c().await;
+}
+
+pub async fn run_server(config: AgentConfig, context: AgentContext) -> anyhow::Result<()> {
     let state = AppState {
         config: config.clone(),
         context: Arc::new(context),
@@ -76,11 +76,19 @@ pub async fn run_server(
 
     let app = Router::new()
         .route("/agent/run", post(run_agent_handler))
-        .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&config.bind_addr).await?;
-    eprintln!("🤖 Агент '{}' запущен на http://{}", config.name, config.bind_addr);
-    axum::serve(listener, app).await?;
+    eprintln!(
+        "🤖 Агент '{}' запущен на http://{}",
+        config.name, config.bind_addr
+    );
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
     Ok(())
 }
