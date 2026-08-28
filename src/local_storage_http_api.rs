@@ -229,6 +229,10 @@ async fn write_summary(
     }
 }
 
+async fn shutdown_signal() {
+    let _ = tokio::signal::ctrl_c().await;
+}
+
 pub async fn run_server(
     config: LocalStorageServerConfig,
     vector_db_config: VectorDbConfig,
@@ -260,6 +264,8 @@ pub async fn run_server(
 
     let listener = tokio::net::TcpListener::bind(&config.bind_addr).await?;
     eprintln!("🌐 HTTP API запущен на http://{}", config.bind_addr);
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
     Ok(())
 }

@@ -3,8 +3,10 @@
 use anyhow::{Context, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
+use std::rc::Rc;
 use std::time::Duration;
 use tokio::time::timeout;
 
@@ -28,6 +30,10 @@ pub struct AgentConfig {
     pub stream: bool,
     pub prefix_message_count: Option<usize>,
     pub tail_message_count: Option<usize>,
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
+    #[serde(default)]
+    pub rhai_timeout_sec: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -99,7 +105,6 @@ pub async fn run_agent(
     context: &AgentContext,
     request: AgentRequest,
 ) -> Result<AgentResponse> {
-    // Создаём директорию логов агента
     let log_dir = format!("chats/{}", config.name);
     fs::create_dir_all(&log_dir)?;
     let timestamp = chrono::Local::now().format("%Y-%m-%d_%H-%M-%S");
@@ -143,7 +148,7 @@ pub async fn run_agent(
                 .collect(),
         ),
         tool_choice: None,
-        reasoning_effort: None,
+        reasoning_effort: config.reasoning_effort.clone(),
         max_cost_rub: None,
         prefix_message_count: config.prefix_message_count,
         tail_message_count: config.tail_message_count,
@@ -160,6 +165,8 @@ pub async fn run_agent(
 
     let mut tool_calls_log = Vec::new();
     let mut final_response = None;
+
+    let rhai_timeout = config.rhai_timeout_sec.unwrap_or(30);
 
     for _ in 0..=max_iterations {
         let response = timeout(Duration::from_secs(config.timeout_sec), engine.send())
@@ -181,7 +188,7 @@ pub async fn run_agent(
             }
 
             for tc in &tool_calls {
-                let result = execute_agent_tool(context, tc).await?;
+                let result = execute_agent_tool(context, tc, rhai_timeout).await?;
                 eprintln!("✅ Результат '{}': {}", tc.function.name, result);
 
                 write_log(
@@ -247,7 +254,11 @@ pub async fn run_agent(
     })
 }
 
-async fn execute_agent_tool(context: &AgentContext, tool_call: &ToolCall) -> Result<String> {
+async fn execute_agent_tool(
+    context: &AgentContext,
+    tool_call: &ToolCall,
+    rhai_timeout_sec: u64,
+) -> Result<String> {
     match tool_call.function.name.as_str() {
         "run_code" => {
             let parsed: serde_json::Value = serde_json::from_str(&tool_call.function.arguments)
@@ -260,11 +271,21 @@ async fn execute_agent_tool(context: &AgentContext, tool_call: &ToolCall) -> Res
 
             let storage_base_url = context.storage_base_url.clone();
             let storage_auth_token = context.storage_auth_token.clone();
-            let result = tokio::task::spawn_blocking(move || {
-                run_code_with_storage(storage_base_url, storage_auth_token, &code)
-            })
+            let timeout_duration = Duration::from_secs(rhai_timeout_sec);
+
+            let result = tokio::time::timeout(
+                timeout_duration,
+                tokio::task::spawn_blocking(move || {
+                    run_code_with_storage(storage_base_url, storage_auth_token, &code)
+                }),
+            )
             .await
-            .map_err(|e| anyhow::anyhow!("Blocking task failed: {}", e))??;
+            .map_err(|_| anyhow::anyhow!("Rhai execution timed out"))?;
+
+            let result = result.map_err(|e| anyhow::anyhow!("JoinError: {}", e))?;
+
+            let result = result.map_err(|e| anyhow::anyhow!("Rhai execution error: {}", e))?;
+
             Ok(result)
         }
         "local_storage" => {
@@ -274,6 +295,7 @@ async fn execute_agent_tool(context: &AgentContext, tool_call: &ToolCall) -> Res
                 Some(&context.http_client),
                 &context.storage_base_url,
                 &context.storage_auth_token,
+                rhai_timeout_sec,
             )
             .await;
             Ok(result)
@@ -292,17 +314,23 @@ fn run_code_with_storage(
     engine.set_max_call_levels(32);
     engine.set_max_string_size(1024 * 10);
 
-    engine.register_fn("get_time", || -> String {
-        chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
-    });
-    engine.register_fn("get_weather", |city: String| -> String {
-        format!("Погода в городе {}: солнечно, +22°C (заглушка)", city)
-    });
+    // Перехват вывода print
+    let output = Rc::new(RefCell::new(String::new()));
+    let output_clone = output.clone();
+    engine.on_print(move |s| output_clone.borrow_mut().push_str(s));
 
+    crate::tools::register_basic_functions(&mut engine);
     crate::tools::register_storage_functions(&mut engine, &storage_base_url, &storage_auth_token);
 
     match engine.eval::<rhai::Dynamic>(code) {
-        Ok(result) => Ok(result.to_string()),
+        Ok(result) => {
+            let printed = output.borrow().clone();
+            if !printed.is_empty() {
+                Ok(printed)
+            } else {
+                Ok(result.to_string())
+            }
+        }
         Err(e) => Err(anyhow::anyhow!("Rhai execution error: {}", e)),
     }
 }

@@ -10,6 +10,10 @@ struct Args {
     config: PathBuf,
 }
 
+async fn shutdown_signal() {
+    let _ = tokio::signal::ctrl_c().await;
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();

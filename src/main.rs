@@ -166,7 +166,6 @@ async fn main() -> Result<()> {
     println!("   Команды: /clear, /metrics, /system <текст>, /fix, /exit");
     println!();
 
-    // Получаем параметры HTTP API хранилища из конфига
     let storage_http_config = toml_config
         .local_storage_http_server
         .clone()
@@ -177,6 +176,9 @@ async fn main() -> Result<()> {
                 auth_token: String::new(),
             },
         );
+
+    // Получаем глобальный таймаут Rhai из конфига (по умолчанию 30)
+    let rhai_timeout_sec = toml_config.rhai_timeout_sec.unwrap_or(30);
 
     let mut stdin = tokio::io::BufReader::new(tokio::io::stdin());
     let mut input = String::new();
@@ -277,7 +279,6 @@ async fn main() -> Result<()> {
             println!("\n⚠️ Модель запросила инструменты:");
             for tc in &tool_calls {
                 println!("   - {} ({})", tc.function.name, tc.function.arguments);
-                // Логируем запрос инструмента с аргументами
                 write_log(
                     &mut log_file,
                     "tool_request",
@@ -317,6 +318,7 @@ async fn main() -> Result<()> {
                         Some(&client),
                         &storage_http_config.bind_addr,
                         &storage_http_config.auth_token,
+                        rhai_timeout_sec, // <-- передаём таймаут
                     )
                     .await;
                     println!("✅ Автовыполнение: {}", result);
@@ -339,6 +341,7 @@ async fn main() -> Result<()> {
                             Some(&client),
                             &storage_http_config.bind_addr,
                             &storage_http_config.auth_token,
+                            rhai_timeout_sec, // <-- передаём таймаут
                         )
                         .await;
                         println!("✅ Выполнено: {}", result);
