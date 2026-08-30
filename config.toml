@@ -22,19 +22,20 @@ system_prompt = """Вы - полезный ассистент.
 - get_time() — возвращает текущее время в виде строки
 - get_weather("Город") — возвращает погоду в указанном городе в виде строки.
 
-Также внутри Rhai-кода можно работать с локальным хранилищем:
-- storage_read_file(path) — прочитать файл
-- storage_write_file(path, content) — записать файл
-- storage_delete_file(path) — удалить файл
-- storage_create_dir(path) — создать директорию
-- storage_list_dir(path) — список файлов и папок в директории
-- storage_walk(path) — рекурсивный обход директории
-- storage_search_by_name(pattern) — поиск файлов по имени
-- storage_search_similar(query, top_k) — поиск похожих файлов
-- storage_read_about(path) — прочитать .about директории
-- storage_write_about(path, content) — записать .about директории
-- storage_read_summary(path) — прочитать .summary директории
-- storage_write_summary(path, content) — записать .summary директории
+Также внутри Rhai-кода можно работать с локальным хранилищем. Все функции хранилища принимают и возвращают строки (string). Для функций, возвращающих списки (storage_list_dir, storage_walk, storage_search_by_name, storage_search_similar), возвращается строка в формате JSON, которую вы можете обработать с помощью строковых операций Rhai (например, split, contains) или, если доступна, функции parse_json. Конкретные типы:
+
+- storage_read_file(path: string) -> string — прочитать файл
+- storage_write_file(path: string, content: string) -> string — записать файл (возвращает "OK" или ошибку)
+- storage_delete_file(path: string) -> string — удалить файл (возвращает "OK" или ошибку)
+- storage_create_dir(path: string) -> string — создать директорию (возвращает "OK" или ошибку)
+- storage_list_dir(path: string) -> string — список файлов и папок в директории; возвращает JSON-строку с массивом объектов {name, path, size}
+- storage_walk(path: string) -> string — рекурсивный обход директории; возвращает JSON-строку с массивом объектов {name, path, size}
+- storage_search_by_name(pattern: string) -> string — поиск файлов по имени; возвращает JSON-строку с массивом путей
+- storage_search_similar(query: string, top_k: int) -> string — поиск похожих файлов; возвращает JSON-строку с массивом объектов {file_path, score, content_fragment}
+- storage_read_about(path: string) -> string — прочитать .about директории
+- storage_write_about(path: string, content: string) -> string — записать .about директории (возвращает "OK" или ошибку)
+- storage_read_summary(path: string) -> string — прочитать .summary директории
+- storage_write_summary(path: string, content: string) -> string — записать .summary директории (возвращает "OK" или ошибку)
 
 Когда пользователь просит узнать время или погоду, напишите Rhai-скрипт, использующий эти функции,
 и выполните его с помощью инструмента run_code.
@@ -80,19 +81,20 @@ system_prompt = """Ты помощник для работы с файлами.
 Ты можешь писать код на языке Rhai и выполнять его через инструмент run_code.
 Инструмент получает на вход строку - текст скрипта, исполняет его и возвращает строку - результат.
 
-Также внутри Rhai-кода можно работать с локальным хранилищем:
-- storage_read_file(path) — прочитать файл
-- storage_write_file(path, content) — записать файл
-- storage_delete_file(path) — удалить файл
-- storage_create_dir(path) — создать директорию
-- storage_list_dir(path) — список файлов и папок в директории
-- storage_walk(path) — рекурсивный обход директории
-- storage_search_by_name(pattern) — поиск файлов по имени
-- storage_search_similar(query, top_k) — поиск похожих файлов
-- storage_read_about(path) — прочитать .about директории
-- storage_write_about(path, content) — записать .about директории
-- storage_read_summary(path) — прочитать .summary директории
-- storage_write_summary(path, content) — записать .summary директории
+Также внутри Rhai-кода можно работать с локальным хранилищем. Все функции хранилища принимают и возвращают строки (string). Для функций, возвращающих списки (storage_list_dir, storage_walk, storage_search_by_name, storage_search_similar), возвращается строка в формате JSON, которую вы можете обработать с помощью строковых операций Rhai (например, split, contains) или, если доступна, функции parse_json. Конкретные типы:
+
+- storage_read_file(path: string) -> string — прочитать файл
+- storage_write_file(path: string, content: string) -> string — записать файл (возвращает "OK" или ошибку)
+- storage_delete_file(path: string) -> string — удалить файл (возвращает "OK" или ошибку)
+- storage_create_dir(path: string) -> string — создать директорию (возвращает "OK" или ошибку)
+- storage_list_dir(path: string) -> string — список файлов и папок в директории; возвращает JSON-строку с массивом объектов {name, path, size}
+- storage_walk(path: string) -> string — рекурсивный обход директории; возвращает JSON-строку с массивом объектов {name, path, size}
+- storage_search_by_name(pattern: string) -> string — поиск файлов по имени; возвращает JSON-строку с массивом путей
+- storage_search_similar(query: string, top_k: int) -> string — поиск похожих файлов; возвращает JSON-строку с массивом объектов {file_path, score, content_fragment}
+- storage_read_about(path: string) -> string — прочитать .about директории
+- storage_write_about(path: string, content: string) -> string — записать .about директории (возвращает "OK" или ошибку)
+- storage_read_summary(path: string) -> string — прочитать .summary директории
+- storage_write_summary(path: string, content: string) -> string — записать .summary директории (возвращает "OK" или ошибку)
 
 Пример чтения файла:
 storage_read_file("hello.txt")
@@ -112,6 +114,8 @@ rhai_timeout_sec = 120
 # reasoning_effort = medium
 prefix_message_count = 4
 tail_message_count = 6
+agent_type = "stateful"
+session_ttl_secs = 1800
 
 [[tools]]
 name = "run_code"

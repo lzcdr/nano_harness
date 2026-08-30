@@ -12,6 +12,19 @@ use tokio::time::timeout;
 
 use crate::engine::{ChatEngine, EngineConfig, Role, ToolCall};
 
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentType {
+    Stateless,
+    Stateful,
+}
+
+impl Default for AgentType {
+    fn default() -> Self {
+        AgentType::Stateless
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct AgentConfig {
     pub name: String,
@@ -34,6 +47,10 @@ pub struct AgentConfig {
     pub reasoning_effort: Option<String>,
     #[serde(default)]
     pub rhai_timeout_sec: Option<u64>,
+    #[serde(default)]
+    pub agent_type: AgentType,
+    #[serde(default)]
+    pub session_ttl_secs: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -42,6 +59,7 @@ pub struct AgentRequest {
     pub max_iterations: Option<usize>,
     pub tools: Option<Vec<String>>,
     pub system_prompt: Option<String>,
+    pub session_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -52,6 +70,7 @@ pub struct AgentResponse {
     pub tool_calls_log: Vec<ToolCallLogEntry>,
     pub metrics: AgentMetrics,
     pub error: Option<String>,
+    pub session_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -100,35 +119,9 @@ fn write_log(file: &mut fs::File, role: &str, content: &str) -> Result<()> {
     Ok(())
 }
 
-pub async fn run_agent(
-    config: &AgentConfig,
-    context: &AgentContext,
-    request: AgentRequest,
-) -> Result<AgentResponse> {
-    let log_dir = format!("chats/{}", config.name);
-    fs::create_dir_all(&log_dir)?;
-    let timestamp = chrono::Local::now().format("%Y-%m-%d_%H-%M-%S");
-    let log_path = format!("{}/{}.txt", log_dir, timestamp);
-    let mut log_file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)?;
-
-    let max_iterations = request.max_iterations.unwrap_or(config.max_iterations);
-    let allowed_tools = request.tools.unwrap_or_else(|| config.tools.clone());
-    let system_prompt = request
-        .system_prompt
-        .or_else(|| config.system_prompt.clone())
-        .unwrap_or_else(|| "Вы - полезный ассистент.".to_string());
-
-    write_log(&mut log_file, "system", &system_prompt)?;
-    write_log(&mut log_file, "task", &request.prompt)?;
-
-    eprintln!(
-        "🚀 Агент '{}' получил задачу: {}",
-        config.name, request.prompt
-    );
-
+/// Создаёт ChatEngine на основе конфигурации агента
+pub fn create_agent_engine(config: &AgentConfig) -> Result<ChatEngine> {
+    let allowed_tools = config.tools.clone();
     let engine_config = EngineConfig {
         api_key: config.api_key.clone(),
         base_url: config.base_url.clone(),
@@ -153,19 +146,24 @@ pub async fn run_agent(
         prefix_message_count: config.prefix_message_count,
         tail_message_count: config.tail_message_count,
     };
-
     let client = Client::builder()
         .timeout(Duration::from_secs(config.timeout_sec))
         .build()
         .context("Failed to create HTTP client")?;
+    Ok(ChatEngine::new(engine_config, client))
+}
 
-    let mut engine = ChatEngine::new(engine_config.clone(), client);
-    engine.add_message(Role::System, system_prompt);
-    engine.add_message(Role::User, request.prompt.clone());
-
+/// Основной цикл обработки запросов агента (используется и stateless, и stateful)
+pub async fn process_agent_turns(
+    engine: &mut ChatEngine,
+    config: &AgentConfig,
+    context: &AgentContext,
+    request: &AgentRequest,
+    log_file: &mut fs::File,
+) -> Result<AgentResponse> {
+    let max_iterations = request.max_iterations.unwrap_or(config.max_iterations);
     let mut tool_calls_log = Vec::new();
     let mut final_response = None;
-
     let rhai_timeout = config.rhai_timeout_sec.unwrap_or(30);
 
     for _ in 0..=max_iterations {
@@ -181,7 +179,7 @@ pub async fn run_agent(
             for tc in &tool_calls {
                 eprintln!("   - {} ({})", tc.function.name, tc.function.arguments);
                 write_log(
-                    &mut log_file,
+                    log_file,
                     "tool_request",
                     &format!("{} ({})", tc.function.name, tc.function.arguments),
                 )?;
@@ -192,7 +190,7 @@ pub async fn run_agent(
                 eprintln!("✅ Результат '{}': {}", tc.function.name, result);
 
                 write_log(
-                    &mut log_file,
+                    log_file,
                     "tool_result",
                     &format!(
                         "{} ({}) -> {}",
@@ -224,12 +222,12 @@ pub async fn run_agent(
     };
 
     eprintln!("🎯 Финальный ответ агента: {}", final_response.content);
-    write_log(&mut log_file, "assistant", &final_response.content)?;
+    write_log(log_file, "assistant", &final_response.content)?;
     if !final_response.reasoning.is_empty() {
-        write_log(&mut log_file, "reasoning", &final_response.reasoning)?;
+        write_log(log_file, "reasoning", &final_response.reasoning)?;
     }
     write_log(
-        &mut log_file,
+        log_file,
         "metrics",
         &format!(
             "Prompt: {}, Completion: {}, Cost: {:.6} RUB, Calls: {}",
@@ -251,9 +249,49 @@ pub async fn run_agent(
         tool_calls_log,
         metrics,
         error: None,
+        session_id: None,
     })
 }
 
+/// Обработка stateless-агента: каждый запрос с новым движком
+pub async fn run_agent(
+    config: &AgentConfig,
+    context: &AgentContext,
+    request: AgentRequest,
+) -> Result<AgentResponse> {
+    let log_dir = format!("chats/{}", config.name);
+    fs::create_dir_all(&log_dir)?;
+    let timestamp = chrono::Local::now().format("%Y-%m-%d_%H-%M-%S");
+    let log_path = format!("{}/{}.txt", log_dir, timestamp);
+    let mut log_file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)?;
+
+    let system_prompt = request
+        .system_prompt
+        .clone()
+        .or_else(|| config.system_prompt.clone())
+        .unwrap_or_else(|| "Вы - полезный ассистент.".to_string());
+
+    write_log(&mut log_file, "system", &system_prompt)?;
+    write_log(&mut log_file, "task", &request.prompt)?;
+    eprintln!(
+        "🚀 Агент '{}' получил задачу: {}",
+        config.name, request.prompt
+    );
+
+    let mut engine = create_agent_engine(config)?;
+    engine.add_message(Role::System, system_prompt);
+    engine.add_message(Role::User, request.prompt.clone());
+
+    let mut response =
+        process_agent_turns(&mut engine, config, context, &request, &mut log_file).await?;
+    response.session_id = None;
+    Ok(response)
+}
+
+/// Выполнение одного инструмента
 async fn execute_agent_tool(
     context: &AgentContext,
     tool_call: &ToolCall,
