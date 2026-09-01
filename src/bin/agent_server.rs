@@ -49,12 +49,14 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    let agent_call_timeout = agent_config.agent_call_timeout_sec.unwrap_or(120);
     let context = AgentContext::new(
         storage_config.bind_addr.clone(),
         storage_config.auth_token.clone(),
         agent_config.timeout_sec,
         agents_map,
         Some(agent_config.name.clone()),
+        agent_call_timeout,
     );
 
     agent_http_api::run_server(agent_config.clone(), context).await

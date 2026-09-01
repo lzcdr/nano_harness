@@ -81,6 +81,7 @@ pub fn register_agent_call_functions(
     engine: &mut Engine,
     agents: Arc<HashMap<String, AgentEndpoint>>,
     self_name: Option<String>,
+    agent_call_timeout_sec: u64,
 ) {
     let agents = agents.clone();
     let self_name = self_name.clone();
@@ -96,7 +97,7 @@ pub fn register_agent_call_functions(
                 Some(endpoint) => {
                     let url = format!("{}/agent/run", endpoint.url.trim_end_matches('/'));
                     let client = reqwest::blocking::Client::builder()
-                        .timeout(Duration::from_secs(120))
+                        .timeout(Duration::from_secs(agent_call_timeout_sec))
                         .build()
                         .unwrap_or_default();
                     let resp = client

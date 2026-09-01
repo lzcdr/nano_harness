@@ -111,6 +111,7 @@ max_tokens = 4096
 top_p = 1.0
 stream = true
 rhai_timeout_sec = 120
+agent_call_timeout_sec = 120 # outgoing agent call timeout
 # reasoning_effort = medium
 prefix_message_count = 4
 tail_message_count = 6
