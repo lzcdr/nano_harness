@@ -1,7 +1,8 @@
 use clap::Parser;
-use nano_harness::agent_core::AgentContext;
+use nano_harness::agent_core::{AgentContext, AgentEndpoint};
 use nano_harness::agent_http_api;
 use nano_harness::config::TomlConfig;
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -31,10 +32,29 @@ async fn main() -> anyhow::Result<()> {
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("Секция [local_storage_http_server] не найдена"))?;
 
+    // Строим карту агентов
+    let mut agents_map = HashMap::new();
+    for agent in &config.agents {
+        let url = if agent.bind_addr.starts_with("http") {
+            agent.bind_addr.clone()
+        } else {
+            format!("http://{}", agent.bind_addr)
+        };
+        agents_map.insert(
+            agent.name.clone(),
+            AgentEndpoint {
+                url,
+                auth_token: agent.auth_token.clone(),
+            },
+        );
+    }
+
     let context = AgentContext::new(
         storage_config.bind_addr.clone(),
         storage_config.auth_token.clone(),
         agent_config.timeout_sec,
+        agents_map,
+        Some(agent_config.name.clone()),
     );
 
     agent_http_api::run_server(agent_config.clone(), context).await

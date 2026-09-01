@@ -4,9 +4,11 @@ use anyhow::{Context, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::timeout;
 
@@ -88,14 +90,28 @@ pub struct AgentMetrics {
     pub api_calls_count: u32,
 }
 
+#[derive(Debug, Clone)]
+pub struct AgentEndpoint {
+    pub url: String,
+    pub auth_token: String,
+}
+
 pub struct AgentContext {
     pub http_client: Client,
     pub storage_base_url: String,
     pub storage_auth_token: String,
+    pub agents: Arc<HashMap<String, AgentEndpoint>>,
+    pub self_name: Option<String>,
 }
 
 impl AgentContext {
-    pub fn new(storage_base_url: String, storage_auth_token: String, timeout_sec: u64) -> Self {
+    pub fn new(
+        storage_base_url: String,
+        storage_auth_token: String,
+        timeout_sec: u64,
+        agents: HashMap<String, AgentEndpoint>,
+        self_name: Option<String>,
+    ) -> Self {
         let http_client = Client::builder()
             .timeout(Duration::from_secs(timeout_sec))
             .build()
@@ -104,6 +120,8 @@ impl AgentContext {
             http_client,
             storage_base_url,
             storage_auth_token,
+            agents: Arc::new(agents),
+            self_name,
         }
     }
 }
@@ -309,12 +327,20 @@ async fn execute_agent_tool(
 
             let storage_base_url = context.storage_base_url.clone();
             let storage_auth_token = context.storage_auth_token.clone();
+            let agents = context.agents.clone();
+            let self_name = context.self_name.clone();
             let timeout_duration = Duration::from_secs(rhai_timeout_sec);
 
             let result = tokio::time::timeout(
                 timeout_duration,
                 tokio::task::spawn_blocking(move || {
-                    run_code_with_storage(storage_base_url, storage_auth_token, &code)
+                    run_code_with_storage(
+                        storage_base_url,
+                        storage_auth_token,
+                        agents,
+                        self_name,
+                        &code,
+                    )
                 }),
             )
             .await
@@ -345,6 +371,8 @@ async fn execute_agent_tool(
 fn run_code_with_storage(
     storage_base_url: String,
     storage_auth_token: String,
+    agents: Arc<HashMap<String, AgentEndpoint>>,
+    self_name: Option<String>,
     code: &str,
 ) -> Result<String> {
     let mut engine = rhai::Engine::new();
@@ -359,6 +387,7 @@ fn run_code_with_storage(
 
     crate::tools::register_basic_functions(&mut engine);
     crate::tools::register_storage_functions(&mut engine, &storage_base_url, &storage_auth_token);
+    crate::tools::register_agent_call_functions(&mut engine, agents, self_name);
 
     match engine.eval::<rhai::Dynamic>(code) {
         Ok(result) => {
@@ -372,3 +401,4 @@ fn run_code_with_storage(
         Err(e) => Err(anyhow::anyhow!("Rhai execution error: {}", e)),
     }
 }
+
