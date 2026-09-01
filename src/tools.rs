@@ -1,12 +1,15 @@
 // src/tools.rs
 
+use crate::agent_core::AgentEndpoint;
 use crate::engine::{FunctionDefinition, ToolDefinition};
 use reqwest::blocking::Client;
 use reqwest::Method;
 use rhai::{Dynamic, Engine};
 use serde_json::json;
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
 
 pub fn available_tools() -> Vec<ToolDefinition> {
@@ -72,6 +75,55 @@ pub fn register_basic_functions(engine: &mut Engine) {
     engine.register_fn("get_weather", |city: String| -> String {
         format!("Погода в городе {}: солнечно, +22°C (заглушка)", city)
     });
+}
+
+pub fn register_agent_call_functions(
+    engine: &mut Engine,
+    agents: Arc<HashMap<String, AgentEndpoint>>,
+    self_name: Option<String>,
+) {
+    let agents = agents.clone();
+    let self_name = self_name.clone();
+    engine.register_fn(
+        "call_agent",
+        move |name: String, prompt: String| -> String {
+            if let Some(ref self_name) = self_name {
+                if name == *self_name {
+                    return format!("Ошибка: агент '{}' не может вызывать сам себя", name);
+                }
+            }
+            match agents.get(&name) {
+                Some(endpoint) => {
+                    let url = format!("{}/agent/run", endpoint.url.trim_end_matches('/'));
+                    let client = reqwest::blocking::Client::builder()
+                        .timeout(Duration::from_secs(120))
+                        .build()
+                        .unwrap_or_default();
+                    let resp = client
+                        .post(&url)
+                        .header("Authorization", format!("Bearer {}", endpoint.auth_token))
+                        .json(&serde_json::json!({ "prompt": prompt }))
+                        .send();
+                    match resp {
+                        Ok(r) if r.status().is_success() => {
+                            let body: serde_json::Value = r.json().unwrap_or_default();
+                            body.get("result")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string())
+                                .unwrap_or_else(|| "Агент вернул пустой результат".to_string())
+                        }
+                        Ok(r) => format!(
+                            "HTTP ошибка {}: {}",
+                            r.status(),
+                            r.text().unwrap_or_default()
+                        ),
+                        Err(e) => format!("Ошибка вызова агента: {}", e),
+                    }
+                }
+                None => format!("Агент '{}' не найден", name),
+            }
+        },
+    );
 }
 
 pub async fn execute_tool(
