@@ -77,22 +77,22 @@ curl.exe "http://127.0.0.1:8080/summary?path=." -H "Authorization: Bearer secret
 
 ### Stateless: время через run_code
 ```powershell
-curl.exe --% -X POST "http://127.0.0.1:8081/agent/run" -H "Authorization: Bearer agent_token_1" -H "Content-Type: application/json" -d "{\"prompt\":\"Узнай текущее время\"}"
+curl.exe -X POST "http://127.0.0.1:8081/agent/run" -H "Authorization: Bearer agent_token_1" -H "Content-Type: application/json" -d '{"prompt":"Узнай текущее время"}'
 ```
 
 ### Stateless: чтение файла через run_code
 ```powershell
-curl.exe --% -X POST "http://127.0.0.1:8081/agent/run" -H "Authorization: Bearer agent_token_1" -H "Content-Type: application/json" -d "{\"prompt\":\"Прочитай example.txt\"}"
+curl.exe -X POST "http://127.0.0.1:8081/agent/run" -H "Authorization: Bearer agent_token_1" -H "Content-Type: application/json" -d '{"prompt":"Прочитай example.txt"}'
 ```
 
 ### Stateful: первый запрос (получить session_id)
 ```powershell
-curl.exe --% -X POST "http://127.0.0.1:8081/agent/run" -H "Authorization: Bearer agent_token_1" -H "Content-Type: application/json" -d "{\"prompt\":\"Запомни: цвет синий\"}"
+curl.exe -X POST "http://127.0.0.1:8081/agent/run" -H "Authorization: Bearer agent_token_1" -H "Content-Type: application/json" -d '{"prompt":"Запомни: цвет синий"}'
 ```
 
 ### Stateful: следующий запрос с session_id
 ```powershell
-curl.exe --% -X POST "http://127.0.0.1:8081/agent/run" -H "Authorization: Bearer agent_token_1" -H "Content-Type: application/json" -d "{\"prompt\":\"Какой цвет?\",\"session_id\":\"ПОДСТАВЬТЕ_ID\"}"
+curl.exe -X POST "http://127.0.0.1:8081/agent/run" -H "Authorization: Bearer agent_token_1" -H "Content-Type: application/json" -d '{"prompt":"Какой цвет?","session_id":"ПОДСТАВЬТЕ_ID"}'
 ```
 
 ## Проверка ошибок
