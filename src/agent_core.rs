@@ -50,6 +50,8 @@ pub struct AgentConfig {
     #[serde(default)]
     pub rhai_timeout_sec: Option<u64>,
     #[serde(default)]
+    pub agent_call_timeout_sec: Option<u64>,
+    #[serde(default)]
     pub agent_type: AgentType,
     #[serde(default)]
     pub session_ttl_secs: Option<u64>,
@@ -102,6 +104,7 @@ pub struct AgentContext {
     pub storage_auth_token: String,
     pub agents: Arc<HashMap<String, AgentEndpoint>>,
     pub self_name: Option<String>,
+    pub agent_call_timeout_sec: u64,
 }
 
 impl AgentContext {
@@ -111,6 +114,7 @@ impl AgentContext {
         timeout_sec: u64,
         agents: HashMap<String, AgentEndpoint>,
         self_name: Option<String>,
+        agent_call_timeout_sec: u64,
     ) -> Self {
         let http_client = Client::builder()
             .timeout(Duration::from_secs(timeout_sec))
@@ -122,6 +126,7 @@ impl AgentContext {
             storage_auth_token,
             agents: Arc::new(agents),
             self_name,
+            agent_call_timeout_sec,
         }
     }
 }
@@ -330,6 +335,7 @@ async fn execute_agent_tool(
             let agents = context.agents.clone();
             let self_name = context.self_name.clone();
             let timeout_duration = Duration::from_secs(rhai_timeout_sec);
+            let agent_call_timeout = context.agent_call_timeout_sec;
 
             let result = tokio::time::timeout(
                 timeout_duration,
@@ -339,6 +345,7 @@ async fn execute_agent_tool(
                         storage_auth_token,
                         agents,
                         self_name,
+                        agent_call_timeout,
                         &code,
                     )
                 }),
@@ -373,6 +380,7 @@ fn run_code_with_storage(
     storage_auth_token: String,
     agents: Arc<HashMap<String, AgentEndpoint>>,
     self_name: Option<String>,
+    agent_call_timeout_sec: u64,
     code: &str,
 ) -> Result<String> {
     let mut engine = rhai::Engine::new();
@@ -387,7 +395,12 @@ fn run_code_with_storage(
 
     crate::tools::register_basic_functions(&mut engine);
     crate::tools::register_storage_functions(&mut engine, &storage_base_url, &storage_auth_token);
-    crate::tools::register_agent_call_functions(&mut engine, agents, self_name);
+    crate::tools::register_agent_call_functions(
+        &mut engine,
+        agents,
+        self_name,
+        agent_call_timeout_sec,
+    );
 
     match engine.eval::<rhai::Dynamic>(code) {
         Ok(result) => {
@@ -401,4 +414,3 @@ fn run_code_with_storage(
         Err(e) => Err(anyhow::anyhow!("Rhai execution error: {}", e)),
     }
 }
-
