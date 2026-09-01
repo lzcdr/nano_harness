@@ -10,6 +10,7 @@ use axum::{
 };
 use serde::Deserialize;
 use std::sync::{Arc, Mutex};
+use tokio::task; // добавлено для spawn_blocking
 
 use crate::local_storage::{LocalStorage, VectorDbConfig};
 
@@ -71,6 +72,14 @@ fn io_error_response(err: std::io::Error) -> Response {
     (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
 }
 
+fn join_error_response(err: tokio::task::JoinError) -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        format!("Join error: {}", err),
+    )
+        .into_response()
+}
+
 // ---------- File handlers ----------
 
 async fn create_file(
@@ -78,70 +87,107 @@ async fn create_file(
     Query(query): Query<PathQuery>,
     body: String,
 ) -> Response {
-    let mut storage = match state.storage.lock() {
-        Ok(s) => s,
-        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Lock poisoned").into_response(),
-    };
-    match storage.write_file(&query.path, &body) {
-        Ok(_) => StatusCode::OK.into_response(),
-        Err(e) => io_error_response(e),
+    let storage = state.storage.clone();
+    let path = query.path.clone();
+    let content = body.clone();
+
+    let result = task::spawn_blocking(move || {
+        let mut storage = storage.lock().unwrap();
+        storage.write_file(&path, &content)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(_)) => StatusCode::OK.into_response(),
+        Ok(Err(e)) => io_error_response(e),
+        Err(e) => join_error_response(e),
     }
 }
 
 async fn read_file(State(state): State<AppState>, Query(query): Query<PathQuery>) -> Response {
-    let storage = match state.storage.lock() {
-        Ok(s) => s,
-        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Lock poisoned").into_response(),
-    };
-    match storage.read_file(&query.path) {
-        Ok(content) => (StatusCode::OK, content).into_response(),
-        Err(e) => io_error_response(e),
+    let storage = state.storage.clone();
+    let path = query.path.clone();
+
+    let result = task::spawn_blocking(move || {
+        let storage = storage.lock().unwrap();
+        storage.read_file(&path)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(content)) => (StatusCode::OK, content).into_response(),
+        Ok(Err(e)) => io_error_response(e),
+        Err(e) => join_error_response(e),
     }
 }
 
 async fn delete_file(State(state): State<AppState>, Query(query): Query<PathQuery>) -> Response {
-    let mut storage = match state.storage.lock() {
-        Ok(s) => s,
-        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Lock poisoned").into_response(),
-    };
-    match storage.delete_file(&query.path) {
-        Ok(_) => StatusCode::OK.into_response(),
-        Err(e) => io_error_response(e),
+    let storage = state.storage.clone();
+    let path = query.path.clone();
+
+    let result = task::spawn_blocking(move || {
+        let mut storage = storage.lock().unwrap();
+        storage.delete_file(&path)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(_)) => StatusCode::OK.into_response(),
+        Ok(Err(e)) => io_error_response(e),
+        Err(e) => join_error_response(e),
     }
 }
 
 // ---------- Directory handlers ----------
 
 async fn create_dir(State(state): State<AppState>, Query(query): Query<PathQuery>) -> Response {
-    let mut storage = match state.storage.lock() {
-        Ok(s) => s,
-        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Lock poisoned").into_response(),
-    };
-    match storage.create_dir(&query.path) {
-        Ok(_) => StatusCode::OK.into_response(),
-        Err(e) => io_error_response(e),
+    let storage = state.storage.clone();
+    let path = query.path.clone();
+
+    let result = task::spawn_blocking(move || {
+        let mut storage = storage.lock().unwrap();
+        storage.create_dir(&path)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(_)) => StatusCode::OK.into_response(),
+        Ok(Err(e)) => io_error_response(e),
+        Err(e) => join_error_response(e),
     }
 }
 
 async fn list_dir(State(state): State<AppState>, Query(query): Query<PathQuery>) -> Response {
-    let storage = match state.storage.lock() {
-        Ok(s) => s,
-        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Lock poisoned").into_response(),
-    };
-    match storage.list(&query.path) {
-        Ok(entries) => Json(entries).into_response(),
-        Err(e) => io_error_response(e),
+    let storage = state.storage.clone();
+    let path = query.path.clone();
+
+    let result = task::spawn_blocking(move || {
+        let storage = storage.lock().unwrap();
+        storage.list(&path)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(entries)) => Json(entries).into_response(),
+        Ok(Err(e)) => io_error_response(e),
+        Err(e) => join_error_response(e),
     }
 }
 
 async fn walk_dir(State(state): State<AppState>, Query(query): Query<PathQuery>) -> Response {
-    let storage = match state.storage.lock() {
-        Ok(s) => s,
-        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Lock poisoned").into_response(),
-    };
-    match storage.walk(&query.path) {
-        Ok(entries) => Json(entries).into_response(),
-        Err(e) => io_error_response(e),
+    let storage = state.storage.clone();
+    let path = query.path.clone();
+
+    let result = task::spawn_blocking(move || {
+        let storage = storage.lock().unwrap();
+        storage.walk(&path)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(entries)) => Json(entries).into_response(),
+        Ok(Err(e)) => io_error_response(e),
+        Err(e) => join_error_response(e),
     }
 }
 
@@ -151,13 +197,20 @@ async fn search_similar(
     State(state): State<AppState>,
     Query(query): Query<SearchQuery>,
 ) -> Response {
-    let storage = match state.storage.lock() {
-        Ok(s) => s,
-        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Lock poisoned").into_response(),
-    };
-    match storage.search_similar(&query.query, query.top_k) {
-        Ok(results) => Json(results).into_response(),
-        Err(e) => io_error_response(e),
+    let storage = state.storage.clone();
+    let query_text = query.query.clone();
+    let top_k = query.top_k;
+
+    let result = task::spawn_blocking(move || {
+        let storage = storage.lock().unwrap();
+        storage.search_similar(&query_text, top_k)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(results)) => Json(results).into_response(),
+        Ok(Err(e)) => io_error_response(e),
+        Err(e) => join_error_response(e),
     }
 }
 
@@ -165,26 +218,38 @@ async fn search_by_name(
     State(state): State<AppState>,
     Query(query): Query<NameSearchQuery>,
 ) -> Response {
-    let storage = match state.storage.lock() {
-        Ok(s) => s,
-        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Lock poisoned").into_response(),
-    };
-    match storage.search_by_name(&query.pattern) {
-        Ok(paths) => Json(paths).into_response(),
-        Err(e) => io_error_response(e),
+    let storage = state.storage.clone();
+    let pattern = query.pattern.clone();
+
+    let result = task::spawn_blocking(move || {
+        let storage = storage.lock().unwrap();
+        storage.search_by_name(&pattern)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(paths)) => Json(paths).into_response(),
+        Ok(Err(e)) => io_error_response(e),
+        Err(e) => join_error_response(e),
     }
 }
 
 // ---------- Meta handlers (.about, .summary) ----------
 
 async fn read_about(State(state): State<AppState>, Query(query): Query<PathQuery>) -> Response {
-    let storage = match state.storage.lock() {
-        Ok(s) => s,
-        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Lock poisoned").into_response(),
-    };
-    match storage.read_about(&query.path) {
-        Ok(content) => (StatusCode::OK, content).into_response(),
-        Err(e) => io_error_response(e),
+    let storage = state.storage.clone();
+    let path = query.path.clone();
+
+    let result = task::spawn_blocking(move || {
+        let storage = storage.lock().unwrap();
+        storage.read_about(&path)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(content)) => (StatusCode::OK, content).into_response(),
+        Ok(Err(e)) => io_error_response(e),
+        Err(e) => join_error_response(e),
     }
 }
 
@@ -193,24 +258,37 @@ async fn write_about(
     Query(query): Query<WriteMetaQuery>,
     body: String,
 ) -> Response {
-    let mut storage = match state.storage.lock() {
-        Ok(s) => s,
-        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Lock poisoned").into_response(),
-    };
-    match storage.write_about(&query.path, &body) {
-        Ok(_) => StatusCode::OK.into_response(),
-        Err(e) => io_error_response(e),
+    let storage = state.storage.clone();
+    let path = query.path.clone();
+    let content = body.clone();
+
+    let result = task::spawn_blocking(move || {
+        let mut storage = storage.lock().unwrap();
+        storage.write_about(&path, &content)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(_)) => StatusCode::OK.into_response(),
+        Ok(Err(e)) => io_error_response(e),
+        Err(e) => join_error_response(e),
     }
 }
 
 async fn read_summary(State(state): State<AppState>, Query(query): Query<PathQuery>) -> Response {
-    let storage = match state.storage.lock() {
-        Ok(s) => s,
-        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Lock poisoned").into_response(),
-    };
-    match storage.read_summary(&query.path) {
-        Ok(content) => (StatusCode::OK, content).into_response(),
-        Err(e) => io_error_response(e),
+    let storage = state.storage.clone();
+    let path = query.path.clone();
+
+    let result = task::spawn_blocking(move || {
+        let storage = storage.lock().unwrap();
+        storage.read_summary(&path)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(content)) => (StatusCode::OK, content).into_response(),
+        Ok(Err(e)) => io_error_response(e),
+        Err(e) => join_error_response(e),
     }
 }
 
@@ -219,13 +297,20 @@ async fn write_summary(
     Query(query): Query<WriteMetaQuery>,
     body: String,
 ) -> Response {
-    let mut storage = match state.storage.lock() {
-        Ok(s) => s,
-        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Lock poisoned").into_response(),
-    };
-    match storage.write_summary(&query.path, &body) {
-        Ok(_) => StatusCode::OK.into_response(),
-        Err(e) => io_error_response(e),
+    let storage = state.storage.clone();
+    let path = query.path.clone();
+    let content = body.clone();
+
+    let result = task::spawn_blocking(move || {
+        let mut storage = storage.lock().unwrap();
+        storage.write_summary(&path, &content)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(_)) => StatusCode::OK.into_response(),
+        Ok(Err(e)) => io_error_response(e),
+        Err(e) => join_error_response(e),
     }
 }
 
