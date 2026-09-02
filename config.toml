@@ -117,6 +117,7 @@ prefix_message_count = 4
 tail_message_count = 6
 agent_type = "stateful"
 session_ttl_secs = 1800
+skill_mode = "auto"
 
 [[tools]]
 name = "run_code"

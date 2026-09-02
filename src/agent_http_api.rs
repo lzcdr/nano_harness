@@ -80,7 +80,6 @@ async fn run_stateful_agent(state: &AppState, request: AgentRequest) -> Response
         .unwrap_or_else(generate_session_id);
     let mut sessions = state.sessions.lock().await;
 
-    // Удаляем просроченные сессии (по TTL)
     if let Some(ttl) = state.config.session_ttl_secs {
         let now = Instant::now();
         let mut to_remove = Vec::new();
@@ -99,7 +98,6 @@ async fn run_stateful_agent(state: &AppState, request: AgentRequest) -> Response
     let session_arc = match sessions.get(&session_id) {
         Some(s) => s.clone(),
         None => {
-            // Создаём новую сессию
             let mut engine = match create_agent_engine(&state.config) {
                 Ok(e) => e,
                 Err(e) => {
@@ -128,7 +126,6 @@ async fn run_stateful_agent(state: &AppState, request: AgentRequest) -> Response
                 .unwrap_or_else(|| "Вы - полезный ассистент.".to_string());
             engine.add_message(Role::System, system_prompt.clone());
 
-            // Создаём лог-файл
             let log_dir = format!("chats/{}", state.config.name);
             if let Err(e) = std::fs::create_dir_all(&log_dir) {
                 return Json(AgentResponse {
@@ -147,7 +144,9 @@ async fn run_stateful_agent(state: &AppState, request: AgentRequest) -> Response
                 })
                 .into_response();
             }
-            let log_path = format!("{}/{}.txt", log_dir, session_id);
+
+            let timestamp = chrono::Local::now().format("%Y-%m-%d_%H-%M-%S");
+            let log_path = format!("{}/{}_{}.txt", log_dir, timestamp, session_id);
             let mut log_file = match OpenOptions::new().create(true).append(true).open(&log_path) {
                 Ok(f) => f,
                 Err(e) => {
@@ -198,11 +197,9 @@ async fn run_stateful_agent(state: &AppState, request: AgentRequest) -> Response
     };
     drop(sessions);
 
-    // Блокируем сессию
     let mut session_guard = session_arc.lock().await;
     session_guard.last_used = Instant::now();
 
-    // Добавляем сообщение пользователя
     session_guard
         .engine
         .add_message(Role::User, request.prompt.clone());
@@ -224,12 +221,10 @@ async fn run_stateful_agent(state: &AppState, request: AgentRequest) -> Response
         .into_response();
     }
 
-    // Разделяем заимствования: берём отдельные ссылки на engine и log_file
     let Session {
         engine, log_file, ..
     } = &mut *session_guard;
 
-    // Выполняем цикл обработки
     match process_agent_turns(engine, &state.config, &state.context, &request, log_file).await {
         Ok(mut response) => {
             response.session_id = Some(session_id);

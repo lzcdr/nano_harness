@@ -1,6 +1,6 @@
 // src/tools.rs
 
-use crate::agent_core::AgentEndpoint;
+use crate::agent_core::{AgentConfig, AgentEndpoint};
 use crate::engine::{FunctionDefinition, ToolDefinition};
 use reqwest::blocking::Client;
 use reqwest::Method;
@@ -127,6 +127,126 @@ pub fn register_agent_call_functions(
     );
 }
 
+pub fn register_skill_functions(
+    engine: &mut Engine,
+    storage_base_url: &str,
+    storage_auth_token: &str,
+    config: &AgentConfig,
+) {
+    let base_url = storage_base_url.to_string();
+    let auth_token = storage_auth_token.to_string();
+    let agent_name = config.name.clone();
+    let min_code_len = config.skill_min_code_length;
+    let semantic_threshold = config.skill_semantic_threshold;
+
+    let client = reqwest::blocking::Client::new();
+
+    // skill_search(query) -> string
+    {
+        let c = client.clone();
+        let b = base_url.clone();
+        let t = auth_token.clone();
+        let a = agent_name.clone();
+        let th = semantic_threshold;
+        engine.register_fn("skill_search", move |query: String| -> String {
+            match crate::skill_manager::search_best_skill(&c, &b, &t, &a, &query, th, 5) {
+                Ok(Some((rec, score))) => format!("{} (score: {:.2})", rec.description, score),
+                Ok(None) => "Скилл не найден".to_string(),
+                Err(e) => format!("Ошибка поиска: {}", e),
+            }
+        });
+    }
+
+    // skill_load(skill_name) -> string
+    {
+        let c = client.clone();
+        let b = base_url.clone();
+        let t = auth_token.clone();
+        engine.register_fn("skill_load", move |name: String| -> String {
+            let catalog_json = crate::skill_manager::list_skills(&c, &b, &t).unwrap_or_default();
+            let catalog: crate::skill_manager::SkillCatalog =
+                serde_json::from_str(&catalog_json).unwrap_or_default();
+            if let Some(rec) = catalog.skills.iter().find(|r| r.skill_file.contains(&name)) {
+                crate::skill_manager::load_skill(&c, &b, &t, &rec.skill_file)
+                    .unwrap_or_else(|e| format!("Ошибка: {}", e))
+            } else {
+                format!("Скилл '{}' не найден", name)
+            }
+        });
+    }
+
+    // skill_save(skill_name, description, prompt, rhai_code) -> string
+    {
+        let c = client.clone();
+        let b = base_url.clone();
+        let t = auth_token.clone();
+        let a = agent_name.clone();
+        let min_len = min_code_len;
+        engine.register_fn(
+            "skill_save",
+            move |skill_name: String,
+                  description: String,
+                  prompt: String,
+                  rhai_code: String|
+                  -> String {
+                match crate::skill_manager::save_skill(
+                    &c,
+                    &b,
+                    &t,
+                    &skill_name,
+                    &a,
+                    &description,
+                    &prompt,
+                    &rhai_code,
+                    min_len,
+                ) {
+                    Ok(_) => "OK".to_string(),
+                    Err(e) => format!("Ошибка сохранения: {}", e),
+                }
+            },
+        );
+    }
+
+    // skill_record_usage(skill_name, success) -> string
+    {
+        let c = client.clone();
+        let b = base_url.clone();
+        let t = auth_token.clone();
+        engine.register_fn(
+            "skill_record_usage",
+            move |skill_name: String, success: bool| -> String {
+                let catalog_json =
+                    crate::skill_manager::list_skills(&c, &b, &t).unwrap_or_default();
+                let catalog: crate::skill_manager::SkillCatalog =
+                    serde_json::from_str(&catalog_json).unwrap_or_default();
+                if let Some(rec) = catalog
+                    .skills
+                    .iter()
+                    .find(|r| r.skill_file.contains(&skill_name))
+                {
+                    match crate::skill_manager::record_usage(&c, &b, &t, &rec.skill_file, success) {
+                        Ok(_) => "OK".to_string(),
+                        Err(e) => format!("Ошибка: {}", e),
+                    }
+                } else {
+                    "Скилл не найден".to_string()
+                }
+            },
+        );
+    }
+
+    // skill_list() -> string
+    {
+        let c = client.clone();
+        let b = base_url.clone();
+        let t = auth_token.clone();
+        engine.register_fn("skill_list", move || -> String {
+            crate::skill_manager::list_skills(&c, &b, &t)
+                .unwrap_or_else(|e| format!("Ошибка: {}", e))
+        });
+    }
+}
+
 pub async fn execute_tool(
     name: &str,
     args: &str,
@@ -177,7 +297,6 @@ fn run_rhai_code(code: &str, storage_base_url: &str, storage_auth_token: &str) -
     engine.set_max_call_levels(32);
     engine.set_max_string_size(1024 * 10);
 
-    // Перехват вывода print
     let output = Rc::new(RefCell::new(String::new()));
     let output_clone = output.clone();
     engine.on_print(move |s| output_clone.borrow_mut().push_str(s));
