@@ -61,6 +61,8 @@ pub struct AgentConfig {
     pub skill_min_code_length: usize,
     #[serde(default)]
     pub agent_call_timeout_sec: Option<u64>,
+    #[serde(default = "default_skill_auto_execute_threshold")]
+    pub skill_auto_execute_threshold: f32,
 }
 
 fn default_skill_mode() -> String {
@@ -71,6 +73,9 @@ fn default_skill_semantic_threshold() -> f32 {
 }
 fn default_skill_min_code_length() -> usize {
     100
+}
+fn default_skill_auto_execute_threshold() -> f32 {
+    0.15
 }
 
 #[derive(Debug, Deserialize)]
@@ -216,6 +221,8 @@ pub async fn process_agent_turns(
     let mut tool_calls_log = Vec::new();
     let mut final_response = None;
     let rhai_timeout = config.rhai_timeout_sec.unwrap_or(30);
+
+    // Флаг, указывающий, что подходящий скилл был найден и внедрён (не автоисполнен)
     let mut skill_found = false;
 
     // Автоматический поиск скилла перед запросом
@@ -226,10 +233,10 @@ pub async fn process_agent_turns(
         let prompt = request.prompt.clone();
         let threshold = config.skill_semantic_threshold;
 
-        let skill_result =
-            tokio::task::spawn_blocking(move || -> Result<Option<(String, String)>> {
+        let skill_result = tokio::task::spawn_blocking(
+            move || -> Result<Option<(crate::skill_manager::SkillRecord, f32)>> {
                 let client = reqwest::blocking::Client::new();
-                let best = crate::skill_manager::search_best_skill(
+                crate::skill_manager::search_best_skill(
                     &client,
                     &storage_base_url,
                     &storage_auth_token,
@@ -237,29 +244,88 @@ pub async fn process_agent_turns(
                     &prompt,
                     threshold,
                     10,
-                )?;
-                if let Some((rec, _score)) = best {
-                    let content = crate::skill_manager::load_skill(
-                        &client,
-                        &storage_base_url,
-                        &storage_auth_token,
-                        &rec.skill_file,
-                    )?;
-                    Ok(Some((rec.skill_file, content)))
-                } else {
-                    Ok(None)
-                }
+                )
+            },
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("Join error: {}", e))??;
+
+        if let Some((skill_record, distance)) = skill_result {
+            let storage_base_url = context.storage_base_url.clone();
+            let storage_auth_token = context.storage_auth_token.clone();
+            let skill_file = skill_record.skill_file.clone();
+
+            let content = tokio::task::spawn_blocking(move || {
+                let client = reqwest::blocking::Client::new();
+                crate::skill_manager::load_skill(
+                    &client,
+                    &storage_base_url,
+                    &storage_auth_token,
+                    &skill_file,
+                )
             })
             .await
             .map_err(|e| anyhow::anyhow!("Join error: {}", e))??;
 
-        if let Some((skill_file, skill_content)) = skill_result {
-            engine.add_message(
-                Role::System,
-                format!("Найден подходящий скилл:\n{}", skill_content),
-            );
-            write_log(log_file, "skill_injected", &skill_file)?;
-            skill_found = true;
+            write_log(log_file, "skill_found", &skill_record.skill_file)?;
+            eprintln!("🔍 Найден скилл: {}", skill_record.skill_file);
+
+            if distance <= config.skill_auto_execute_threshold {
+                let code = extract_rhai_code(&content)
+                    .ok_or_else(|| anyhow::anyhow!("RHAI_CODE not found in skill"))?;
+
+                write_log(
+                    log_file,
+                    "skill_auto_execute",
+                    &format!("{} (distance: {:.4})", skill_record.skill_file, distance),
+                )?;
+                eprintln!(
+                    "⚡ Автоисполнение скилла: {} (distance: {:.4})",
+                    skill_record.skill_file, distance
+                );
+
+                let result = execute_skill_code_directly(context, config, code.clone()).await?;
+
+                write_log(
+                    log_file,
+                    "tool_result",
+                    &format!("run_code (auto from skill) -> {}", result),
+                )?;
+                eprintln!("✅ Результат автоисполнения: {}", result);
+
+                // Добавляем ответ ассистента в контекст
+                engine.add_message(Role::Assistant, result.clone());
+                write_log(log_file, "assistant", &result)?;
+
+                let tool_log = ToolCallLogEntry {
+                    name: "run_code".to_string(),
+                    arguments: serde_json::json!({ "code": code }).to_string(),
+                    result: result.clone(),
+                };
+
+                return Ok(AgentResponse {
+                    status: "completed".to_string(),
+                    result,
+                    reasoning: None,
+                    tool_calls_log: vec![tool_log],
+                    metrics: AgentMetrics {
+                        prompt_tokens: 0,
+                        completion_tokens: 0,
+                        cost_rub: 0.0,
+                        api_calls_count: 0,
+                    },
+                    error: None,
+                    session_id: None,
+                });
+            } else {
+                engine.add_message(
+                    Role::System,
+                    format!("Найден подходящий скилл:\n{}", content),
+                );
+                write_log(log_file, "skill_injected", &skill_record.skill_file)?;
+                eprintln!("💉 Скилл добавлен в контекст: {}", skill_record.skill_file);
+                skill_found = true;
+            }
         }
     }
 
@@ -345,7 +411,7 @@ pub async fn process_agent_turns(
                     let min_len = config.skill_min_code_length;
                     let skill_name_for_log = skill_name.clone();
 
-                    let save_result = tokio::task::spawn_blocking(move || {
+                    tokio::task::spawn_blocking(move || {
                         let client = reqwest::blocking::Client::new();
                         crate::skill_manager::save_skill(
                             &client,
@@ -363,6 +429,7 @@ pub async fn process_agent_turns(
                     .map_err(|e| anyhow::anyhow!("Join error: {}", e))??;
 
                     write_log(log_file, "skill_saved", &skill_name_for_log)?;
+                    eprintln!("💾 Скилл сохранён: {}", skill_name_for_log);
                 }
             }
         }
@@ -555,4 +622,45 @@ fn run_code_with_storage(
         }
         Err(e) => Err(anyhow::anyhow!("Rhai execution error: {}", e)),
     }
+}
+
+// Вспомогательные функции для работы скиллов (автоисполнение)
+
+fn extract_rhai_code(skill_content: &str) -> Option<String> {
+    let marker = "RHAI_CODE:";
+    let pos = skill_content.find(marker)?;
+    Some(skill_content[pos + marker.len()..].trim().to_string())
+}
+
+async fn execute_skill_code_directly(
+    context: &AgentContext,
+    config: &AgentConfig,
+    code: String,
+) -> Result<String> {
+    let storage_base_url = context.storage_base_url.clone();
+    let storage_auth_token = context.storage_auth_token.clone();
+    let agents = context.agents.clone();
+    let self_name = context.self_name.clone();
+    let agent_call_timeout = context.agent_call_timeout_sec;
+    let config_owned = config.clone();
+    let rhai_timeout = config.rhai_timeout_sec.unwrap_or(30);
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(rhai_timeout),
+        tokio::task::spawn_blocking(move || {
+            run_code_with_storage(
+                storage_base_url,
+                storage_auth_token,
+                agents,
+                self_name,
+                agent_call_timeout,
+                &config_owned,
+                &code,
+            )
+        }),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("Rhai execution timed out"))??;
+
+    result.map_err(|e| anyhow::anyhow!("Rhai execution error: {}", e))
 }
