@@ -284,7 +284,31 @@ pub async fn process_agent_turns(
                     skill_record.skill_file, distance
                 );
 
-                let result = execute_skill_code_directly(context, config, code.clone()).await?;
+                let result = execute_skill_code_directly(context, config, code.clone()).await;
+
+                // Обновляем счётчик использования скилла в зависимости от результата
+                let success = result.is_ok();
+                let storage_base_url = context.storage_base_url.clone();
+                let storage_auth_token = context.storage_auth_token.clone();
+                let skill_file = skill_record.skill_file.clone();
+                tokio::task::spawn_blocking(move || {
+                    let client = reqwest::blocking::Client::new();
+                    if let Err(e) = crate::skill_manager::record_usage(
+                        &client,
+                        &storage_base_url,
+                        &storage_auth_token,
+                        &skill_file,
+                        success,
+                    ) {
+                        eprintln!(
+                            "⚠️ Не удалось обновить счётчик скилла {}: {}",
+                            skill_file, e
+                        );
+                    }
+                });
+
+                // Если была ошибка, пробрасываем её
+                let result = result?;
 
                 write_log(
                     log_file,
