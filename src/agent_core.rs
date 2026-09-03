@@ -216,6 +216,7 @@ pub async fn process_agent_turns(
     let mut tool_calls_log = Vec::new();
     let mut final_response = None;
     let rhai_timeout = config.rhai_timeout_sec.unwrap_or(30);
+    let mut skill_found = false;
 
     // Автоматический поиск скилла перед запросом
     if config.skill_mode == "auto" {
@@ -258,6 +259,7 @@ pub async fn process_agent_turns(
                 format!("Найден подходящий скилл:\n{}", skill_content),
             );
             write_log(log_file, "skill_injected", &skill_file)?;
+            skill_found = true;
         }
     }
 
@@ -310,7 +312,7 @@ pub async fn process_agent_turns(
     let final_response = final_response.ok_or_else(|| anyhow::anyhow!("No response from agent"))?;
 
     // Автосохранение скилла после успешных вызовов run_code
-    if config.skill_mode == "auto" {
+    if config.skill_mode == "auto" && !skill_found {
         let rhai_calls: Vec<&ToolCallLogEntry> = tool_calls_log
             .iter()
             .filter(|t| t.name == "run_code" && !t.result.starts_with("Ошибка"))
