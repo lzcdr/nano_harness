@@ -17,8 +17,10 @@ const SKILLS_DIR: &str = ".skills";
 pub struct SkillRecord {
     pub skill_file: String,
     pub description_file: String,
+    pub prompt_file: String, // новое поле: файл с исходным промптом
     pub agent_name: String,
     pub description: String,
+    pub prompt: String, // новое поле: исходный промпт
     pub success_count: u32,
     pub fail_count: u32,
     pub ast_hash: String,
@@ -139,7 +141,6 @@ fn sha256(input: &str) -> String {
 }
 
 // ----- Основные функции -----
-
 pub fn search_best_skill(
     client: &Client,
     base_url: &str,
@@ -149,15 +150,27 @@ pub fn search_best_skill(
     semantic_threshold: f32,
     top_k: usize,
 ) -> Result<Option<(SkillRecord, f32)>> {
+    // 1. Загружаем каталог
     let catalog = load_catalog(client, base_url, auth_token)?;
-
-    let mut description_files: HashMap<String, SkillRecord> = HashMap::new();
-    for rec in &catalog.skills {
-        description_files.insert(rec.description_file.clone(), rec.clone());
+    if catalog.skills.is_empty() {
+        eprintln!("DEBUG: каталог скиллов пуст");
+        return Ok(None);
     }
 
+    // 2. Строим карту: ключ = нормализованный путь к файлу промпта (без префикса хранилища)
+    //    Будем хранить как путь с ".skills/" (как возвращает поиск после нормализации)
+    let mut prompt_file_to_record: HashMap<String, SkillRecord> = HashMap::new();
+    for rec in &catalog.skills {
+        // rec.prompt_file хранится как "skill_agent_..._prompt.txt"
+        // Добавляем ".skills/" для соответствия путям из поиска
+        let key = format!("{}/{}", SKILLS_DIR, rec.prompt_file.trim_start_matches('/'));
+        eprintln!("DEBUG: добавляем в карту ключ: {}", key);
+        prompt_file_to_record.insert(key, rec.clone());
+    }
+
+    // 3. Семантический поиск по промптам
     let search_url = format!("{}/search", base_url.trim_end_matches('/'));
-    let top_k_str = top_k.to_string();
+    let top_k_str = (top_k * 2).to_string(); // берём с запасом
     let resp = client
         .get(&search_url)
         .query(&[("query", prompt), ("top_k", &top_k_str)])
@@ -172,52 +185,80 @@ pub fn search_best_skill(
     let mut all_candidates: Vec<(SkillRecord, f32)> = Vec::new();
 
     for item in results {
-        let file_path = item.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
-        let score = item.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
-        if score < semantic_threshold {
+        let file_path_raw = item.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
+        let distance = item.get("distance").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+        eprintln!(
+            "DEBUG: результат поиска: file_path_raw='{}', distance={:.4}",
+            file_path_raw, distance
+        );
+
+        // Нормализуем путь: убираем возможные префиксы хранилища, оставляем только путь от корня .skills/
+        // Пример: ".local_storage/default_storage/.skills/skill_..._prompt.txt" -> ".skills/skill_..._prompt.txt"
+        let file_path = file_path_raw
+            .split('/')
+            .skip_while(|seg| *seg != SKILLS_DIR && !seg.ends_with(".txt")) // грубо, но для отладки
+            .collect::<Vec<_>>()
+            .join("/");
+
+        // Более надёжно: найти позицию ".skills/" и взять оттуда
+        let file_path = if let Some(pos) = file_path_raw.find(SKILLS_DIR) {
+            &file_path_raw[pos..]
+        } else {
+            file_path_raw
+        };
+        eprintln!("DEBUG: нормализованный путь: {}", file_path);
+
+        if distance > semantic_threshold {
+            eprintln!(
+                "DEBUG: расстояние {} > порога {} — пропускаем",
+                distance, semantic_threshold
+            );
             continue;
         }
-        if let Some(rec) = description_files.get(file_path) {
+
+        if let Some(rec) = prompt_file_to_record.get(file_path) {
+            eprintln!(
+                "DEBUG: НАЙДЕНО совпадение для path='{}', rec.agent={}",
+                file_path, rec.agent_name
+            );
             if rec.agent_name == current_agent {
-                own_candidates.push((rec.clone(), score));
+                own_candidates.push((rec.clone(), distance));
             }
-            all_candidates.push((rec.clone(), score));
+            all_candidates.push((rec.clone(), distance));
+        } else {
+            eprintln!("DEBUG: совпадений в каталоге нет для path='{}'", file_path);
         }
     }
 
-    let best_own = select_best_by_success_rate(&own_candidates);
-    let best_all = select_best_by_success_rate(&all_candidates);
+    // 4. Выбираем лучшего: сначала свои, потом все
+    if let Some(best_own) = select_best_by_success_rate(&own_candidates) {
+        eprintln!("DEBUG: выбран свой скилл: {}", best_own.0.skill_file);
+        return Ok(Some(best_own));
+    }
+    if let Some(best_all) = select_best_by_success_rate(&all_candidates) {
+        eprintln!("DEBUG: выбран чужой скилл: {}", best_all.0.skill_file);
+        return Ok(Some(best_all));
+    }
 
-    let best = match (best_own, best_all) {
-        (Some(own), Some(all)) => {
-            if success_rate(&own.0) >= success_rate(&all.0) {
-                Some(own)
-            } else {
-                Some(all)
-            }
-        }
-        (Some(own), None) => Some(own),
-        (None, Some(all)) => Some(all),
-        (None, None) => None,
-    };
-
-    Ok(best)
-}
-
-fn success_rate(rec: &SkillRecord) -> f32 {
-    rec.success_count as f32 / (rec.success_count + rec.fail_count + 1) as f32
+    eprintln!("DEBUG: подходящий скилл не найден");
+    Ok(None)
 }
 
 fn select_best_by_success_rate(candidates: &[(SkillRecord, f32)]) -> Option<(SkillRecord, f32)> {
     candidates
         .iter()
         .max_by(|a, b| {
-            success_rate(&a.0)
-                .partial_cmp(&success_rate(&b.0))
+            let ra = success_rate(&a.0);
+            let rb = success_rate(&b.0);
+            ra.partial_cmp(&rb)
                 .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+                .then_with(|| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
         })
         .cloned()
+}
+
+fn success_rate(rec: &SkillRecord) -> f32 {
+    rec.success_count as f32 / (rec.success_count + rec.fail_count + 1) as f32
 }
 
 pub fn load_skill(
@@ -249,35 +290,8 @@ pub fn save_skill(
         return Err(anyhow::anyhow!("Invalid Rhai code"));
     }
 
-    // Проверка уникальности по семантике описания
-    let catalog = load_catalog(client, base_url, auth_token)?;
-    let search_url = format!("{}/search", base_url.trim_end_matches('/'));
-    let top_k_str = "5".to_string();
-    let resp = client
-        .get(&search_url)
-        .query(&[("query", prompt), ("top_k", &top_k_str)])
-        .header("Authorization", format!("Bearer {}", auth_token))
-        .send()?;
-    if resp.status().is_success() {
-        let results: Vec<serde_json::Value> = resp.json()?;
-        let mut max_score = 0.0f32;
-        for item in results {
-            let file_path = item.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
-            let score = item.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
-            if catalog
-                .skills
-                .iter()
-                .any(|r| r.description_file == file_path)
-            {
-                if score > max_score {
-                    max_score = score;
-                }
-            }
-        }
-        if max_score > 0.7 {
-            return Ok(());
-        }
-    }
+    // В автоматическом режиме поиск уже был выполнен перед вызовом этой функции,
+    // поэтому если мы здесь, значит подходящего скилла нет — сохраняем без дополнительных проверок.
 
     let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
     let normalized_name = if skill_name.trim().is_empty() {
@@ -291,7 +305,9 @@ pub fn save_skill(
         agent_name, normalized_name, timestamp
     );
     let description_file = format!("{}_description.txt", skill_file.trim_end_matches(".txt"));
+    let prompt_file = format!("{}_prompt.txt", skill_file.trim_end_matches(".txt"));
 
+    // Основной файл скилла
     let content = format!(
         "SKILL: {}\nFOR: {}\nDESCRIPTION: {}\n\nINSTRUCTION:\n{}\n\nRHAI_CODE:\n{}\n",
         if skill_name.trim().is_empty() {
@@ -304,16 +320,23 @@ pub fn save_skill(
         prompt,
         rhai_code
     );
-
     write_file(client, base_url, auth_token, &skill_file, &content)?;
+
+    // Файл описания (для совместимости или ручного режима)
     write_file(client, base_url, auth_token, &description_file, description)?;
 
+    // Файл промпта (для семантического поиска)
+    write_file(client, base_url, auth_token, &prompt_file, prompt)?;
+
+    // Обновляем каталог
     let mut catalog = load_catalog(client, base_url, auth_token)?;
     catalog.skills.push(SkillRecord {
         skill_file,
         description_file,
+        prompt_file,
         agent_name: agent_name.to_string(),
         description: description.to_string(),
+        prompt: prompt.to_string(),
         success_count: 0,
         fail_count: 0,
         ast_hash,
