@@ -100,3 +100,7 @@ curl.exe -X POST "http://127.0.0.1:8081/agent/run" -H "Authorization: Bearer age
 ```powershell
 curl.exe "http://127.0.0.1:8080/files?path=example.txt" -H "Authorization: Bearer wrong"
 ```
+## Использование скилов
+```powershell
+curl.exe -X POST http://127.0.0.1:8081/agent/run -H "Authorization: Bearer agent_token_1" -H "Content-Type: application/json" -d '{"prompt":"Напиши и выполни Rhai-код, который создаёт директорию test_skill_dir и записывает в неё файл example.txt с текстом Привет от агента. Код должен быть не короче 150 символов."}'
+```
