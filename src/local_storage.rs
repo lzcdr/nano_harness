@@ -78,7 +78,8 @@ struct VectorDb {
     hnsw: Hnsw<'static, f32, DistCosine>,
     entries: Vec<(String, ChunkMeta)>,
     label_to_id: HashMap<String, usize>,
-    id_to_label: HashMap<usize, String>, // ← ДОБАВЛЕНО: обратный индекс для O(1) поиска
+    id_to_label: HashMap<usize, String>,
+    id_to_meta: HashMap<usize, ChunkMeta>,
     deleted_ids: HashSet<usize>,
     next_id: usize,
 }
@@ -117,6 +118,7 @@ impl VectorDb {
             entries: Vec::new(),
             label_to_id: HashMap::new(),
             id_to_label: HashMap::new(),
+            id_to_meta: HashMap::new(),
             deleted_ids: HashSet::new(),
             next_id: 0,
         })
@@ -167,6 +169,12 @@ impl VectorDb {
                 valid_entries.push((label, meta));
             }
             db.entries = valid_entries;
+
+            for (label, meta) in &db.entries {
+                if let Some(&id) = db.label_to_id.get(label) {
+                    db.id_to_meta.insert(id, meta.clone());
+                }
+            }
         }
         eprintln!(
             "✅ Индекс загружен за {:?}, записей: {}",
@@ -339,20 +347,19 @@ impl VectorDb {
             self.next_id += 1;
             self.hnsw.insert((&emb, id));
             self.label_to_id.insert(label.clone(), id);
-            self.id_to_label.insert(id, label.clone()); // ← ДОБАВЛЕНО
-            self.entries.push((
-                label,
-                ChunkMeta {
-                    file_path: file_path.to_path_buf(),
-                    chunk_index: i as u32,
-                    start_byte,
-                    end_byte,
-                    content: chunk_text,
-                    embedding: emb,
-                    file_size,
-                    modified,
-                },
-            ));
+            self.id_to_label.insert(id, label.clone());
+            let meta = ChunkMeta {
+                file_path: file_path.to_path_buf(),
+                chunk_index: i as u32,
+                start_byte,
+                end_byte,
+                content: chunk_text,
+                embedding: emb,
+                file_size,
+                modified,
+            };
+            self.entries.push((label.clone(), meta.clone()));
+            self.id_to_meta.insert(id, meta);
         }
         eprintln!("✅ Индексация файла завершена за {:?}", start.elapsed());
         Ok(())
@@ -368,16 +375,13 @@ impl VectorDb {
             if self.deleted_ids.contains(&id) {
                 continue;
             }
-            // ← ИСПРАВЛЕНО: O(1) вместо O(n)
-            if let Some(label) = self.id_to_label.get(&id) {
-                if let Some((_, meta)) = self.entries.iter().find(|(l, _)| l == label) {
-                    results.push(SearchResult {
-                        file_path: meta.file_path.clone(),
-                        chunk_index: meta.chunk_index,
-                        distance: neighbour.distance,
-                        content_fragment: meta.content.clone(),
-                    });
-                }
+            if let Some(meta) = self.id_to_meta.get(&id) {
+                results.push(SearchResult {
+                    file_path: meta.file_path.clone(),
+                    chunk_index: meta.chunk_index,
+                    distance: neighbour.distance,
+                    content_fragment: meta.content.clone(),
+                });
             }
             if results.len() >= top_k {
                 break;
@@ -396,7 +400,8 @@ impl VectorDb {
         let start = std::time::Instant::now();
         self.entries.clear();
         self.label_to_id.clear();
-        self.id_to_label.clear(); // ← ДОБАВЛЕНО
+        self.id_to_label.clear();
+        self.id_to_meta.clear();
         self.deleted_ids.clear();
         self.next_id = 0;
         self.hnsw = Hnsw::new(16, 100_000, 32, 200, DistCosine);
@@ -627,7 +632,8 @@ impl LocalStorage {
         for label in old_labels {
             if let Some(id) = self.vector_db.label_to_id.remove(&label) {
                 self.vector_db.deleted_ids.insert(id);
-                self.vector_db.id_to_label.remove(&id); // ← ДОБАВЛЕНО
+                self.vector_db.id_to_label.remove(&id);
+                self.vector_db.id_to_meta.remove(&id);
             }
             self.vector_db.entries.retain(|(l, _)| l != &label);
         }
