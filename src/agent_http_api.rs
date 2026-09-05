@@ -9,10 +9,9 @@ use axum::{
     Json, Router,
 };
 use std::collections::HashMap;
-use std::fs::OpenOptions;
 use std::io::Write;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::agent_core::{
@@ -20,6 +19,7 @@ use crate::agent_core::{
     AgentRequest, AgentResponse, AgentType,
 };
 use crate::engine::Role;
+use crate::session_store;
 
 struct Session {
     engine: crate::engine::ChatEngine,
@@ -54,14 +54,6 @@ async fn auth_middleware(
     }
 }
 
-fn generate_session_id() -> String {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    format!("{:x}", nanos)
-}
-
 fn write_log(file: &mut std::fs::File, role: &str, content: &str) -> anyhow::Result<()> {
     writeln!(
         file,
@@ -73,33 +65,81 @@ fn write_log(file: &mut std::fs::File, role: &str, content: &str) -> anyhow::Res
     Ok(())
 }
 
+fn error_response(e: anyhow::Error) -> Response {
+    Json(AgentResponse {
+        status: "failed".to_string(),
+        result: String::new(),
+        reasoning: None,
+        tool_calls_log: vec![],
+        metrics: AgentMetrics {
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            cost_rub: 0.0,
+            api_calls_count: 0,
+        },
+        error: Some(format!("{:#}", e)),
+        session_id: None,
+    })
+    .into_response()
+}
+
 async fn run_stateful_agent(state: &AppState, request: AgentRequest) -> Response {
     let session_id = request
         .session_id
         .clone()
-        .unwrap_or_else(generate_session_id);
-    let mut sessions = state.sessions.lock().await;
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
-    if let Some(ttl) = state.config.session_ttl_secs {
-        let now = Instant::now();
-        let mut to_remove = Vec::new();
-        for (id, session_arc) in sessions.iter() {
-            if let Ok(session) = session_arc.try_lock() {
-                if now.duration_since(session.last_used) >= Duration::from_secs(ttl) {
-                    to_remove.push(id.clone());
-                }
+    // Попытка получить из кэша
+    {
+        let sessions = state.sessions.lock().await;
+        if let Some(cached) = sessions.get(&session_id).cloned() {
+            drop(sessions);
+            let mut session_guard = cached.lock().await;
+            session_guard.last_used = Instant::now();
+
+            session_guard
+                .engine
+                .add_message(Role::User, request.prompt.clone());
+            if let Err(e) = write_log(&mut session_guard.log_file, "task", &request.prompt) {
+                eprintln!("Ошибка записи в лог: {}", e);
             }
-        }
-        for id in to_remove {
-            sessions.remove(&id);
-        }
-    }
 
-    let session_arc = match sessions.get(&session_id) {
-        Some(s) => s.clone(),
-        None => {
-            let mut engine = match create_agent_engine(&state.config) {
-                Ok(e) => e,
+            let Session {
+                engine, log_file, ..
+            } = &mut *session_guard;
+
+            match process_agent_turns(engine, &state.config, &state.context, &request, log_file)
+                .await
+            {
+                Ok(mut response) => {
+                    response.session_id = Some(session_id.clone());
+                    // Обновить и сохранить сессию
+                    if let Ok(mut store_session) = session_store::load_session(&session_id) {
+                        if let Some(ctx) = store_session
+                            .contexts
+                            .agents
+                            .iter_mut()
+                            .find(|a| a.name == state.config.name)
+                        {
+                            ctx.engine_state = engine.get_state();
+                            ctx.engine_config = engine.get_config().clone();
+                        } else {
+                            store_session
+                                .contexts
+                                .agents
+                                .push(session_store::AgentContextBlock {
+                                    name: state.config.name.clone(),
+                                    engine_config: engine.get_config().clone(),
+                                    engine_state: engine.get_state(),
+                                });
+                        }
+                        store_session.updated_at = session_store::now_ts();
+                        if let Err(e) = session_store::save_session(&store_session) {
+                            eprintln!("Ошибка сохранения сессии: {}", e);
+                        }
+                    }
+                    return Json(response).into_response();
+                }
                 Err(e) => {
                     return Json(AgentResponse {
                         status: "failed".to_string(),
@@ -113,112 +153,107 @@ async fn run_stateful_agent(state: &AppState, request: AgentRequest) -> Response
                             api_calls_count: 0,
                         },
                         error: Some(format!("{:#}", e)),
-                        session_id: None,
+                        session_id: Some(session_id),
                     })
                     .into_response();
                 }
             };
+        }
+    }
 
-            let system_prompt = state
-                .config
-                .system_prompt
-                .clone()
-                .unwrap_or_else(|| "Вы - полезный ассистент.".to_string());
-            engine.add_message(Role::System, system_prompt.clone());
-
-            let log_dir = format!("chats/{}", state.config.name);
-            if let Err(e) = std::fs::create_dir_all(&log_dir) {
-                return Json(AgentResponse {
-                    status: "failed".to_string(),
-                    result: String::new(),
-                    reasoning: None,
-                    tool_calls_log: vec![],
-                    metrics: AgentMetrics {
-                        prompt_tokens: 0,
-                        completion_tokens: 0,
-                        cost_rub: 0.0,
-                        api_calls_count: 0,
-                    },
-                    error: Some(format!("Failed to create log dir: {}", e)),
-                    session_id: None,
-                })
-                .into_response();
+    // Загрузка или создание сессии
+    let mut store_session = match session_store::load_session_with_key(
+        &session_id,
+        &state.config.api_key,
+        Some(&state.config.name),
+    ) {
+        Ok(s) => {
+            // restore_api_key_for_agent уже применён внутри load_session_with_key
+            s
+        }
+        Err(_) => {
+            let display_name = format!("Agent session {}", session_id);
+            match session_store::create_session_with_id(&session_id, &display_name) {
+                Ok(s) => s,
+                Err(e) => return error_response(e),
             }
-
-            let timestamp = chrono::Local::now().format("%Y-%m-%d_%H-%M-%S");
-            let log_path = format!("{}/{}_{}.txt", log_dir, timestamp, session_id);
-            let mut log_file = match OpenOptions::new().create(true).append(true).open(&log_path) {
-                Ok(f) => f,
-                Err(e) => {
-                    return Json(AgentResponse {
-                        status: "failed".to_string(),
-                        result: String::new(),
-                        reasoning: None,
-                        tool_calls_log: vec![],
-                        metrics: AgentMetrics {
-                            prompt_tokens: 0,
-                            completion_tokens: 0,
-                            cost_rub: 0.0,
-                            api_calls_count: 0,
-                        },
-                        error: Some(format!("Failed to open log file: {}", e)),
-                        session_id: None,
-                    })
-                    .into_response();
-                }
-            };
-            if let Err(e) = write_log(&mut log_file, "system", &system_prompt) {
-                return Json(AgentResponse {
-                    status: "failed".to_string(),
-                    result: String::new(),
-                    reasoning: None,
-                    tool_calls_log: vec![],
-                    metrics: AgentMetrics {
-                        prompt_tokens: 0,
-                        completion_tokens: 0,
-                        cost_rub: 0.0,
-                        api_calls_count: 0,
-                    },
-                    error: Some(format!("Failed to write system log: {}", e)),
-                    session_id: None,
-                })
-                .into_response();
-            }
-
-            let session = Session {
-                engine,
-                log_file,
-                last_used: Instant::now(),
-            };
-            let arc = Arc::new(AsyncMutex::new(session));
-            sessions.insert(session_id.clone(), arc.clone());
-            arc
         }
     };
-    drop(sessions);
 
-    let mut session_guard = session_arc.lock().await;
+    // Инициализация лога для агента
+    if let Err(e) =
+        session_store::add_or_update_log(&mut store_session, "agent", Some(&state.config.name))
+    {
+        eprintln!("Ошибка инициализации лога: {}", e);
+    }
+
+    // Получение или создание контекста агента
+    let agent_ctx = store_session
+        .contexts
+        .agents
+        .iter_mut()
+        .find(|a| a.name == state.config.name);
+
+    let engine = if let Some(ctx) = agent_ctx {
+        let mut engine = match create_agent_engine(&state.config) {
+            Ok(e) => e,
+            Err(e) => return error_response(e),
+        };
+        engine.set_state(ctx.engine_state.clone());
+        engine
+    } else {
+        let mut engine = match create_agent_engine(&state.config) {
+            Ok(e) => e,
+            Err(e) => return error_response(e),
+        };
+        let system_prompt = state
+            .config
+            .system_prompt
+            .clone()
+            .unwrap_or_else(|| "Вы - полезный ассистент.".to_string());
+        engine.add_message(Role::System, system_prompt);
+        store_session
+            .contexts
+            .agents
+            .push(session_store::AgentContextBlock {
+                name: state.config.name.clone(),
+                engine_config: engine.get_config().clone(),
+                engine_state: engine.get_state(),
+            });
+        engine
+    };
+
+    // Открытие лог-файла
+    let log_file = match session_store::open_log(&session_id, "agent", Some(&state.config.name)) {
+        Ok(f) => f,
+        Err(e) => return error_response(e),
+    };
+
+    // Сохранение сессии после возможного создания контекста
+    if let Err(e) = session_store::save_session(&store_session) {
+        eprintln!("Ошибка сохранения сессии: {}", e);
+    }
+
+    // Кэширование сессии
+    let session = Session {
+        engine,
+        log_file,
+        last_used: Instant::now(),
+    };
+    let arc = Arc::new(AsyncMutex::new(session));
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_id.clone(), arc.clone());
+
+    let mut session_guard = arc.lock().await;
     session_guard.last_used = Instant::now();
-
     session_guard
         .engine
         .add_message(Role::User, request.prompt.clone());
     if let Err(e) = write_log(&mut session_guard.log_file, "task", &request.prompt) {
-        return Json(AgentResponse {
-            status: "failed".to_string(),
-            result: String::new(),
-            reasoning: None,
-            tool_calls_log: vec![],
-            metrics: AgentMetrics {
-                prompt_tokens: 0,
-                completion_tokens: 0,
-                cost_rub: 0.0,
-                api_calls_count: 0,
-            },
-            error: Some(format!("Failed to write task log: {}", e)),
-            session_id: None,
-        })
-        .into_response();
+        eprintln!("Ошибка записи в лог: {}", e);
     }
 
     let Session {
@@ -227,25 +262,52 @@ async fn run_stateful_agent(state: &AppState, request: AgentRequest) -> Response
 
     match process_agent_turns(engine, &state.config, &state.context, &request, log_file).await {
         Ok(mut response) => {
-            response.session_id = Some(session_id);
-            Json(response).into_response()
+            response.session_id = Some(session_id.clone());
+            // Обновить и сохранить сессию
+            if let Ok(mut store_session) = session_store::load_session(&session_id) {
+                if let Some(ctx) = store_session
+                    .contexts
+                    .agents
+                    .iter_mut()
+                    .find(|a| a.name == state.config.name)
+                {
+                    ctx.engine_state = engine.get_state();
+                    ctx.engine_config = engine.get_config().clone();
+                } else {
+                    store_session
+                        .contexts
+                        .agents
+                        .push(session_store::AgentContextBlock {
+                            name: state.config.name.clone(),
+                            engine_config: engine.get_config().clone(),
+                            engine_state: engine.get_state(),
+                        });
+                }
+                store_session.updated_at = session_store::now_ts();
+                if let Err(e) = session_store::save_session(&store_session) {
+                    eprintln!("Ошибка сохранения сессии: {}", e);
+                }
+            }
+            return Json(response).into_response();
         }
-        Err(e) => Json(AgentResponse {
-            status: "failed".to_string(),
-            result: String::new(),
-            reasoning: None,
-            tool_calls_log: vec![],
-            metrics: AgentMetrics {
-                prompt_tokens: 0,
-                completion_tokens: 0,
-                cost_rub: 0.0,
-                api_calls_count: 0,
-            },
-            error: Some(format!("{:#}", e)),
-            session_id: Some(session_id),
-        })
-        .into_response(),
-    }
+        Err(e) => {
+            return Json(AgentResponse {
+                status: "failed".to_string(),
+                result: String::new(),
+                reasoning: None,
+                tool_calls_log: vec![],
+                metrics: AgentMetrics {
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    cost_rub: 0.0,
+                    api_calls_count: 0,
+                },
+                error: Some(format!("{:#}", e)),
+                session_id: Some(session_id),
+            })
+            .into_response();
+        }
+    };
 }
 
 async fn run_agent_handler(

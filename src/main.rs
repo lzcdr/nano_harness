@@ -1,15 +1,15 @@
 // src/main.rs
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use reqwest::Client;
-use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::time::Duration;
 
 use nano_harness::config::{build_engine_config, TomlConfig};
 use nano_harness::engine::{ChatEngine, Role};
+use nano_harness::session_store;
 use nano_harness::tools::execute_tool;
 
 #[derive(Parser, Debug)]
@@ -57,19 +57,12 @@ struct Args {
 
     #[arg(long, default_value = "60", help = "Таймаут HTTP в секундах")]
     timeout_sec: u64,
+
+    #[arg(long, help = "ID существующей сессии для продолжения")]
+    session: Option<String>,
 }
 
-fn sanitize_model_name(model: &str) -> String {
-    model
-        .chars()
-        .map(|c| match c {
-            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
-            _ => c,
-        })
-        .collect()
-}
-
-fn write_log(file: &mut fs::File, role: &str, content: &str) -> Result<()> {
+fn write_log(file: &mut std::fs::File, role: &str, content: &str) -> Result<()> {
     writeln!(
         file,
         "[{}] {}: {}",
@@ -122,18 +115,41 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|| "Ты полезный ассистент. Отвечай кратко и по делу.".to_string());
     engine.add_message(Role::System, system_prompt.clone());
 
-    fs::create_dir_all("chats")?;
+    // Работа с сессией
+    let mut current_session = if let Some(sid) = args.session.clone() {
+        session_store::load_session_with_key(&sid, &engine_config.api_key, None)
+            .with_context(|| format!("Не удалось загрузить сессию '{}'", sid))?
+    } else {
+        let auto_name = format!("Сессия {}", chrono::Local::now().format("%Y-%m-%d %H:%M"));
+        session_store::new_session(&auto_name).with_context(|| "Не удалось создать новую сессию")?
+    };
 
-    let timestamp = chrono::Local::now().format("%Y-%m-%d_%H-%M-%S");
-    let safe_model = sanitize_model_name(&engine_config.model);
-    let log_path = format!("chats/{}_{}.txt", timestamp, safe_model);
+    // Восстановление контекста чата, если есть
+    if let Some(chat_ctx) = current_session.contexts.chat.clone() {
+        engine.set_state(chat_ctx.engine_state);
+    } else {
+        // Для новой сессии заполняем контекст текущим состоянием движка (system_prompt уже добавлен)
+        current_session.contexts.chat = Some(session_store::ContextBlock {
+            engine_config: engine.get_config().clone(),
+            engine_state: engine.get_state(),
+        });
+    }
 
-    let mut log_file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)?;
+    // Открытие лога
+    let mut log_file = session_store::open_log(&current_session.session_id, "chat", None)
+        .with_context(|| {
+            format!(
+                "Не удалось открыть лог-файл для сессии '{}'",
+                current_session.session_id
+            )
+        })?;
+    session_store::add_or_update_log(&mut current_session, "chat", None)
+        .with_context(|| "Не удалось добавить запись о логе в сессию")?;
+    if let Err(e) = session_store::save_session(&current_session) {
+        eprintln!("Ошибка сохранения сессии: {}", e);
+    }
 
-    println!("📝 Лог чата: {}", log_path);
+    println!("📝 Сессия: {}", current_session.session_id);
     write_log(&mut log_file, "system", &system_prompt)?;
 
     println!("🤖 Чат запущен");
@@ -163,7 +179,7 @@ async fn main() -> Result<()> {
     if let Some(tail) = engine_config.tail_message_count {
         println!("   Хвост: {} пар", tail);
     }
-    println!("   Команды: /clear, /metrics, /system <текст>, /fix, /exit");
+    println!("   Команды: /clear, /metrics, /system <текст>, /fix, /session, /exit");
     println!();
 
     let storage_http_config = toml_config
@@ -177,7 +193,6 @@ async fn main() -> Result<()> {
             },
         );
 
-    // Получаем глобальный таймаут Rhai из конфига (по умолчанию 30)
     let rhai_timeout_sec = toml_config.rhai_timeout_sec.unwrap_or(30);
 
     let mut stdin = tokio::io::BufReader::new(tokio::io::stdin());
@@ -244,6 +259,91 @@ async fn main() -> Result<()> {
                     engine.tail_word_count()
                 );
                 println!();
+                continue;
+            }
+            "/session" => {
+                let parts: Vec<&str> = user_input.splitn(3, ' ').collect();
+                match parts.get(1) {
+                    Some(&"list") => {
+                        let sessions = session_store::list_sessions()?;
+                        println!("Список сессий:");
+                        for s in sessions {
+                            println!(
+                                "  {} - {} (обновлена: {})",
+                                s.session_id, s.display_name, s.updated_at
+                            );
+                        }
+                    }
+                    Some(&"new") => {
+                        let name = parts.get(2).copied().unwrap_or("Новая сессия");
+                        current_session = session_store::new_session(name)
+                            .with_context(|| "Не удалось создать новую сессию")?;
+                        engine = ChatEngine::new(engine_config.clone(), client.clone());
+                        engine.add_message(Role::System, system_prompt.clone());
+                        // Сразу заполняем контекст в новой сессии
+                        current_session.contexts.chat = Some(session_store::ContextBlock {
+                            engine_config: engine.get_config().clone(),
+                            engine_state: engine.get_state(),
+                        });
+                        log_file =
+                            session_store::open_log(&current_session.session_id, "chat", None)
+                                .with_context(|| {
+                                    format!(
+                                        "Не удалось открыть лог для сессии '{}'",
+                                        current_session.session_id
+                                    )
+                                })?;
+                        session_store::add_or_update_log(&mut current_session, "chat", None)?;
+                        if let Err(e) = session_store::save_session(&current_session) {
+                            eprintln!("Ошибка сохранения сессии: {}", e);
+                        }
+                        println!("Создана сессия {}", current_session.session_id);
+                    }
+                    Some(&"switch") => {
+                        if let Some(sid) = parts.get(2) {
+                            current_session = session_store::load_session_with_key(
+                                sid,
+                                &engine_config.api_key,
+                                None,
+                            )
+                            .with_context(|| format!("Не удалось загрузить сессию '{}'", sid))?;
+                            engine = ChatEngine::new(engine_config.clone(), client.clone());
+                            if let Some(chat_ctx) = current_session.contexts.chat.clone() {
+                                engine.set_state(chat_ctx.engine_state);
+                            } else {
+                                engine.add_message(Role::System, system_prompt.clone());
+                                current_session.contexts.chat = Some(session_store::ContextBlock {
+                                    engine_config: engine.get_config().clone(),
+                                    engine_state: engine.get_state(),
+                                });
+                            }
+                            log_file =
+                                session_store::open_log(&current_session.session_id, "chat", None)
+                                    .with_context(|| {
+                                        format!(
+                                            "Не удалось открыть лог для сессии '{}'",
+                                            current_session.session_id
+                                        )
+                                    })?;
+                            session_store::add_or_update_log(&mut current_session, "chat", None)?;
+                            if let Err(e) = session_store::save_session(&current_session) {
+                                eprintln!("Ошибка сохранения сессии: {}", e);
+                            }
+                            println!("Переключено на сессию {}", sid);
+                        } else {
+                            println!("Укажите ID сессии");
+                        }
+                    }
+                    Some(&"rename") => {
+                        if let Some(name) = parts.get(2) {
+                            current_session.display_name = name.to_string();
+                            current_session.updated_at = session_store::now_ts();
+                            session_store::save_session(&current_session)?;
+                            println!("Имя сессии изменено");
+                        }
+                    }
+                    _ => println!("Команды: /session list|new|switch <id>|rename <имя>"),
+                }
                 continue;
             }
             _ => {}
@@ -318,7 +418,7 @@ async fn main() -> Result<()> {
                         Some(&client),
                         &storage_http_config.bind_addr,
                         &storage_http_config.auth_token,
-                        rhai_timeout_sec, // <-- передаём таймаут
+                        rhai_timeout_sec,
                     )
                     .await;
                     println!("✅ Автовыполнение: {}", result);
@@ -341,7 +441,7 @@ async fn main() -> Result<()> {
                             Some(&client),
                             &storage_http_config.bind_addr,
                             &storage_http_config.auth_token,
-                            rhai_timeout_sec, // <-- передаём таймаут
+                            rhai_timeout_sec,
                         )
                         .await;
                         println!("✅ Выполнено: {}", result);
@@ -383,6 +483,16 @@ async fn main() -> Result<()> {
                     final_response.reasoning
                 );
             }
+        }
+
+        // Сохранение сессии после каждого обмена
+        current_session.contexts.chat = Some(session_store::ContextBlock {
+            engine_config: engine.get_config().clone(),
+            engine_state: engine.get_state(),
+        });
+        current_session.updated_at = session_store::now_ts();
+        if let Err(e) = session_store::save_session(&current_session) {
+            eprintln!("Ошибка сохранения сессии: {}", e);
         }
 
         println!(
