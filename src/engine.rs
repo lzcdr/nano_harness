@@ -68,7 +68,7 @@ pub struct FunctionDefinition {
 // 2. МЕТРИКИ СЕССИИ
 // ============================================================================
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct SessionMetrics {
     pub total_prompt_tokens: u32,
     pub total_completion_tokens: u32,
@@ -122,13 +122,13 @@ pub struct EngineResponse {
 // ============================================================================
 
 /// Конфигурация разрешённого инструмента и режима его выполнения
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ToolExecutionConfig {
     pub name: String,
     pub mode: String, // "auto" или "manual"
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineConfig {
     pub api_key: String,
     pub base_url: String,
@@ -174,8 +174,8 @@ impl Default for EngineConfig {
 // 5. ДВИЖОК
 // ============================================================================
 
-#[derive(Clone)]
-struct Turn {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Turn {
     messages: Vec<Message>,
 }
 
@@ -638,6 +638,28 @@ impl ChatEngine {
             tool_calls: final_tool_calls,
             usage: final_usage,
         })
+    }
+
+    pub fn get_state(&self) -> crate::session_store::EngineState {
+        crate::session_store::EngineState {
+            system_messages: self.system_messages.clone(),
+            prefix_turns: self.prefix_turns.clone(),
+            tail_turns: self.tail_turns.clone(),
+            pending_turn: self.pending_turn.clone(),
+            metrics: self.metrics.clone(),
+        }
+    }
+
+    pub fn set_state(&mut self, state: crate::session_store::EngineState) {
+        self.system_messages = state.system_messages;
+        self.prefix_turns = state.prefix_turns;
+        self.tail_turns = state.tail_turns;
+        self.pending_turn = state.pending_turn;
+        self.metrics = state.metrics;
+    }
+
+    pub fn get_config(&self) -> &EngineConfig {
+        &self.config
     }
 }
 
