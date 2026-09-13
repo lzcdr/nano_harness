@@ -1,16 +1,17 @@
 // src/tools.rs
 
-use crate::agent_core::{AgentConfig, AgentEndpoint};
+use crate::agent_core::{AgentConfig, OutgoingTask, OutgoingTasks, PendingCalls};
 use crate::engine::{FunctionDefinition, ToolDefinition};
 use reqwest::blocking::Client;
 use reqwest::Method;
 use rhai::{Dynamic, Engine};
 use serde_json::json;
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::runtime::Handle;
 
 pub fn available_tools() -> Vec<ToolDefinition> {
     vec![
@@ -19,12 +20,14 @@ pub fn available_tools() -> Vec<ToolDefinition> {
             function: FunctionDefinition {
                 name: "run_code".to_string(),
                 description: "Выполняет код на языке Rhai и возвращает результат. \
-                              В коде доступны функции: get_time() и get_weather(city), \
-                              а также функции хранилища: storage_read_file, storage_write_file, \
+                              В коде доступны функции: get_time(), get_weather(city), \
+                              функции хранилища: storage_read_file, storage_write_file, \
                               storage_delete_file, storage_create_dir, storage_list_dir, \
                               storage_walk, storage_search_by_name, storage_search_similar, \
                               storage_read_about, storage_write_about, storage_read_summary, \
-                              storage_write_summary."
+                              storage_write_summary, а также функции работы с доской: \
+                              call_agent(to_agent, to_session_id, prompt) — синхронно, \
+                              post_task(to_agent, to_session_id, prompt) — асинхронно."
                     .to_string(),
                 parameters: json!({
                     "type": "object",
@@ -46,20 +49,12 @@ pub fn available_tools() -> Vec<ToolDefinition> {
                 parameters: json!({
                     "type": "object",
                     "properties": {
-                        "action": {
-                            "type": "string",
-                            "enum": [
-                                "read_file", "write_file", "delete_file", "create_dir",
-                                "list_dir", "walk", "search_by_name", "search_similar",
-                                "write_about", "read_about", "write_summary", "read_summary"
-                            ],
-                            "description": "Действие"
-                        },
-                        "path": {"type": "string", "description": "Путь (если требуется)"},
-                        "content": {"type": "string", "description": "Содержимое (для записи)"},
-                        "query": {"type": "string", "description": "Поисковый запрос"},
-                        "pattern": {"type": "string", "description": "Шаблон имени"},
-                        "top_k": {"type": "integer", "description": "Количество результатов поиска"}
+                        "action": {"type": "string"},
+                        "path": {"type": "string"},
+                        "content": {"type": "string"},
+                        "query": {"type": "string"},
+                        "pattern": {"type": "string"},
+                        "top_k": {"type": "integer"}
                     },
                     "required": ["action"]
                 }),
@@ -77,54 +72,187 @@ pub fn register_basic_functions(engine: &mut Engine) {
     });
 }
 
-pub fn register_agent_call_functions(
+/// Регистрирует функции для работы с доской сообщений.
+#[allow(clippy::too_many_arguments)]
+pub fn register_board_functions(
     engine: &mut Engine,
-    agents: Arc<HashMap<String, AgentEndpoint>>,
-    self_name: Option<String>,
+    board_url: String,
+    board_token: String,
+    self_agent_name: String,
+    self_session_id: Option<String>,
+    pending_calls: PendingCalls,
     agent_call_timeout_sec: u64,
+    posted_flag: Arc<AtomicBool>,
+    outgoing_tasks: OutgoingTasks,
 ) {
-    let agents = agents.clone();
-    let self_name = self_name.clone();
-    engine.register_fn(
-        "call_agent",
-        move |name: String, prompt: String| -> String {
-            if let Some(ref self_name) = self_name {
-                if name == *self_name {
-                    return format!("Ошибка: агент '{}' не может вызывать сам себя", name);
+    // post_task
+    {
+        let url = board_url.clone();
+        let token = board_token.clone();
+        let agent = self_agent_name.clone();
+        let sess = self_session_id.clone();
+        let flag = posted_flag.clone();
+        let outgoing = outgoing_tasks.clone();
+        engine.register_fn(
+            "post_task",
+            move |to_agent: String, to_session_id: String, prompt: String| -> String {
+                let result = post_task_request(
+                    &url,
+                    &token,
+                    &agent,
+                    sess.as_deref(),
+                    &to_agent,
+                    &to_session_id,
+                    &prompt,
+                );
+                if let Some(task_id) = result.strip_prefix("posted:") {
+                    let handle = Handle::current();
+                    let tid = task_id.to_string();
+                    let to_a = to_agent.clone();
+                    let to_s = to_session_id.clone();
+                    let from_s = sess.clone().unwrap_or_default();
+                    let outgoing = outgoing.clone();
+                    handle.block_on(async move {
+                        let mut map = outgoing.lock().await;
+                        map.insert(
+                            tid.clone(),
+                            OutgoingTask {
+                                task_id: tid,
+                                session_id: from_s,
+                                to_agent_name: to_a,
+                                to_session_id: to_s,
+                            },
+                        );
+                    });
+                    flag.store(true, Ordering::Relaxed);
                 }
-            }
-            match agents.get(&name) {
-                Some(endpoint) => {
-                    let url = format!("{}/agent/run", endpoint.url.trim_end_matches('/'));
-                    let client = reqwest::blocking::Client::builder()
-                        .timeout(Duration::from_secs(agent_call_timeout_sec))
-                        .build()
-                        .unwrap_or_default();
-                    let resp = client
-                        .post(&url)
-                        .header("Authorization", format!("Bearer {}", endpoint.auth_token))
-                        .json(&serde_json::json!({ "prompt": prompt }))
-                        .send();
-                    match resp {
-                        Ok(r) if r.status().is_success() => {
-                            let body: serde_json::Value = r.json().unwrap_or_default();
-                            body.get("result")
-                                .and_then(|v| v.as_str())
-                                .map(|s| s.to_string())
-                                .unwrap_or_else(|| "Агент вернул пустой результат".to_string())
+                result
+            },
+        );
+    }
+
+    // call_agent — синхронный, с таймаутом
+    {
+        let url = board_url.clone();
+        let token = board_token.clone();
+        let agent = self_agent_name.clone();
+        let sess = self_session_id.clone();
+        let pc = pending_calls.clone();
+        let timeout_sec = agent_call_timeout_sec;
+        engine.register_fn(
+            "call_agent",
+            move |to_agent: String, to_session_id: String, prompt: String| -> String {
+                let result = post_task_request(
+                    &url,
+                    &token,
+                    &agent,
+                    sess.as_deref(),
+                    &to_agent,
+                    &to_session_id,
+                    &prompt,
+                );
+                let task_id = match result.strip_prefix("posted:") {
+                    Some(id) => id.to_string(),
+                    None => return result,
+                };
+
+                let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+                {
+                    let handle = Handle::current();
+                    let created_at = std::time::Instant::now();
+                    let tid = task_id.clone();
+                    handle.block_on(async {
+                        let mut map = pc.lock().await;
+                        map.insert(tid, crate::agent_core::PendingCall { tx, created_at });
+                    });
+                }
+
+                let url_for_fail = url.clone();
+                let token_for_fail = token.clone();
+                let outcome = {
+                    let handle = Handle::current();
+                    let pc_cleanup = pc.clone();
+                    let tid = task_id.clone();
+                    handle.block_on(async move {
+                        match tokio::time::timeout(Duration::from_secs(timeout_sec), rx).await {
+                            Ok(Ok(s)) => Ok(s),
+                            Ok(Err(_)) => Err("канал ожидания закрыт".to_string()),
+                            Err(_) => {
+                                {
+                                    let mut map = pc_cleanup.lock().await;
+                                    map.remove(&tid);
+                                }
+                                let body = serde_json::json!({
+                                    "error": format!(
+                                        "call_agent timeout ({} sec)",
+                                        timeout_sec
+                                    )
+                                });
+                                let _ = reqwest::blocking::Client::new()
+                                    .post(format!(
+                                        "{}/tasks/{}/fail",
+                                        url_for_fail.trim_end_matches('/'),
+                                        tid
+                                    ))
+                                    .header("Authorization", format!("Bearer {}", token_for_fail))
+                                    .json(&body)
+                                    .send();
+                                Err(format!("таймаут ожидания ответа ({} сек)", timeout_sec))
+                            }
                         }
-                        Ok(r) => format!(
-                            "HTTP ошибка {}: {}",
-                            r.status(),
-                            r.text().unwrap_or_default()
-                        ),
-                        Err(e) => format!("Ошибка вызова агента: {}", e),
-                    }
+                    })
+                };
+
+                match outcome {
+                    Ok(s) => s,
+                    Err(e) => format!("Ошибка: {}", e),
                 }
-                None => format!("Агент '{}' не найден", name),
+            },
+        );
+    }
+}
+
+fn post_task_request(
+    url: &str,
+    token: &str,
+    from_agent: &str,
+    from_session: Option<&str>,
+    to_agent: &str,
+    to_session: &str,
+    prompt: &str,
+) -> String {
+    let client = reqwest::blocking::Client::new();
+    let body = serde_json::json!({
+        "from_agent": from_agent,
+        "from_session_id": from_session.unwrap_or(""),
+        "to_agent": to_agent,
+        "to_session_id": to_session,
+        "payload": { "prompt": prompt },
+        "parent_task_id": null
+    });
+    match client
+        .post(format!("{}/tasks", url.trim_end_matches('/')))
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&body)
+        .send()
+    {
+        Ok(r) if r.status().is_success() => match r.json::<serde_json::Value>() {
+            Ok(v) => {
+                if let Some(id) = v.get("task_id").and_then(|x| x.as_str()) {
+                    format!("posted:{}", id)
+                } else {
+                    "Ошибка: нет task_id в ответе".to_string()
+                }
             }
+            Err(e) => format!("Ошибка парсинга ответа: {}", e),
         },
-    );
+        Ok(r) => format!(
+            "HTTP ошибка {}: {}",
+            r.status(),
+            r.text().unwrap_or_default()
+        ),
+        Err(e) => format!("Ошибка запроса к доске: {}", e),
+    }
 }
 
 pub fn register_skill_functions(
@@ -138,10 +266,8 @@ pub fn register_skill_functions(
     let agent_name = config.name.clone();
     let min_code_len = config.skill_min_code_length;
     let semantic_threshold = config.skill_semantic_threshold;
-
     let client = reqwest::blocking::Client::new();
 
-    // skill_search(query) -> string
     {
         let c = client.clone();
         let b = base_url.clone();
@@ -157,7 +283,6 @@ pub fn register_skill_functions(
         });
     }
 
-    // skill_load(skill_name) -> string
     {
         let c = client.clone();
         let b = base_url.clone();
@@ -175,7 +300,6 @@ pub fn register_skill_functions(
         });
     }
 
-    // skill_save(skill_name, description, prompt, rhai_code) -> string
     {
         let c = client.clone();
         let b = base_url.clone();
@@ -207,7 +331,6 @@ pub fn register_skill_functions(
         );
     }
 
-    // skill_record_usage(skill_name, success) -> string
     {
         let c = client.clone();
         let b = base_url.clone();
@@ -235,7 +358,6 @@ pub fn register_skill_functions(
         );
     }
 
-    // skill_list() -> string
     {
         let c = client.clone();
         let b = base_url.clone();
@@ -378,12 +500,10 @@ pub fn register_storage_functions(engine: &mut Engine, base_url: &str, auth_toke
     let token = auth_token.to_string();
     let client = Client::new();
 
-    // GET /files
     register_storage_fn!(engine, client, base, token,
         "storage_read_file", Method::GET, "/files",
         path: String => ("path", path));
 
-    // POST /files (с телом)
     {
         let c = client.clone();
         let b = base.clone();
@@ -403,43 +523,39 @@ pub fn register_storage_functions(engine: &mut Engine, base_url: &str, auth_toke
         );
     }
 
-    // DELETE /files
     register_storage_fn!(engine, client, base, token,
         "storage_delete_file", Method::DELETE, "/files",
         path: String => ("path", path));
 
-    // POST /dirs
     register_storage_fn!(engine, client, base, token,
         "storage_create_dir", Method::POST, "/dirs",
         path: String => ("path", path));
 
-    // GET /list
     register_storage_fn!(engine, client, base, token,
         "storage_list_dir", Method::GET, "/list",
         path: String => ("path", path));
 
-    // GET /walk
     register_storage_fn!(engine, client, base, token,
         "storage_walk", Method::GET, "/walk",
         path: String => ("path", path));
 
-    // GET /search_name
     register_storage_fn!(engine, client, base, token,
         "storage_search_by_name", Method::GET, "/search_name",
         pattern: String => ("pattern", pattern));
 
-    // GET /search
     register_storage_fn!(engine, client, base, token,
         "storage_search_similar", Method::GET, "/search",
         query: String => ("query", query),
         top_k: i64 => ("top_k", top_k.to_string()));
 
-    // GET /about
     register_storage_fn!(engine, client, base, token,
         "storage_read_about", Method::GET, "/about",
         path: String => ("path", path));
 
-    // POST /about
+    register_storage_fn!(engine, client, base, token,
+        "storage_read_summary", Method::GET, "/summary",
+        path: String => ("path", path));
+
     {
         let c = client.clone();
         let b = base.clone();
@@ -459,12 +575,6 @@ pub fn register_storage_functions(engine: &mut Engine, base_url: &str, auth_toke
         );
     }
 
-    // GET /summary
-    register_storage_fn!(engine, client, base, token,
-        "storage_read_summary", Method::GET, "/summary",
-        path: String => ("path", path));
-
-    // POST /summary
     {
         let c = client.clone();
         let b = base.clone();
@@ -515,6 +625,7 @@ async fn execute_local_storage_tool(
 
     let endpoint = endpoint_for_action(action);
     let url = format!("{}{}", base_url.trim_end_matches('/'), endpoint);
+
     let mut request_builder = match action {
         "write_file" | "create_dir" | "write_about" | "write_summary" => client
             .post(&url)
@@ -529,24 +640,16 @@ async fn execute_local_storage_tool(
 
     let mut query_params = Vec::new();
     match action {
-        "read_file" | "write_file" | "delete_file" | "create_dir" | "walk" => {
+        "read_file" | "write_file" | "delete_file" | "create_dir" | "walk" | "list_dir" => {
             query_params.push(("path", path.to_string()));
         }
-        "search_by_name" => {
-            query_params.push(("pattern", pattern.to_string()));
-        }
+        "search_by_name" => query_params.push(("pattern", pattern.to_string())),
         "search_similar" => {
             query_params.push(("query", query.to_string()));
             query_params.push(("top_k", top_k.to_string()));
         }
-        "read_about" | "read_summary" => {
-            query_params.push(("path", path.to_string()));
-        }
-        "write_about" | "write_summary" => {
-            query_params.push(("path", path.to_string()));
-        }
-        "list_dir" => {
-            query_params.push(("path", path.to_string()));
+        "read_about" | "read_summary" | "write_about" | "write_summary" => {
+            query_params.push(("path", path.to_string()))
         }
         _ => {}
     }

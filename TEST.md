@@ -100,7 +100,18 @@ curl.exe -X POST "http://127.0.0.1:8081/agent/run" -H "Authorization: Bearer age
 ```powershell
 curl.exe "http://127.0.0.1:8080/files?path=example.txt" -H "Authorization: Bearer wrong"
 ```
+
 ## Использование скилов
 ```powershell
 curl.exe -X POST http://127.0.0.1:8081/agent/run -H "Authorization: Bearer agent_token_1" -H "Content-Type: application/json" -d '{"prompt":"Напиши и выполни Rhai-код, который создаёт директорию test_skill_dir и записывает в неё файл example.txt с текстом Привет от агента. Код должен быть не короче 150 символов."}'
+```
+## Использование мессаджборда
+### Создание задачи (замените board_token на ваш токен из config.toml)
+```powershell
+curl.exe -X POST "http://127.0.0.1:8090/tasks" -H "Authorization: Bearer board_token" -H "Content-Type: application/json" -d '{"from_agent":"agentA","from_session_id":"sessA","to_agent":"agentB","to_session_id":"sessB","payload":{"prompt":"hello"},"parent_task_id":null}'
+```
+
+### Завершение задачи (подставьте task_id из ответа предыдущей команды)
+```powershell
+curl.exe -X POST "http://127.0.0.1:8090/tasks/{task_id}/complete" -H "Authorization: Bearer board_token" -H "Content-Type: application/json" -d '{"result":"done"}'
 ```

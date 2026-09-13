@@ -1,4 +1,5 @@
 /target
+/.board
 /.models
 /.sessions
 /.local_storage
