@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use nano_harness::config::{build_engine_config, TomlConfig};
 use nano_harness::engine::{ChatEngine, Role};
-use nano_harness::session_store;
+use nano_harness::session_store::{self, ContextBlock};
 use nano_harness::tools::execute_tool;
 
 #[derive(Parser, Debug)]
@@ -111,25 +111,27 @@ async fn main() -> Result<()> {
 
     let system_prompt = args
         .system_prompt
-        .or(toml_config.system_prompt)
+        .clone()
+        .or(toml_config.system_prompt.clone())
         .unwrap_or_else(|| "Ты полезный ассистент. Отвечай кратко и по делу.".to_string());
     engine.add_message(Role::System, system_prompt.clone());
 
     // Работа с сессией
     let mut current_session = if let Some(sid) = args.session.clone() {
-        session_store::load_session_with_key(&sid, &engine_config.api_key, None)
+        session_store::load_session_with_key(&sid, &engine_config.api_key)
             .with_context(|| format!("Не удалось загрузить сессию '{}'", sid))?
     } else {
         let auto_name = format!("Сессия {}", chrono::Local::now().format("%Y-%m-%d %H:%M"));
-        session_store::new_session(&auto_name).with_context(|| "Не удалось создать новую сессию")?
+        session_store::new_session(&auto_name, None)
+            .with_context(|| "Не удалось создать новую сессию")?
     };
 
     // Восстановление контекста чата, если есть
-    if let Some(chat_ctx) = current_session.contexts.chat.clone() {
-        engine.set_state(chat_ctx.engine_state);
+    if let Some(ctx) = current_session.context.clone() {
+        engine.set_state(ctx.engine_state);
     } else {
-        // Для новой сессии заполняем контекст текущим состоянием движка (system_prompt уже добавлен)
-        current_session.contexts.chat = Some(session_store::ContextBlock {
+        // Для новой сессии заполняем контекст текущим состоянием движка
+        current_session.context = Some(ContextBlock {
             engine_config: engine.get_config().clone(),
             engine_state: engine.get_state(),
         });
@@ -276,12 +278,11 @@ async fn main() -> Result<()> {
                     }
                     Some(&"new") => {
                         let name = parts.get(2).copied().unwrap_or("Новая сессия");
-                        current_session = session_store::new_session(name)
+                        current_session = session_store::new_session(name, None)
                             .with_context(|| "Не удалось создать новую сессию")?;
                         engine = ChatEngine::new(engine_config.clone(), client.clone());
                         engine.add_message(Role::System, system_prompt.clone());
-                        // Сразу заполняем контекст в новой сессии
-                        current_session.contexts.chat = Some(session_store::ContextBlock {
+                        current_session.context = Some(ContextBlock {
                             engine_config: engine.get_config().clone(),
                             engine_state: engine.get_state(),
                         });
@@ -301,18 +302,17 @@ async fn main() -> Result<()> {
                     }
                     Some(&"switch") => {
                         if let Some(sid) = parts.get(2) {
-                            current_session = session_store::load_session_with_key(
-                                sid,
-                                &engine_config.api_key,
-                                None,
-                            )
-                            .with_context(|| format!("Не удалось загрузить сессию '{}'", sid))?;
+                            current_session =
+                                session_store::load_session_with_key(sid, &engine_config.api_key)
+                                    .with_context(|| {
+                                    format!("Не удалось загрузить сессию '{}'", sid)
+                                })?;
                             engine = ChatEngine::new(engine_config.clone(), client.clone());
-                            if let Some(chat_ctx) = current_session.contexts.chat.clone() {
-                                engine.set_state(chat_ctx.engine_state);
+                            if let Some(ctx) = current_session.context.clone() {
+                                engine.set_state(ctx.engine_state);
                             } else {
                                 engine.add_message(Role::System, system_prompt.clone());
-                                current_session.contexts.chat = Some(session_store::ContextBlock {
+                                current_session.context = Some(ContextBlock {
                                     engine_config: engine.get_config().clone(),
                                     engine_state: engine.get_state(),
                                 });
@@ -486,7 +486,7 @@ async fn main() -> Result<()> {
         }
 
         // Сохранение сессии после каждого обмена
-        current_session.contexts.chat = Some(session_store::ContextBlock {
+        current_session.context = Some(ContextBlock {
             engine_config: engine.get_config().clone(),
             engine_state: engine.get_state(),
         });

@@ -1,3 +1,10 @@
+# ============================================================================
+# nano_harness — полный конфиг со всеми параметрами
+# ============================================================================
+
+# ---------------------------------------------------------------------------
+# Глобальные параметры LLM (используются CLI-чатом и как fallback для агентов)
+# ---------------------------------------------------------------------------
 api_key = "pza_IkoixbZBxwg0Fndv8IXcqU2U2u_IIFyH"
 base_url = "https://polza.ai/api/v1"
 model = "google/gemini-3.1-flash-lite"
@@ -7,12 +14,21 @@ max_tokens = 4096
 top_p = 1.0
 stream = true
 
-rhai_timeout_sec = 120
+# Остановочные последовательности (необязательно, можно не указывать)
+# stop = ["\n\n", "###"]
 
-# reasoning_effort = "medium"
+# Уровень reasoning: "low" | "medium" | "high" (зависит от модели)
+reasoning_effort = "medium"
 
-# max_cost_rub = 10.0
+# Лимит бюджета в рублях; при превышении send() вернёт ошибку
+max_cost_rub = 10.0
 
+# Ограничение контекста: сколько первых пар (запрос-ответ) закреплять в префиксе,
+# сколько последних держать в хвосте.
+prefix_message_count = 4
+tail_message_count = 6
+
+# Глобальный системный промпт для CLI-чата (не для агентов)
 system_prompt = """Вы - полезный ассистент.
 
 Вы можете писать код на языке Rhai и выполнять его через инструмент run_code.
@@ -37,8 +53,7 @@ system_prompt = """Вы - полезный ассистент.
 - storage_read_summary(path: string) -> string — прочитать .summary директории
 - storage_write_summary(path: string, content: string) -> string — записать .summary директории (возвращает "OK" или ошибку)
 
-Когда пользователь просит узнать время или погоду, напишите Rhai-скрипт, использующий эти функции,
-и выполните его с помощью инструмента run_code.
+Когда пользователь просит узнать время или погоду, напишите Rhai-скрипт, использующий эти функции, и выполните его с помощью инструмента run_code.
 
 Пример для времени:
 get_time()
@@ -54,9 +69,24 @@ storage_write_file("hello.txt", "Привет")
 
 Всегда передавайте код в параметре "code" инструмента run_code."""
 
-prefix_message_count = 4
-tail_message_count = 6
+# Глобальный таймаут выполнения Rhai-скрипта (в секундах)
+rhai_timeout_sec = 120
 
+# ---------------------------------------------------------------------------
+# Разрешённые инструменты на верхнем уровне (используется CLI-чатом).
+# Для агентов список tools задаётся внутри каждого [[agents]].
+# ---------------------------------------------------------------------------
+[[tools]]
+name = "run_code"
+mode = "auto"
+
+[[tools]]
+name = "local_storage"
+mode = "auto"
+
+# ---------------------------------------------------------------------------
+# Векторная база (эмбеддинги для семантического поиска по хранилищу)
+# ---------------------------------------------------------------------------
 [vector_db]
 model_path = ".models/paraphrase-multilingual-MiniLM-L12-v2"
 tokenizer_path = ".models/paraphrase-multilingual-MiniLM-L12-v2/tokenizer.json"
@@ -64,18 +94,41 @@ chunk_size = 512
 chunk_overlap = 64
 top_k = 5
 
+# ---------------------------------------------------------------------------
+# Локальное файловое хранилище (сервис local_storage_http_server)
+# ---------------------------------------------------------------------------
 [local_storage_http_server]
 bind_addr = "127.0.0.1:8080"
 storage_name = "default_storage"
 auth_token = "secret"
 
+# ---------------------------------------------------------------------------
+# Доска сообщений (сервис message_board_server)
+# ---------------------------------------------------------------------------
+[message_board]
+bind_addr = "127.0.0.1:8090"
+auth_token = "board_token"
+tasks_dir = ".board/tasks"
+task_timeout_sec = 300
+
+# ============================================================================
+# Агент 1 — assistant
+# ============================================================================
 [[agents]]
 name = "assistant"
 bind_addr = "127.0.0.1:8081"
 auth_token = "agent_token_1"
+
+# Таймаут HTTP-запроса к LLM (в секундах)
 timeout_sec = 120
-max_iterations = 1
+
+# Максимальное число итераций LLM в одном запросе (с tool-calls)
+max_iterations = 3
+
+# Разрешённые инструменты для этого агента
 tools = ["run_code", "local_storage"]
+
+# Системный промпт агента (переопределяет глобальный)
 system_prompt = """Ты помощник для работы с файлами.
 
 Ты можешь писать код на языке Rhai и выполнять его через инструмент run_code.
@@ -102,7 +155,29 @@ storage_read_file("hello.txt")
 Пример записи файла:
 storage_write_file("hello.txt", "Привет")
 
+Ты можешь вызвать другого агента через функцию call_agent(to_agent: string, to_session_id: string, prompt: string)
+-> string внутри run_code.
+Агент "helper" доступен для вызова.
+У агента "helper" есть фиксированная сессия: helper_main.
+ВСЕГДА используй именно этот session_id для общения с агентом helper. Никогда не придумывай другой.
+
+Пример:
+    let answer = call_agent("helper", "helper_main", "Представься одним предложением");
+    answer
+
+Также доступна функция post_task(to_agent: string, to_session_id: string, prompt: string) -> string.
+Она публикует задачу асинхронно и возвращает строку "posted:<task_id>".
+После вызова post_task ты должен завершить ход, а продолжение
+произойдёт автоматически, когда helper ответит.
+
+Когда пользователь просит "асинхронно спроси у helper ...",
+используй именно post_task:
+    let task_id = post_task("helper", "helper_main", "Как тебя зовут?");
+    task_id
+
 Всегда передавай код в параметре "code" инструмента run_code."""
+
+# Параметры LLM для этого агента
 api_key = "pza_IkoixbZBxwg0Fndv8IXcqU2U2u_IIFyH"
 base_url = "https://polza.ai/api/v1"
 model = "google/gemini-3.1-flash-lite"
@@ -110,20 +185,73 @@ temperature = 0.7
 max_tokens = 4096
 top_p = 1.0
 stream = true
+
+# Уровень reasoning (опционально)
+reasoning_effort = "medium"
+
+# Таймаут выполнения Rhai-скриптов
 rhai_timeout_sec = 120
-agent_call_timeout_sec = 120 # outgoing agent call timeout
-# reasoning_effort = medium
+
+# Таймаут исходящих вызовов других агентов
+agent_call_timeout_sec = 120
+
+# Ограничение контекста
 prefix_message_count = 4
 tail_message_count = 6
+
+# "stateless" | "stateful"
 agent_type = "stateful"
+
+# Время жизни сессии в секундах (пока не используется)
 session_ttl_secs = 1800
+
+# Режим работы со скиллами: "auto" | "manual"
 skill_mode = "auto"
+
+# Порог семантической близости для поиска скилла (0.0 .. 1.0).
+# Меньше — строже совпадение.
+skill_semantic_threshold = 0.5
+
+# Минимальная длина Rhai-кода для сохранения скилла
+skill_min_code_length = 40
+
+# Порог расстояния для автоисполнения скилла без обращения к LLM
 skill_auto_execute_threshold = 0.15
 
-[[tools]]
-name = "run_code"
-mode = "auto"
+# ============================================================================
+# Агент 2 — helper
+# ============================================================================
+[[agents]]
+name = "helper"
+bind_addr = "127.0.0.1:8082"
+auth_token = "agent_token_2"
 
-[[tools]]
-name = "local_storage"
-mode = "auto"
+timeout_sec = 120
+max_iterations = 3
+tools = ["run_code", "local_storage"]
+
+system_prompt = """Ты — вспомогательный агент. Отвечай кратко."""
+
+api_key = "pza_IkoixbZBxwg0Fndv8IXcqU2U2u_IIFyH"
+base_url = "https://polza.ai/api/v1"
+model = "google/gemini-3.1-flash-lite"
+temperature = 0.7
+max_tokens = 4096
+top_p = 1.0
+stream = true
+
+reasoning_effort = "medium"
+
+rhai_timeout_sec = 120
+agent_call_timeout_sec = 120
+
+prefix_message_count = 4
+tail_message_count = 6
+
+agent_type = "stateful"
+session_ttl_secs = 1800
+
+skill_mode = "auto"
+skill_semantic_threshold = 0.5
+skill_min_code_length = 40
+skill_auto_execute_threshold = 0.15

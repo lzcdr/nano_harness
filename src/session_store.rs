@@ -3,6 +3,7 @@
 use anyhow::{Context, Result};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
+use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -29,16 +30,10 @@ pub struct ContextBlock {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AgentContextBlock {
-    pub name: String,
-    pub engine_config: EngineConfig,
-    pub engine_state: EngineState,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SessionContexts {
-    pub chat: Option<ContextBlock>,
-    pub agents: Vec<AgentContextBlock>,
+pub struct PendingTask {
+    pub task_id: String,
+    pub to_agent_name: String,
+    pub to_session_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,8 +49,13 @@ pub struct Session {
     pub display_name: String,
     pub created_at: u64,
     pub updated_at: u64,
-    pub contexts: SessionContexts,
+    #[serde(default)]
+    pub owner_agent: Option<String>,
+    #[serde(default)]
+    pub context: Option<ContextBlock>,
     pub logs: Vec<LogEntry>,
+    #[serde(default)]
+    pub pending_tasks: Vec<PendingTask>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,6 +64,7 @@ pub struct SessionSummary {
     pub display_name: String,
     pub created_at: u64,
     pub updated_at: u64,
+    pub owner_agent: Option<String>,
 }
 
 fn sessions_dir() -> PathBuf {
@@ -76,12 +77,43 @@ fn logs_dir() -> PathBuf {
     sessions_dir().join(LOGS_SUBDIR)
 }
 
-fn session_file(session_id: &str) -> PathBuf {
-    sessions_dir().join(format!("{}.json", session_id))
+/// Формирует имя файла сессии с префиксом владельца:
+/// `agent_{agent_name}_{session_id}.json` или `chat_{session_id}.json`.
+fn session_file(session_id: &str, owner_agent: Option<&str>) -> PathBuf {
+    match owner_agent {
+        Some(agent) => sessions_dir().join(format!("agent_{}_{}.json", agent, session_id)),
+        None => sessions_dir().join(format!("chat_{}.json", session_id)),
+    }
 }
 
-fn lock_file(session_id: &str) -> PathBuf {
-    sessions_dir().join(format!("{}.lock", session_id))
+/// Ищет файл сессии по session_id, независимо от префикса владельца.
+/// Поддерживает старый формат `{session_id}.json` для совместимости.
+fn find_session_file(session_id: &str) -> Option<PathBuf> {
+    let dir = sessions_dir();
+    if !dir.exists() {
+        return None;
+    }
+    let suffix = format!("_{}.json", session_id);
+    let legacy = format!("{}.json", session_id);
+    let entries = fs::read_dir(&dir).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+            if name.ends_with(&suffix) || name == legacy {
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+
+fn lock_file(session_id: &str, owner_agent: Option<&str>) -> PathBuf {
+    let base = session_file(session_id, owner_agent);
+    let mut new_name = OsString::from(base.file_name().unwrap_or_default());
+    new_name.push(".lock");
+    let mut p = base.clone();
+    p.set_file_name(new_name);
+    p
 }
 
 pub fn now_ts() -> u64 {
@@ -91,7 +123,7 @@ pub fn now_ts() -> u64 {
         .as_secs()
 }
 
-pub fn new_session(display_name: &str) -> Result<Session> {
+pub fn new_session(display_name: &str, owner_agent: Option<&str>) -> Result<Session> {
     fs::create_dir_all(sessions_dir())?;
     fs::create_dir_all(logs_dir())?;
 
@@ -99,22 +131,25 @@ pub fn new_session(display_name: &str) -> Result<Session> {
     let ts = now_ts();
 
     let session = Session {
-        session_id: session_id.clone(),
+        session_id,
         display_name: display_name.to_string(),
         created_at: ts,
         updated_at: ts,
-        contexts: SessionContexts {
-            chat: None,
-            agents: Vec::new(),
-        },
+        owner_agent: owner_agent.map(String::from),
+        context: None,
         logs: Vec::new(),
+        pending_tasks: Vec::new(),
     };
 
     save_session(&session)?;
     Ok(session)
 }
 
-pub fn create_session_with_id(session_id: &str, display_name: &str) -> Result<Session> {
+pub fn create_session_with_id(
+    session_id: &str,
+    display_name: &str,
+    owner_agent: Option<&str>,
+) -> Result<Session> {
     fs::create_dir_all(sessions_dir())?;
     fs::create_dir_all(logs_dir())?;
 
@@ -124,11 +159,10 @@ pub fn create_session_with_id(session_id: &str, display_name: &str) -> Result<Se
         display_name: display_name.to_string(),
         created_at: ts,
         updated_at: ts,
-        contexts: SessionContexts {
-            chat: None,
-            agents: Vec::new(),
-        },
+        owner_agent: owner_agent.map(String::from),
+        context: None,
         logs: Vec::new(),
+        pending_tasks: Vec::new(),
     };
 
     save_session(&session)?;
@@ -136,7 +170,8 @@ pub fn create_session_with_id(session_id: &str, display_name: &str) -> Result<Se
 }
 
 pub fn load_session(session_id: &str) -> Result<Session> {
-    let path = session_file(session_id);
+    let path = find_session_file(session_id)
+        .ok_or_else(|| anyhow::anyhow!("Файл сессии '{}' не найден", session_id))?;
     let content = fs::read_to_string(&path)
         .with_context(|| format!("Не удалось прочитать файл сессии {}", path.display()))?;
     let session: Session = serde_json::from_str(&content)?;
@@ -145,8 +180,9 @@ pub fn load_session(session_id: &str) -> Result<Session> {
 
 pub fn save_session(session: &Session) -> Result<()> {
     fs::create_dir_all(sessions_dir())?;
+    let owner = session.owner_agent.as_deref();
 
-    let lock_path = lock_file(&session.session_id);
+    let lock_path = lock_file(&session.session_id, owner);
     let lock = OpenOptions::new()
         .create(true)
         .write(true)
@@ -154,16 +190,12 @@ pub fn save_session(session: &Session) -> Result<()> {
         .with_context(|| format!("Не удалось открыть lock-файл {}", lock_path.display()))?;
     lock.lock_exclusive()?;
 
-    let tmp_path = sessions_dir().join(format!("{}.tmp", session.session_id));
-    let final_path = session_file(&session.session_id);
+    let tmp_path = sessions_dir().join(format!(".{}.tmp", session.session_id));
+    let final_path = session_file(&session.session_id, owner);
 
-    // Маскируем API-ключи перед сохранением
     let mut session_clone = session.clone();
-    if let Some(chat_ctx) = session_clone.contexts.chat.as_mut() {
-        chat_ctx.engine_config.api_key = "***".to_string();
-    }
-    for agent_ctx in session_clone.contexts.agents.iter_mut() {
-        agent_ctx.engine_config.api_key = "***".to_string();
+    if let Some(ctx) = session_clone.context.as_mut() {
+        ctx.engine_config.api_key = "***".to_string();
     }
     let json = serde_json::to_string_pretty(&session_clone)?;
 
@@ -172,6 +204,13 @@ pub fn save_session(session: &Session) -> Result<()> {
             .with_context(|| format!("Не удалось создать временный файл {}", tmp_path.display()))?;
         tmp_file.write_all(json.as_bytes())?;
         tmp_file.flush()?;
+    }
+
+    // Если есть файл по старому имени — удаляем, чтобы не было дубликатов.
+    if let Some(old_path) = find_session_file(&session.session_id) {
+        if old_path != final_path && old_path.exists() {
+            let _ = fs::remove_file(&old_path);
+        }
     }
     if final_path.exists() {
         fs::remove_file(&final_path)
@@ -187,7 +226,6 @@ pub fn save_session(session: &Session) -> Result<()> {
 
     lock.unlock()?;
 
-    // Удаляем lock-файл после сохранения
     if let Err(e) = fs::remove_file(&lock_path) {
         eprintln!(
             "Предупреждение: не удалось удалить lock-файл {}: {}",
@@ -205,16 +243,19 @@ pub fn list_sessions() -> Result<Vec<SessionSummary>> {
     for entry in fs::read_dir(sessions_dir())? {
         let entry = entry?;
         let path = entry.path();
-        if path.extension().and_then(|s| s.to_str()) == Some("json") {
-            if let Ok(content) = fs::read_to_string(&path) {
-                if let Ok(session) = serde_json::from_str::<Session>(&content) {
-                    sessions.push(SessionSummary {
-                        session_id: session.session_id,
-                        display_name: session.display_name,
-                        created_at: session.created_at,
-                        updated_at: session.updated_at,
-                    });
-                }
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if !name.ends_with(".json") || name.ends_with(".tmp") {
+            continue;
+        }
+        if let Ok(content) = fs::read_to_string(&path) {
+            if let Ok(session) = serde_json::from_str::<Session>(&content) {
+                sessions.push(SessionSummary {
+                    session_id: session.session_id,
+                    display_name: session.display_name,
+                    created_at: session.created_at,
+                    updated_at: session.updated_at,
+                    owner_agent: session.owner_agent,
+                });
             }
         }
     }
@@ -222,14 +263,24 @@ pub fn list_sessions() -> Result<Vec<SessionSummary>> {
     Ok(sessions)
 }
 
+pub fn list_sessions_for_agent(agent_name: &str) -> Result<Vec<SessionSummary>> {
+    let all = list_sessions()?;
+    Ok(all
+        .into_iter()
+        .filter(|s| s.owner_agent.as_deref() == Some(agent_name))
+        .collect())
+}
+
 pub fn delete_session(session_id: &str) -> Result<()> {
-    let json_path = session_file(session_id);
-    if json_path.exists() {
+    if let Some(json_path) = find_session_file(session_id) {
         fs::remove_file(&json_path)?;
-    }
-    let lock_path = lock_file(session_id);
-    if lock_path.exists() {
-        fs::remove_file(&lock_path)?;
+        let mut lock = json_path.clone();
+        let mut new_name = OsString::from(json_path.file_name().unwrap_or_default());
+        new_name.push(".lock");
+        lock.set_file_name(new_name);
+        if lock.exists() {
+            let _ = fs::remove_file(&lock);
+        }
     }
     Ok(())
 }
@@ -237,10 +288,10 @@ pub fn delete_session(session_id: &str) -> Result<()> {
 pub fn init_log(session_id: &str, entity: &str, agent_name: Option<&str>) -> Result<String> {
     fs::create_dir_all(logs_dir())?;
     let filename = match entity {
-        "chat" => format!("session_{}_chat.txt", session_id),
+        "chat" => format!("chat_{}.txt", session_id),
         "agent" => {
             let name = agent_name.unwrap_or("unknown");
-            format!("session_{}_{}.txt", session_id, name)
+            format!("agent_{}_{}.txt", name, session_id)
         }
         _ => return Err(anyhow::anyhow!("Unknown entity type")),
     };
@@ -285,36 +336,28 @@ pub fn add_or_update_log(
     Ok(())
 }
 
-pub fn restore_api_key_for_chat(session: &mut Session, api_key: &str) {
-    if let Some(chat_ctx) = session.contexts.chat.as_mut() {
-        if chat_ctx.engine_config.api_key == "***" {
-            chat_ctx.engine_config.api_key = api_key.to_string();
+pub fn restore_api_key(session: &mut Session, api_key: &str) {
+    if let Some(ctx) = session.context.as_mut() {
+        if ctx.engine_config.api_key == "***" {
+            ctx.engine_config.api_key = api_key.to_string();
         }
     }
 }
 
-pub fn restore_api_key_for_agent(session: &mut Session, agent_name: &str, api_key: &str) {
-    if let Some(agent_ctx) = session
-        .contexts
-        .agents
-        .iter_mut()
-        .find(|a| a.name == agent_name)
-    {
-        if agent_ctx.engine_config.api_key == "***" {
-            agent_ctx.engine_config.api_key = api_key.to_string();
-        }
-    }
-}
-
-pub fn load_session_with_key(
-    session_id: &str,
-    api_key: &str,
-    agent_name: Option<&str>,
-) -> Result<Session> {
+pub fn load_session_with_key(session_id: &str, api_key: &str) -> Result<Session> {
     let mut session = load_session(session_id)?;
-    match agent_name {
-        Some(name) => restore_api_key_for_agent(&mut session, name, api_key),
-        None => restore_api_key_for_chat(&mut session, api_key),
-    }
+    restore_api_key(&mut session, api_key);
     Ok(session)
+}
+
+pub fn add_pending_task(session: &mut Session, task: PendingTask) {
+    session.pending_tasks.push(task);
+}
+
+pub fn remove_pending_task(session: &mut Session, task_id: &str) {
+    session.pending_tasks.retain(|t| t.task_id != task_id);
+}
+
+pub fn find_pending_task<'a>(session: &'a Session, task_id: &str) -> Option<&'a PendingTask> {
+    session.pending_tasks.iter().find(|t| t.task_id == task_id)
 }

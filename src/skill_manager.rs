@@ -236,6 +236,12 @@ pub fn load_skill(
     read_file(client, base_url, auth_token, skill_file)
 }
 
+#[derive(Debug, Clone)]
+pub enum SaveSkillOutcome {
+    Saved,
+    SkippedTooShort { actual: usize, min: usize },
+}
+
 pub fn save_skill(
     client: &Client,
     base_url: &str,
@@ -246,9 +252,13 @@ pub fn save_skill(
     prompt: &str,
     rhai_code: &str,
     min_code_length: usize,
-) -> Result<()> {
-    if rhai_code.trim().len() < min_code_length {
-        return Ok(());
+) -> Result<SaveSkillOutcome> {
+    let trimmed = rhai_code.trim();
+    if trimmed.len() < min_code_length {
+        return Ok(SaveSkillOutcome::SkippedTooShort {
+            actual: trimmed.len(),
+            min: min_code_length,
+        });
     }
 
     let ast_hash = compute_ast_hash(rhai_code);
@@ -301,7 +311,7 @@ pub fn save_skill(
     });
     save_catalog(&catalog, client, base_url, auth_token)?;
 
-    Ok(())
+    Ok(SaveSkillOutcome::Saved)
 }
 
 pub fn record_usage(

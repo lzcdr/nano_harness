@@ -5,14 +5,35 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::Write;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::timeout;
 
 use crate::engine::{ChatEngine, EngineConfig, Role, ToolCall};
+
+pub struct PendingCall {
+    pub tx: tokio::sync::oneshot::Sender<String>,
+    pub created_at: std::time::Instant,
+}
+
+pub type PendingCalls = Arc<tokio::sync::Mutex<HashMap<String, PendingCall>>>;
+
+/// Исходящая задача, опубликованная через `post_task`.
+/// Регистрируется сразу при публикации, не зависит от того,
+/// вернула ли её LLM.
+#[derive(Debug, Clone)]
+pub struct OutgoingTask {
+    pub task_id: String,
+    pub session_id: String,
+    pub to_agent_name: String,
+    pub to_session_id: String,
+}
+
+pub type OutgoingTasks = Arc<tokio::sync::Mutex<HashMap<String, OutgoingTask>>>;
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
@@ -113,30 +134,31 @@ pub struct AgentMetrics {
     pub api_calls_count: u32,
 }
 
-#[derive(Debug, Clone)]
-pub struct AgentEndpoint {
-    pub url: String,
-    pub auth_token: String,
-}
-
 pub struct AgentContext {
     pub http_client: Client,
     pub storage_base_url: String,
     pub storage_auth_token: String,
-    pub agents: Arc<HashMap<String, AgentEndpoint>>,
     pub self_name: Option<String>,
     pub agent_call_timeout_sec: u64,
+    pub board_base_url: String,
+    pub board_auth_token: String,
+    pub pending_calls: PendingCalls,
+    pub outgoing_tasks: OutgoingTasks,
 }
 
 impl AgentContext {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         storage_base_url: String,
         storage_auth_token: String,
         timeout_sec: u64,
-        agents: HashMap<String, AgentEndpoint>,
         self_name: Option<String>,
         agent_call_timeout_sec: u64,
-    ) -> Self {
+        board_base_url: String,
+        board_auth_token: String,
+        pending_calls: PendingCalls,
+        outgoing_tasks: OutgoingTasks,
+    ) -> Result<Self> {
         let storage_base_url = if storage_base_url.starts_with("http://")
             || storage_base_url.starts_with("https://")
         {
@@ -145,18 +167,29 @@ impl AgentContext {
             format!("http://{}", storage_base_url)
         };
 
+        let board_base_url =
+            if board_base_url.starts_with("http://") || board_base_url.starts_with("https://") {
+                board_base_url
+            } else {
+                format!("http://{}", board_base_url)
+            };
+
         let http_client = Client::builder()
             .timeout(Duration::from_secs(timeout_sec))
             .build()
-            .expect("Failed to create HTTP client");
-        Self {
+            .context("Failed to create HTTP client")?;
+
+        Ok(Self {
             http_client,
             storage_base_url,
             storage_auth_token,
-            agents: Arc::new(agents),
             self_name,
             agent_call_timeout_sec,
-        }
+            board_base_url,
+            board_auth_token,
+            pending_calls,
+            outgoing_tasks,
+        })
     }
 }
 
@@ -199,7 +232,6 @@ pub fn build_engine_config(config: &AgentConfig) -> EngineConfig {
     }
 }
 
-/// Создаёт ChatEngine на основе конфигурации агента
 pub fn create_agent_engine(config: &AgentConfig) -> Result<ChatEngine> {
     let engine_config = build_engine_config(config);
     let client = Client::builder()
@@ -209,23 +241,22 @@ pub fn create_agent_engine(config: &AgentConfig) -> Result<ChatEngine> {
     Ok(ChatEngine::new(engine_config, client))
 }
 
-/// Основной цикл обработки запросов агента (используется и stateless, и stateful)
 pub async fn process_agent_turns(
     engine: &mut ChatEngine,
     config: &AgentConfig,
     context: &AgentContext,
     request: &AgentRequest,
     log_file: &mut fs::File,
+    session_id: Option<String>,
 ) -> Result<AgentResponse> {
     let max_iterations = request.max_iterations.unwrap_or(config.max_iterations);
     let mut tool_calls_log = Vec::new();
     let mut final_response = None;
     let rhai_timeout = config.rhai_timeout_sec.unwrap_or(30);
+    let mut posted_any = false;
 
-    // Флаг, указывающий, что подходящий скилл был найден и внедрён (не автоисполнен)
     let mut skill_found = false;
 
-    // Автоматический поиск скилла перед запросом
     if config.skill_mode == "auto" {
         let storage_base_url = context.storage_base_url.clone();
         let storage_auth_token = context.storage_auth_token.clone();
@@ -279,14 +310,11 @@ pub async fn process_agent_turns(
                     "skill_auto_execute",
                     &format!("{} (distance: {:.4})", skill_record.skill_file, distance),
                 )?;
-                eprintln!(
-                    "⚡ Автоисполнение скилла: {} (distance: {:.4})",
-                    skill_record.skill_file, distance
-                );
 
-                let result = execute_skill_code_directly(context, config, code.clone()).await;
+                let result =
+                    execute_skill_code_directly(context, config, code.clone(), session_id.clone())
+                        .await;
 
-                // Обновляем счётчик использования скилла в зависимости от результата
                 let success = result.is_ok();
                 let storage_base_url = context.storage_base_url.clone();
                 let storage_auth_token = context.storage_auth_token.clone();
@@ -300,14 +328,10 @@ pub async fn process_agent_turns(
                         &skill_file,
                         success,
                     ) {
-                        eprintln!(
-                            "⚠️ Не удалось обновить счётчик скилла {}: {}",
-                            skill_file, e
-                        );
+                        eprintln!("⚠️ Не удалось обновить счётчик скилла: {}", e);
                     }
                 });
 
-                // Если была ошибка, пробрасываем её
                 let result = result?;
 
                 write_log(
@@ -315,9 +339,7 @@ pub async fn process_agent_turns(
                     "tool_result",
                     &format!("run_code (auto from skill) -> {}", result),
                 )?;
-                eprintln!("✅ Результат автоисполнения: {}", result);
 
-                // Добавляем ответ ассистента в контекст
                 engine.add_message(Role::Assistant, result.clone());
                 write_log(log_file, "assistant", &result)?;
 
@@ -347,7 +369,6 @@ pub async fn process_agent_turns(
                     format!("Найден подходящий скилл:\n{}", content),
                 );
                 write_log(log_file, "skill_injected", &skill_record.skill_file)?;
-                eprintln!("💉 Скилл добавлен в контекст: {}", skill_record.skill_file);
                 skill_found = true;
             }
         }
@@ -373,7 +394,9 @@ pub async fn process_agent_turns(
             }
 
             for tc in &tool_calls {
-                let result = execute_agent_tool(context, config, tc, rhai_timeout).await?;
+                let (result, posted) =
+                    execute_agent_tool(context, config, tc, rhai_timeout, session_id.clone())
+                        .await?;
                 eprintln!("✅ Результат '{}': {}", tc.function.name, result);
 
                 write_log(
@@ -390,18 +413,48 @@ pub async fn process_agent_turns(
                     arguments: tc.function.arguments.clone(),
                     result: result.clone(),
                 });
-                engine.add_tool_result(tc.id.clone(), result);
+
+                if posted {
+                    posted_any = true;
+                    // не добавляем tool result в контекст LLM
+                } else if result.starts_with("posted:") {
+                    // LLM вернул результат post_task как есть
+                    posted_any = true;
+                } else {
+                    engine.add_tool_result(tc.id.clone(), result);
+                }
             }
             final_response = Some(response);
+
+            if posted_any {
+                break;
+            }
         } else {
             final_response = Some(response);
             break;
         }
     }
 
+    if posted_any {
+        let metrics = AgentMetrics {
+            prompt_tokens: engine.metrics.total_prompt_tokens,
+            completion_tokens: engine.metrics.total_completion_tokens,
+            cost_rub: engine.metrics.total_cost_rub,
+            api_calls_count: engine.metrics.api_calls_count,
+        };
+        return Ok(AgentResponse {
+            status: "waiting".to_string(),
+            result: String::new(),
+            reasoning: None,
+            tool_calls_log,
+            metrics,
+            error: None,
+            session_id: None,
+        });
+    }
+
     let final_response = final_response.ok_or_else(|| anyhow::anyhow!("No response from agent"))?;
 
-    // Автосохранение скилла после успешных вызовов run_code
     if config.skill_mode == "auto" && !skill_found {
         let rhai_calls: Vec<&ToolCallLogEntry> = tool_calls_log
             .iter()
@@ -412,7 +465,6 @@ pub async fn process_agent_turns(
                 if let Some(code_ref) = parsed.get("code").and_then(|v| v.as_str()) {
                     let code = code_ref.to_string();
 
-                    // Генерируем метаданные через LLM (ответственность skill_manager)
                     let engine_config = build_engine_config(config);
                     let (skill_name, skill_description) =
                         match crate::skill_manager::generate_skill_metadata(
@@ -435,7 +487,7 @@ pub async fn process_agent_turns(
                     let min_len = config.skill_min_code_length;
                     let skill_name_for_log = skill_name.clone();
 
-                    tokio::task::spawn_blocking(move || {
+                    let outcome = match tokio::task::spawn_blocking(move || {
                         let client = reqwest::blocking::Client::new();
                         crate::skill_manager::save_skill(
                             &client,
@@ -450,10 +502,33 @@ pub async fn process_agent_turns(
                         )
                     })
                     .await
-                    .map_err(|e| anyhow::anyhow!("Join error: {}", e))??;
+                    {
+                        Ok(Ok(o)) => o,
+                        Ok(Err(e)) => {
+                            write_log(log_file, "skill_save_error", &format!("{}", e))?;
+                            eprintln!("⚠️ Ошибка сохранения скилла: {}", e);
+                            continue;
+                        }
+                        Err(e) => {
+                            write_log(log_file, "skill_save_error", &format!("Join error: {}", e))?;
+                            eprintln!("⚠️ Join error при сохранении скилла: {}", e);
+                            continue;
+                        }
+                    };
 
-                    write_log(log_file, "skill_saved", &skill_name_for_log)?;
-                    eprintln!("💾 Скилл сохранён: {}", skill_name_for_log);
+                    match outcome {
+                        crate::skill_manager::SaveSkillOutcome::Saved => {
+                            write_log(log_file, "skill_saved", &skill_name_for_log)?;
+                            eprintln!("💾 Скилл сохранён: {}", skill_name_for_log);
+                        }
+                        crate::skill_manager::SaveSkillOutcome::SkippedTooShort { actual, min } => {
+                            write_log(
+                                log_file,
+                                "skill_skipped",
+                                &format!("{} ({} < {})", skill_name_for_log, actual, min),
+                            )?;
+                        }
+                    }
                 }
             }
         }
@@ -471,17 +546,6 @@ pub async fn process_agent_turns(
     if !final_response.reasoning.is_empty() {
         write_log(log_file, "reasoning", &final_response.reasoning)?;
     }
-    write_log(
-        log_file,
-        "metrics",
-        &format!(
-            "Prompt: {}, Completion: {}, Cost: {:.6} RUB, Calls: {}",
-            metrics.prompt_tokens,
-            metrics.completion_tokens,
-            metrics.cost_rub,
-            metrics.api_calls_count
-        ),
-    )?;
 
     Ok(AgentResponse {
         status: "completed".to_string(),
@@ -498,20 +562,17 @@ pub async fn process_agent_turns(
     })
 }
 
-/// Обработка stateless-агента: каждый запрос с новым движком
 pub async fn run_agent(
     config: &AgentConfig,
     context: &AgentContext,
     request: AgentRequest,
 ) -> Result<AgentResponse> {
-    let log_dir = format!("chats/{}", config.name);
-    fs::create_dir_all(&log_dir)?;
-    let timestamp = chrono::Local::now().format("%Y-%m-%d_%H-%M-%S");
-    let log_path = format!("{}/{}.txt", log_dir, timestamp);
-    let mut log_file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)?;
+    let log_session_id = request
+        .session_id
+        .clone()
+        .unwrap_or_else(|| format!("stateless-{}", uuid::Uuid::new_v4()));
+    let mut log_file =
+        crate::session_store::open_log(&log_session_id, "agent", Some(&config.name))?;
 
     let system_prompt = request
         .system_prompt
@@ -530,19 +591,26 @@ pub async fn run_agent(
     engine.add_message(Role::System, system_prompt);
     engine.add_message(Role::User, request.prompt.clone());
 
-    let mut response =
-        process_agent_turns(&mut engine, config, context, &request, &mut log_file).await?;
-    response.session_id = None;
+    let mut response = process_agent_turns(
+        &mut engine,
+        config,
+        context,
+        &request,
+        &mut log_file,
+        request.session_id.clone(),
+    )
+    .await?;
+    response.session_id = request.session_id;
     Ok(response)
 }
 
-/// Выполнение одного инструмента
 async fn execute_agent_tool(
     context: &AgentContext,
     config: &AgentConfig,
     tool_call: &ToolCall,
     rhai_timeout_sec: u64,
-) -> Result<String> {
+    session_id: Option<String>,
+) -> Result<(String, bool)> {
     match tool_call.function.name.as_str() {
         "run_code" => {
             let parsed: serde_json::Value = serde_json::from_str(&tool_call.function.arguments)
@@ -555,11 +623,17 @@ async fn execute_agent_tool(
 
             let storage_base_url = context.storage_base_url.clone();
             let storage_auth_token = context.storage_auth_token.clone();
-            let agents = context.agents.clone();
             let self_name = context.self_name.clone();
             let agent_call_timeout = context.agent_call_timeout_sec;
+            let board_url = context.board_base_url.clone();
+            let board_token = context.board_auth_token.clone();
+            let pending_calls = context.pending_calls.clone();
+            let outgoing_tasks = context.outgoing_tasks.clone();
             let timeout_duration = Duration::from_secs(rhai_timeout_sec);
             let config_owned = config.clone();
+
+            let posted_flag = Arc::new(AtomicBool::new(false));
+            let posted_flag_clone = posted_flag.clone();
 
             let result = tokio::time::timeout(
                 timeout_duration,
@@ -567,9 +641,14 @@ async fn execute_agent_tool(
                     run_code_with_storage(
                         storage_base_url,
                         storage_auth_token,
-                        agents,
                         self_name,
                         agent_call_timeout,
+                        board_url,
+                        board_token,
+                        session_id,
+                        pending_calls,
+                        outgoing_tasks,
+                        posted_flag_clone,
                         &config_owned,
                         &code,
                     )
@@ -580,7 +659,9 @@ async fn execute_agent_tool(
 
             let result = result.map_err(|e| anyhow::anyhow!("JoinError: {}", e))?;
             let result = result.map_err(|e| anyhow::anyhow!("Rhai execution error: {}", e))?;
-            Ok(result)
+
+            let posted = posted_flag.load(Ordering::Relaxed);
+            Ok((result, posted))
         }
         "local_storage" => {
             let result = crate::tools::execute_tool(
@@ -592,18 +673,24 @@ async fn execute_agent_tool(
                 rhai_timeout_sec,
             )
             .await;
-            Ok(result)
+            Ok((result, false))
         }
         _ => Err(anyhow::anyhow!("Unknown tool: {}", tool_call.function.name)),
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_code_with_storage(
     storage_base_url: String,
     storage_auth_token: String,
-    agents: Arc<HashMap<String, AgentEndpoint>>,
     self_name: Option<String>,
     agent_call_timeout_sec: u64,
+    board_url: String,
+    board_token: String,
+    self_session_id: Option<String>,
+    pending_calls: PendingCalls,
+    outgoing_tasks: OutgoingTasks,
+    posted_flag: Arc<AtomicBool>,
     config: &AgentConfig,
     code: &str,
 ) -> Result<String> {
@@ -618,14 +705,18 @@ fn run_code_with_storage(
 
     crate::tools::register_basic_functions(&mut engine);
     crate::tools::register_storage_functions(&mut engine, &storage_base_url, &storage_auth_token);
-    crate::tools::register_agent_call_functions(
+    crate::tools::register_board_functions(
         &mut engine,
-        agents,
-        self_name,
+        board_url,
+        board_token,
+        self_name.unwrap_or_default(),
+        self_session_id,
+        pending_calls,
         agent_call_timeout_sec,
+        posted_flag,
+        outgoing_tasks,
     );
 
-    // Регистрируем функции скиллов только в ручном режиме
     if config.skill_mode == "manual" {
         crate::tools::register_skill_functions(
             &mut engine,
@@ -648,8 +739,6 @@ fn run_code_with_storage(
     }
 }
 
-// Вспомогательные функции для работы скиллов (автоисполнение)
-
 fn extract_rhai_code(skill_content: &str) -> Option<String> {
     let marker = "RHAI_CODE:";
     let pos = skill_content.find(marker)?;
@@ -660,14 +749,20 @@ async fn execute_skill_code_directly(
     context: &AgentContext,
     config: &AgentConfig,
     code: String,
+    session_id: Option<String>,
 ) -> Result<String> {
     let storage_base_url = context.storage_base_url.clone();
     let storage_auth_token = context.storage_auth_token.clone();
-    let agents = context.agents.clone();
     let self_name = context.self_name.clone();
     let agent_call_timeout = context.agent_call_timeout_sec;
+    let board_url = context.board_base_url.clone();
+    let board_token = context.board_auth_token.clone();
+    let pending_calls = context.pending_calls.clone();
+    let outgoing_tasks = context.outgoing_tasks.clone();
     let config_owned = config.clone();
     let rhai_timeout = config.rhai_timeout_sec.unwrap_or(30);
+
+    let posted_flag = Arc::new(AtomicBool::new(false));
 
     let result = tokio::time::timeout(
         Duration::from_secs(rhai_timeout),
@@ -675,9 +770,14 @@ async fn execute_skill_code_directly(
             run_code_with_storage(
                 storage_base_url,
                 storage_auth_token,
-                agents,
                 self_name,
                 agent_call_timeout,
+                board_url,
+                board_token,
+                session_id,
+                pending_calls,
+                outgoing_tasks,
+                posted_flag,
                 &config_owned,
                 &code,
             )

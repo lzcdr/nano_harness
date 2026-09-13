@@ -1,9 +1,13 @@
+// src/bin/agent_server.rs
+
 use clap::Parser;
-use nano_harness::agent_core::{AgentContext, AgentEndpoint};
+use nano_harness::agent_core::{AgentContext, OutgoingTasks, PendingCalls};
 use nano_harness::agent_http_api;
 use nano_harness::config::TomlConfig;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 #[derive(Parser, Debug)]
 #[command(name = "agent_server")]
@@ -26,38 +30,37 @@ async fn main() -> anyhow::Result<()> {
         .find(|a| a.name == args.agent_name)
         .ok_or_else(|| anyhow::anyhow!("Агент '{}' не найден в конфиге", args.agent_name))?;
 
-    // Получаем параметры хранилища из конфига
     let storage_config = config
         .local_storage_http_server
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("Секция [local_storage_http_server] не найдена"))?;
 
-    // Строим карту агентов
-    let mut agents_map = HashMap::new();
-    for agent in &config.agents {
-        let url = if agent.bind_addr.starts_with("http") {
-            agent.bind_addr.clone()
-        } else {
-            format!("http://{}", agent.bind_addr)
-        };
-        agents_map.insert(
-            agent.name.clone(),
-            AgentEndpoint {
-                url,
-                auth_token: agent.auth_token.clone(),
-            },
-        );
-    }
+    let board_url = config
+        .message_board
+        .as_ref()
+        .map(|c| c.bind_addr.clone())
+        .unwrap_or_else(|| "127.0.0.1:8090".to_string());
+    let board_token = config
+        .message_board
+        .as_ref()
+        .map(|c| c.auth_token.clone())
+        .unwrap_or_else(|| "board_token".to_string());
+
+    let pending_calls: PendingCalls = Arc::new(Mutex::new(HashMap::new()));
+    let outgoing_tasks: OutgoingTasks = Arc::new(Mutex::new(HashMap::new()));
 
     let agent_call_timeout = agent_config.agent_call_timeout_sec.unwrap_or(120);
     let context = AgentContext::new(
         storage_config.bind_addr.clone(),
         storage_config.auth_token.clone(),
         agent_config.timeout_sec,
-        agents_map,
         Some(agent_config.name.clone()),
         agent_call_timeout,
-    );
+        board_url,
+        board_token,
+        pending_calls,
+        outgoing_tasks,
+    )?;
 
     agent_http_api::run_server(agent_config.clone(), context).await
 }

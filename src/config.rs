@@ -8,6 +8,7 @@ use crate::agent_core::AgentConfig;
 use crate::engine::{EngineConfig, ToolExecutionConfig};
 use crate::local_storage::VectorDbConfig;
 use crate::local_storage_http_api::LocalStorageServerConfig;
+use crate::message_board::MessageBoardConfig;
 
 #[derive(Debug, Deserialize, Default)]
 pub struct TomlConfig {
@@ -32,7 +33,7 @@ pub struct TomlConfig {
 
     pub vector_db: Option<VectorDbConfig>,
     pub local_storage_http_server: Option<LocalStorageServerConfig>,
-
+    pub message_board: Option<MessageBoardConfig>,
     #[serde(default)]
     pub agents: Vec<AgentConfig>,
 }
