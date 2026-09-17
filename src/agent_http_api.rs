@@ -36,9 +36,9 @@ struct AppState {
     context: Arc<AgentContext>,
     auth_token: String,
     sessions: Arc<AsyncMutex<HashMap<String, Arc<AsyncMutex<Session>>>>>,
-    sse_listeners: Arc<AsyncMutex<HashMap<(String, String), tokio::task::JoinHandle<()>>>>,
-    /// Стек входящих task_id на сессию. Верхний — та задача, по которой
-    /// сессия сейчас отвечает.
+    /// Один SSE-листенер на агента. Ключ — имя агента.
+    sse_listeners: Arc<AsyncMutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
+    /// Стек входящих task_id на сессию.
     incoming_tasks: Arc<AsyncMutex<HashMap<String, Vec<String>>>>,
 }
 
@@ -90,7 +90,6 @@ fn error_response(e: anyhow::Error) -> Response {
     .into_response()
 }
 
-/// Сохраняет состояние сессии и её `pending_tasks` (по данным `outgoing_tasks`).
 async fn persist_session(
     state: &Arc<AppState>,
     session_id: &str,
@@ -104,11 +103,12 @@ async fn persist_session(
                 task_id: t.task_id.clone(),
                 to_agent_name: t.to_agent_name.clone(),
                 to_session_id: t.to_session_id.clone(),
+                chain: t.chain.clone(),
             })
             .collect()
     };
 
-    match session_store::load_session(session_id) {
+    match session_store::load_session(session_id, Some(&state.config.name)) {
         Ok(mut store_session) => {
             store_session.context = Some(ContextBlock {
                 engine_config: engine.get_config().clone(),
@@ -128,7 +128,8 @@ fn load_or_create_engine(
     session_id: &str,
     config: &AgentConfig,
 ) -> anyhow::Result<(crate::engine::ChatEngine, Option<session_store::Session>)> {
-    let store_session = session_store::load_session_with_key(session_id, &config.api_key).ok();
+    let store_session =
+        session_store::load_session_with_key(session_id, &config.api_key, Some(&config.name)).ok();
     let mut engine = create_agent_engine(config)?;
 
     if let Some(ref session) = store_session {
@@ -155,6 +156,15 @@ async fn ensure_session(
         let sessions = state.sessions.lock().await;
         if let Some(arc) = sessions.get(session_id).cloned() {
             return Ok(arc);
+        }
+    }
+
+    if let Ok(s) = session_store::load_session(session_id, Some(&state.config.name)) {
+        if s.deleted {
+            return Err(anyhow::anyhow!(
+                "Сессия '{}' помечена удалённой",
+                session_id
+            ));
         }
     }
 
@@ -213,38 +223,43 @@ async fn ensure_session(
         .await
         .insert(session_id.to_string(), arc.clone());
 
-    spawn_sse_listener(
-        state.clone(),
-        state.config.name.clone(),
-        session_id.to_string(),
-    );
-
     Ok(arc)
 }
 
 // ==================== Управление SSE ====================
 
-fn spawn_sse_listener(state: Arc<AppState>, agent_name: String, session_id: String) {
+fn spawn_sse_listener(state: Arc<AppState>) {
     let state_clone = state.clone();
     tokio::spawn(async move {
-        let key = (agent_name.clone(), session_id.clone());
+        let agent_name = state_clone.config.name.clone();
         {
             let mut listeners = state_clone.sse_listeners.lock().await;
-            if let Some(handle) = listeners.get(&key) {
+            if let Some(handle) = listeners.get(&agent_name) {
                 if !handle.is_finished() {
                     return;
                 }
-                listeners.remove(&key);
+                listeners.remove(&agent_name);
             }
         }
         let state_for_loop = state_clone.clone();
         let agent_for_loop = agent_name.clone();
-        let session_for_loop = session_id.clone();
         let handle = tokio::spawn(async move {
-            sse_loop(state_for_loop, agent_for_loop, session_for_loop).await;
+            sse_loop(state_for_loop, agent_for_loop).await;
         });
-        state_clone.sse_listeners.lock().await.insert(key, handle);
+        state_clone
+            .sse_listeners
+            .lock()
+            .await
+            .insert(agent_name, handle);
     });
+}
+
+async fn stop_sse_listener(state: &Arc<AppState>, agent_name: &str) {
+    let mut listeners = state.sse_listeners.lock().await;
+    if let Some(handle) = listeners.remove(agent_name) {
+        handle.abort();
+        eprintln!("🛑 SSE остановлен: agent={}", agent_name);
+    }
 }
 
 async fn sse_cleanup_loop(state: Arc<AppState>, mut shutdown_rx: watch::Receiver<bool>) {
@@ -308,6 +323,13 @@ async fn session_cleanup_loop(
                 let now = Instant::now();
                 let mut to_remove: Vec<String> = Vec::new();
                 for (id, arc) in snapshot {
+                    if session_store::is_session_deleted_or_missing(
+                        &id,
+                        Some(&state.config.name),
+                    ) {
+                        to_remove.push(id);
+                        continue;
+                    }
                     if let Ok(guard) = arc.try_lock() {
                         if now.duration_since(guard.last_used).as_secs() > ttl_sec {
                             to_remove.push(id);
@@ -322,20 +344,25 @@ async fn session_cleanup_loop(
                             evicted += 1;
                         }
                     }
-                    eprintln!("🧹 Выгружено {} неактивных сессий из кэша", evicted);
+                    if evicted > 0 {
+                        eprintln!(
+                            "🧹 Выгружено {} неактивных/удалённых сессий из кэша",
+                            evicted
+                        );
+                    }
                 }
             }
         }
     }
 }
 
-async fn sse_loop(state: Arc<AppState>, agent_name: String, session_id: String) {
+async fn sse_loop(state: Arc<AppState>, agent_name: String) {
     let mut backoff = Duration::from_secs(1);
     let max_backoff = Duration::from_secs(30);
     let mut consecutive_errors = 0u32;
 
     loop {
-        match connect_and_listen(&state, &agent_name, &session_id).await {
+        match connect_and_listen(&state, &agent_name).await {
             Ok(()) => {
                 consecutive_errors = 0;
                 backoff = Duration::from_secs(1);
@@ -344,8 +371,8 @@ async fn sse_loop(state: Arc<AppState>, agent_name: String, session_id: String) 
                 consecutive_errors += 1;
                 if consecutive_errors <= 3 || consecutive_errors % 10 == 0 {
                     eprintln!(
-                        "❌ SSE [agent={}, session_id={}] ошибка #{}: {}",
-                        agent_name, session_id, consecutive_errors, e
+                        "❌ SSE [agent={}] ошибка #{}: {}",
+                        agent_name, consecutive_errors, e
                     );
                 }
                 tokio::time::sleep(backoff).await;
@@ -357,21 +384,13 @@ async fn sse_loop(state: Arc<AppState>, agent_name: String, session_id: String) 
     }
 }
 
-async fn connect_and_listen(
-    state: &Arc<AppState>,
-    agent_name: &str,
-    session_id: &str,
-) -> anyhow::Result<()> {
+async fn connect_and_listen(state: &Arc<AppState>, agent_name: &str) -> anyhow::Result<()> {
     let url = format!(
-        "{}/events?agent_name={}&session_id={}",
+        "{}/events?agent_name={}",
         state.context.board_base_url.trim_end_matches('/'),
-        urlencoding::encode(agent_name),
-        urlencoding::encode(session_id)
+        urlencoding::encode(agent_name)
     );
-    eprintln!(
-        "⏳ Подключаю SSE: agent={}, session_id={} -> {}",
-        agent_name, session_id, url
-    );
+    eprintln!("⏳ Подключаю SSE: agent={} -> {}", agent_name, url);
     let client = reqwest::Client::new();
     let resp = client
         .get(&url)
@@ -384,10 +403,7 @@ async fn connect_and_listen(
     if !resp.status().is_success() {
         return Err(anyhow::anyhow!("HTTP {}", resp.status()));
     }
-    eprintln!(
-        "🔌 SSE подключён: agent={}, session_id={}",
-        agent_name, session_id
-    );
+    eprintln!("🔌 SSE подключён: agent={}", agent_name);
 
     let mut stream = resp.bytes_stream();
     let mut buffer = String::new();
@@ -473,6 +489,7 @@ async fn handle_task_created(state: Arc<AppState>, task: crate::message_board::T
         session_id: Some(session_id.clone()),
     };
 
+    let parent_chain = task.chain.clone();
     let Session {
         engine, log_file, ..
     } = &mut *guard;
@@ -484,6 +501,7 @@ async fn handle_task_created(state: Arc<AppState>, task: crate::message_board::T
         &request,
         log_file,
         Some(session_id.clone()),
+        parent_chain,
     )
     .await;
 
@@ -496,8 +514,6 @@ async fn handle_task_created(state: Arc<AppState>, task: crate::message_board::T
                     let _ = publish_complete(&state, &task.id, &response.result).await;
                 }
                 "waiting" => {
-                    // Входящая задача уходит в стек: сессия ждёт ответа
-                    // на исходящие post_task, а по завершении вернётся к ней.
                     let mut stack = state.incoming_tasks.lock().await;
                     stack
                         .entry(session_id.clone())
@@ -528,10 +544,6 @@ async fn handle_task_result(
     from_session_id: String,
     is_error: bool,
 ) {
-    //if from_agent != state.config.name {
-    //    return;
-    //}
-
     // 1. Синхронный call_agent?
     {
         let mut pc = state.context.pending_calls.lock().await;
@@ -551,7 +563,9 @@ async fn handle_task_result(
         return;
     };
 
-    let session_id = outgoing.session_id;
+    let session_id = outgoing.session_id.clone();
+    let parent_chain = outgoing.chain.clone();
+
     if session_id.is_empty() {
         eprintln!("TaskCompleted для задачи {} без session_id", task_id);
         return;
@@ -568,6 +582,13 @@ async fn handle_task_result(
     let Some(arc) = arc else { return };
     let mut guard = arc.lock().await;
     guard.last_used = Instant::now();
+
+    if let Ok(mut store) = session_store::load_session(&session_id, Some(&state.config.name)) {
+        session_store::remove_pending_task(&mut store, &task_id);
+        if let Err(e) = session_store::save_session(&store) {
+            eprintln!("Ошибка сохранения сессии {}: {}", session_id, e);
+        }
+    }
 
     let header = if is_error {
         format!("[Ошибка от агента {}]: {}", from_agent, result)
@@ -598,6 +619,7 @@ async fn handle_task_result(
         &request,
         log_file,
         Some(session_id.clone()),
+        parent_chain,
     )
     .await;
 
@@ -608,16 +630,11 @@ async fn handle_task_result(
 
             match response.status.as_str() {
                 "completed" => {
-                    // Продолжение завершено → снимаем верхнюю входящую задачу
-                    // со стека и отвечаем её отправителю.
                     if let Some(parent_task_id) = pop_incoming_task(&state, &session_id).await {
                         let _ = publish_complete(&state, &parent_task_id, &response.result).await;
                     }
                 }
-                "waiting" => {
-                    // Внутри продолжения LLM снова сделал post_task —
-                    // верхняя входящая задача остаётся в стеке.
-                }
+                "waiting" => {}
                 _ => {
                     if let Some(parent_task_id) = pop_incoming_task(&state, &session_id).await {
                         let err = response
@@ -702,13 +719,113 @@ async fn publish_fail(state: &Arc<AppState>, task_id: &str, error: &str) -> anyh
     Ok(())
 }
 
+// ==================== Фоновая проверка незавершённых задач ====================
+
+async fn poll_pending_tasks(state: Arc<AppState>) {
+    let active_task_ids: Vec<String> = {
+        let map = state.context.outgoing_tasks.lock().await;
+        map.keys().cloned().collect()
+    };
+    if active_task_ids.is_empty() {
+        return;
+    }
+
+    // Один запрос на все завершённые задачи этого агента.
+    let url = format!(
+        "{}/tasks?from_agent={}&status=completed,failed",
+        state.context.board_base_url.trim_end_matches('/'),
+        urlencoding::encode(&state.config.name)
+    );
+    let client = reqwest::Client::new();
+    let resp = match client
+        .get(&url)
+        .header(
+            "Authorization",
+            format!("Bearer {}", state.context.board_auth_token),
+        )
+        .send()
+        .await
+    {
+        Ok(r) if r.status().is_success() => r,
+        Ok(r) => {
+            eprintln!("poll_pending_tasks: HTTP {}", r.status());
+            return;
+        }
+        Err(e) => {
+            eprintln!("poll_pending_tasks: ошибка запроса: {}", e);
+            return;
+        }
+    };
+    let tasks: Vec<crate::message_board::Task> = match resp.json().await {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("poll_pending_tasks: ошибка парсинга: {}", e);
+            return;
+        }
+    };
+
+    for task in tasks {
+        if !active_task_ids.contains(&task.id) {
+            continue;
+        }
+        match task.status {
+            crate::message_board::TaskStatus::Completed => {
+                if let Some(result) = task.result.clone() {
+                    eprintln!("📬 Восстановлена завершённая задача {}", task.id);
+                    handle_task_result(
+                        state.clone(),
+                        task.id.clone(),
+                        result,
+                        task.from_agent.clone(),
+                        task.from_session_id.clone(),
+                        false,
+                    )
+                    .await;
+                }
+            }
+            crate::message_board::TaskStatus::Failed => {
+                let err = task.error.clone().unwrap_or_default();
+                eprintln!("📬 Восстановлена упавшая задача {}", task.id);
+                handle_task_result(
+                    state.clone(),
+                    task.id.clone(),
+                    err,
+                    task.from_agent.clone(),
+                    task.from_session_id.clone(),
+                    true,
+                )
+                .await;
+            }
+            _ => {}
+        }
+    }
+}
+
+async fn poll_pending_tasks_loop(state: Arc<AppState>, mut shutdown_rx: watch::Receiver<bool>) {
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    poll_pending_tasks(state.clone()).await;
+
+    let mut interval = tokio::time::interval(Duration::from_secs(60));
+    interval.tick().await;
+    loop {
+        tokio::select! {
+            _ = shutdown_rx.changed() => break,
+            _ = interval.tick() => {
+                poll_pending_tasks(state.clone()).await;
+            }
+        }
+    }
+}
+
 // ==================== HTTP-обработчики ====================
 
 async fn run_stateful_agent(state: &AppState, request: AgentRequest) -> Response {
-    let session_id = request
-        .session_id
-        .clone()
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let session_id = match request.session_id.clone() {
+        Some(id) if !id.trim().is_empty() => id,
+        _ => {
+            return error_response(anyhow::anyhow!("session_id is required for stateful agent"));
+        }
+    };
     eprintln!(
         "📨 HTTP /agent/run: agent='{}', session_id={}",
         state.config.name, session_id
@@ -746,6 +863,7 @@ async fn run_stateful_agent(state: &AppState, request: AgentRequest) -> Response
         &request,
         log_file,
         Some(sid.clone()),
+        vec![],
     )
     .await
     {
@@ -795,6 +913,10 @@ pub async fn run_server(config: AgentConfig, context: AgentContext) -> anyhow::R
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     if matches!(config.agent_type, AgentType::Stateful) {
+        // Одно SSE на агента.
+        spawn_sse_listener(state_arc.clone());
+
+        // Восстановление pending_tasks из файлов сессий.
         match session_store::list_sessions_for_agent(&config.name) {
             Ok(sessions) => {
                 if sessions.is_empty() {
@@ -803,11 +925,9 @@ pub async fn run_server(config: AgentConfig, context: AgentContext) -> anyhow::R
                     eprintln!("📁 Найдено {} сессий агента:", sessions.len());
                     let mut restored_pending = 0usize;
                     for s in &sessions {
-                        eprintln!(
-                            "   - session_id={} display_name=\"{}\"",
-                            s.session_id, s.display_name
-                        );
-                        if let Ok(session) = session_store::load_session(&s.session_id) {
+                        if let Ok(session) =
+                            session_store::load_session(&s.session_id, Some(&config.name))
+                        {
                             let mut map = state_arc.context.outgoing_tasks.lock().await;
                             for pt in &session.pending_tasks {
                                 map.insert(
@@ -817,6 +937,7 @@ pub async fn run_server(config: AgentConfig, context: AgentContext) -> anyhow::R
                                         session_id: s.session_id.clone(),
                                         to_agent_name: pt.to_agent_name.clone(),
                                         to_session_id: pt.to_session_id.clone(),
+                                        chain: pt.chain.clone(),
                                     },
                                 );
                                 restored_pending += 1;
@@ -826,22 +947,15 @@ pub async fn run_server(config: AgentConfig, context: AgentContext) -> anyhow::R
                     if restored_pending > 0 {
                         eprintln!("🔄 Восстановлено {} ожидающих задач", restored_pending);
                     }
-                    for s in sessions {
-                        spawn_sse_listener(
-                            state_arc.clone(),
-                            config.name.clone(),
-                            s.session_id.clone(),
-                        );
-                    }
                 }
             }
             Err(e) => eprintln!("⚠️ Не удалось прочитать список сессий: {}", e),
         }
 
         let state_for_poll = state_arc.clone();
+        let rx_poll = shutdown_rx.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(2)).await;
-            poll_pending_tasks(state_for_poll).await;
+            poll_pending_tasks_loop(state_for_poll, rx_poll).await;
         });
 
         let state_for_sse_cleanup = state_arc.clone();
@@ -893,88 +1007,7 @@ pub async fn run_server(config: AgentConfig, context: AgentContext) -> anyhow::R
         })
         .await?;
 
-    {
-        let mut listeners = state_arc.sse_listeners.lock().await;
-        for (_, handle) in listeners.drain() {
-            handle.abort();
-        }
-    }
+    stop_sse_listener(&state_arc, &config.name).await;
     eprintln!("✅ Агент '{}' остановлен корректно", config.name);
     Ok(())
-}
-
-/// Опрос незакрытых исходящих задач после рестарта.
-async fn poll_pending_tasks(state: Arc<AppState>) {
-    let snapshot: Vec<String> = {
-        let map = state.context.outgoing_tasks.lock().await;
-        map.keys().cloned().collect()
-    };
-    if snapshot.is_empty() {
-        return;
-    }
-    eprintln!("🔎 Проверяю {} ожидающих задач на доске...", snapshot.len());
-    for task_id in snapshot {
-        let url = format!(
-            "{}/tasks/{}",
-            state.context.board_base_url.trim_end_matches('/'),
-            task_id
-        );
-        let client = reqwest::Client::new();
-        let resp = match client
-            .get(&url)
-            .header(
-                "Authorization",
-                format!("Bearer {}", state.context.board_auth_token),
-            )
-            .send()
-            .await
-        {
-            Ok(r) if r.status().is_success() => r,
-            Ok(r) => {
-                eprintln!("Задача {}: HTTP {}", task_id, r.status());
-                continue;
-            }
-            Err(e) => {
-                eprintln!("Ошибка запроса статуса задачи {}: {}", task_id, e);
-                continue;
-            }
-        };
-        let task: crate::message_board::Task = match resp.json().await {
-            Ok(t) => t,
-            Err(e) => {
-                eprintln!("Ошибка парсинга задачи {}: {}", task_id, e);
-                continue;
-            }
-        };
-        match task.status {
-            crate::message_board::TaskStatus::Completed => {
-                if let Some(result) = task.result.clone() {
-                    eprintln!("📬 Восстановлена завершённая задача {}", task_id);
-                    handle_task_result(
-                        state.clone(),
-                        task_id.clone(),
-                        result,
-                        task.from_agent.clone(),
-                        task.from_session_id.clone(),
-                        false,
-                    )
-                    .await;
-                }
-            }
-            crate::message_board::TaskStatus::Failed => {
-                let err = task.error.clone().unwrap_or_default();
-                eprintln!("📬 Восстановлена упавшая задача {}", task_id);
-                handle_task_result(
-                    state.clone(),
-                    task_id.clone(),
-                    err,
-                    task.from_agent.clone(),
-                    task.from_session_id.clone(),
-                    true,
-                )
-                .await;
-            }
-            _ => {}
-        }
-    }
 }

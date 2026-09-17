@@ -14,9 +14,6 @@ max_tokens = 4096
 top_p = 1.0
 stream = true
 
-# Остановочные последовательности (необязательно, можно не указывать)
-# stop = ["\n\n", "###"]
-
 # Уровень reasoning: "low" | "medium" | "high" (зависит от модели)
 reasoning_effort = "medium"
 
@@ -67,7 +64,41 @@ storage_read_file("hello.txt")
 Пример записи файла:
 storage_write_file("hello.txt", "Привет")
 
-Всегда передавайте код в параметре "code" инструмента run_code."""
+Ты можешь вызывать других агентов через функции внутри run_code:
+
+- call_agent(to_agent: string, prompt: string) -> string — синхронный вызов,
+  ждёт ответа и возвращает его.
+- post_task(to_agent: string, prompt: string) -> string — асинхронный,
+  возвращает "posted:<task_id>". После вызова заверши ход — продолжение
+  произойдёт автоматически, когда агент ответит.
+
+Доступные агенты:
+
+- assistant — помощник для работы с файлами. Умеет читать, писать,
+  искать файлы в локальном хранилище, вызывать других агентов.
+- helper — вспомогательный агент для коротких справок.
+
+Если пользователь называет конкретного агента — вызывай именно его.
+Если не называет — выбирай по смыслу задачи: для работы с файлами
+используй assistant, для простых вопросов — helper.
+
+Пример синхронного вызова assistant:
+    let answer = call_agent("assistant", "Прочитай файл hello.txt и верни содержимое");
+    answer
+
+Пример синхронного вызова helper:
+    let answer = call_agent("helper", "Представься одним предложением");
+    answer
+
+Пример асинхронного вызова:
+    let task_id = post_task("assistant", "Найди все файлы с расширением .md");
+    task_id
+
+Всегда передавайте код в параметре "code" инструмента run_code.
+
+Свои предложения по созданию новых или уже существующих агентов, инструментов,
+скиллов можешь записывать в хранилище.
+"""
 
 # Глобальный таймаут выполнения Rhai-скрипта (в секундах)
 rhai_timeout_sec = 120
@@ -155,24 +186,20 @@ storage_read_file("hello.txt")
 Пример записи файла:
 storage_write_file("hello.txt", "Привет")
 
-Ты можешь вызвать другого агента через функцию call_agent(to_agent: string, to_session_id: string, prompt: string)
+Ты можешь вызвать другого агента через функцию call_agent(to_agent: string, prompt: string)
 -> string внутри run_code.
-Агент "helper" доступен для вызова.
-У агента "helper" есть фиксированная сессия: helper_main.
-ВСЕГДА используй именно этот session_id для общения с агентом helper. Никогда не придумывай другой.
-
 Пример:
-    let answer = call_agent("helper", "helper_main", "Представься одним предложением");
+    let answer = call_agent("helper", "Представься одним предложением");
     answer
 
-Также доступна функция post_task(to_agent: string, to_session_id: string, prompt: string) -> string.
+Также доступна функция post_task(to_agent: string, prompt: string) -> string.
 Она публикует задачу асинхронно и возвращает строку "posted:<task_id>".
 После вызова post_task ты должен завершить ход, а продолжение
-произойдёт автоматически, когда helper ответит.
+произойдёт автоматически, когда агент ответит.
 
 Когда пользователь просит "асинхронно спроси у helper ...",
 используй именно post_task:
-    let task_id = post_task("helper", "helper_main", "Как тебя зовут?");
+    let task_id = post_task("helper", "Как тебя зовут?");
     task_id
 
 Всегда передавай код в параметре "code" инструмента run_code."""
@@ -218,6 +245,9 @@ skill_min_code_length = 40
 # Порог расстояния для автоисполнения скилла без обращения к LLM
 skill_auto_execute_threshold = 0.15
 
+# Лимит бюджета в рублях (переопределяет глобальный)
+max_cost_rub = 10.0
+
 # ============================================================================
 # Агент 2 — helper
 # ============================================================================
@@ -255,3 +285,5 @@ skill_mode = "auto"
 skill_semantic_threshold = 0.5
 skill_min_code_length = 40
 skill_auto_execute_threshold = 0.15
+
+max_cost_rub = 10.0

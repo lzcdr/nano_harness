@@ -22,15 +22,13 @@ pub struct PendingCall {
 
 pub type PendingCalls = Arc<tokio::sync::Mutex<HashMap<String, PendingCall>>>;
 
-/// Исходящая задача, опубликованная через `post_task`.
-/// Регистрируется сразу при публикации, не зависит от того,
-/// вернула ли её LLM.
 #[derive(Debug, Clone)]
 pub struct OutgoingTask {
     pub task_id: String,
     pub session_id: String,
     pub to_agent_name: String,
     pub to_session_id: String,
+    pub chain: Vec<String>,
 }
 
 pub type OutgoingTasks = Arc<tokio::sync::Mutex<HashMap<String, OutgoingTask>>>;
@@ -84,6 +82,8 @@ pub struct AgentConfig {
     pub agent_call_timeout_sec: Option<u64>,
     #[serde(default = "default_skill_auto_execute_threshold")]
     pub skill_auto_execute_threshold: f32,
+    #[serde(default)]
+    pub max_cost_rub: Option<f64>,
 }
 
 fn default_skill_mode() -> String {
@@ -226,7 +226,7 @@ pub fn build_engine_config(config: &AgentConfig) -> EngineConfig {
         ),
         tool_choice: None,
         reasoning_effort: config.reasoning_effort.clone(),
-        max_cost_rub: None,
+        max_cost_rub: config.max_cost_rub,
         prefix_message_count: config.prefix_message_count,
         tail_message_count: config.tail_message_count,
     }
@@ -248,6 +248,7 @@ pub async fn process_agent_turns(
     request: &AgentRequest,
     log_file: &mut fs::File,
     session_id: Option<String>,
+    parent_chain: Vec<String>,
 ) -> Result<AgentResponse> {
     let max_iterations = request.max_iterations.unwrap_or(config.max_iterations);
     let mut tool_calls_log = Vec::new();
@@ -257,7 +258,7 @@ pub async fn process_agent_turns(
 
     let mut skill_found = false;
 
-    if config.skill_mode == "auto" {
+    if config.skill_mode == "auto" && !request.prompt.trim().is_empty() {
         let storage_base_url = context.storage_base_url.clone();
         let storage_auth_token = context.storage_auth_token.clone();
         let current_agent = config.name.clone();
@@ -311,9 +312,14 @@ pub async fn process_agent_turns(
                     &format!("{} (distance: {:.4})", skill_record.skill_file, distance),
                 )?;
 
-                let result =
-                    execute_skill_code_directly(context, config, code.clone(), session_id.clone())
-                        .await;
+                let result = execute_skill_code_directly(
+                    context,
+                    config,
+                    code.clone(),
+                    session_id.clone(),
+                    parent_chain.clone(),
+                )
+                .await;
 
                 let success = result.is_ok();
                 let storage_base_url = context.storage_base_url.clone();
@@ -394,9 +400,15 @@ pub async fn process_agent_turns(
             }
 
             for tc in &tool_calls {
-                let (result, posted) =
-                    execute_agent_tool(context, config, tc, rhai_timeout, session_id.clone())
-                        .await?;
+                let (result, posted) = execute_agent_tool(
+                    context,
+                    config,
+                    tc,
+                    rhai_timeout,
+                    session_id.clone(),
+                    parent_chain.clone(),
+                )
+                .await?;
                 eprintln!("✅ Результат '{}': {}", tc.function.name, result);
 
                 write_log(
@@ -414,14 +426,12 @@ pub async fn process_agent_turns(
                     result: result.clone(),
                 });
 
-                if posted {
+                // Всегда закрываем tool_call, иначе следующий send() упадёт
+                // на невалидной истории (assistant с tool_calls без tool).
+                engine.add_tool_result(tc.id.clone(), result.clone());
+
+                if posted || result.starts_with("posted:") {
                     posted_any = true;
-                    // не добавляем tool result в контекст LLM
-                } else if result.starts_with("posted:") {
-                    // LLM вернул результат post_task как есть
-                    posted_any = true;
-                } else {
-                    engine.add_tool_result(tc.id.clone(), result);
                 }
             }
             final_response = Some(response);
@@ -454,6 +464,18 @@ pub async fn process_agent_turns(
     }
 
     let final_response = final_response.ok_or_else(|| anyhow::anyhow!("No response from agent"))?;
+
+    // Если исчерпали max_iterations, а модель всё ещё хотела инструменты —
+    // финальный ответ пустой. Возвращаем последний tool_result вместо пустоты.
+    let final_content =
+        if final_response.content.trim().is_empty() && final_response.tool_calls.is_some() {
+            tool_calls_log
+                .last()
+                .map(|t| t.result.clone())
+                .unwrap_or_else(|| "(пустой результат: исчерпан max_iterations)".to_string())
+        } else {
+            final_response.content.clone()
+        };
 
     if config.skill_mode == "auto" && !skill_found {
         let rhai_calls: Vec<&ToolCallLogEntry> = tool_calls_log
@@ -541,15 +563,15 @@ pub async fn process_agent_turns(
         api_calls_count: engine.metrics.api_calls_count,
     };
 
-    eprintln!("🎯 Финальный ответ агента: {}", final_response.content);
-    write_log(log_file, "assistant", &final_response.content)?;
+    eprintln!("🎯 Финальный ответ агента: {}", final_content);
+    write_log(log_file, "assistant", &final_content)?;
     if !final_response.reasoning.is_empty() {
         write_log(log_file, "reasoning", &final_response.reasoning)?;
     }
 
     Ok(AgentResponse {
         status: "completed".to_string(),
-        result: final_response.content.clone(),
+        result: final_content,
         reasoning: if final_response.reasoning.is_empty() {
             None
         } else {
@@ -598,6 +620,7 @@ pub async fn run_agent(
         &request,
         &mut log_file,
         request.session_id.clone(),
+        vec![],
     )
     .await?;
     response.session_id = request.session_id;
@@ -610,6 +633,7 @@ async fn execute_agent_tool(
     tool_call: &ToolCall,
     rhai_timeout_sec: u64,
     session_id: Option<String>,
+    parent_chain: Vec<String>,
 ) -> Result<(String, bool)> {
     match tool_call.function.name.as_str() {
         "run_code" => {
@@ -646,6 +670,7 @@ async fn execute_agent_tool(
                         board_url,
                         board_token,
                         session_id,
+                        parent_chain,
                         pending_calls,
                         outgoing_tasks,
                         posted_flag_clone,
@@ -671,6 +696,7 @@ async fn execute_agent_tool(
                 &context.storage_base_url,
                 &context.storage_auth_token,
                 rhai_timeout_sec,
+                None,
             )
             .await;
             Ok((result, false))
@@ -688,6 +714,7 @@ fn run_code_with_storage(
     board_url: String,
     board_token: String,
     self_session_id: Option<String>,
+    parent_chain: Vec<String>,
     pending_calls: PendingCalls,
     outgoing_tasks: OutgoingTasks,
     posted_flag: Arc<AtomicBool>,
@@ -711,6 +738,7 @@ fn run_code_with_storage(
         board_token,
         self_name.unwrap_or_default(),
         self_session_id,
+        parent_chain,
         pending_calls,
         agent_call_timeout_sec,
         posted_flag,
@@ -750,6 +778,7 @@ async fn execute_skill_code_directly(
     config: &AgentConfig,
     code: String,
     session_id: Option<String>,
+    parent_chain: Vec<String>,
 ) -> Result<String> {
     let storage_base_url = context.storage_base_url.clone();
     let storage_auth_token = context.storage_auth_token.clone();
@@ -775,6 +804,7 @@ async fn execute_skill_code_directly(
                 board_url,
                 board_token,
                 session_id,
+                parent_chain,
                 pending_calls,
                 outgoing_tasks,
                 posted_flag,

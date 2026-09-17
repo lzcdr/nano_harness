@@ -99,15 +99,16 @@ impl FileStorage {
             if name == ".about" || name == ".summary" {
                 continue;
             }
+            let rel_path = self.relativize(&entry.path());
             if entry.file_type().await?.is_dir() {
                 entries.push(crate::local_storage::Entry::Dir {
                     name,
-                    path: entry.path(),
+                    path: rel_path,
                 });
             } else {
                 entries.push(crate::local_storage::Entry::File {
                     name,
-                    path: entry.path(),
+                    path: rel_path,
                     size: entry.metadata().await?.len(),
                 });
             }
