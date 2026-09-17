@@ -34,6 +34,8 @@ pub struct PendingTask {
     pub task_id: String,
     pub to_agent_name: String,
     pub to_session_id: String,
+    #[serde(default)]
+    pub chain: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,6 +58,10 @@ pub struct Session {
     pub logs: Vec<LogEntry>,
     #[serde(default)]
     pub pending_tasks: Vec<PendingTask>,
+    #[serde(default)]
+    pub incoming_stack: Vec<String>,
+    #[serde(default)]
+    pub deleted: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -77,8 +83,6 @@ fn logs_dir() -> PathBuf {
     sessions_dir().join(LOGS_SUBDIR)
 }
 
-/// Формирует имя файла сессии с префиксом владельца:
-/// `agent_{agent_name}_{session_id}.json` или `chat_{session_id}.json`.
 fn session_file(session_id: &str, owner_agent: Option<&str>) -> PathBuf {
     match owner_agent {
         Some(agent) => sessions_dir().join(format!("agent_{}_{}.json", agent, session_id)),
@@ -86,25 +90,13 @@ fn session_file(session_id: &str, owner_agent: Option<&str>) -> PathBuf {
     }
 }
 
-/// Ищет файл сессии по session_id, независимо от префикса владельца.
-/// Поддерживает старый формат `{session_id}.json` для совместимости.
-fn find_session_file(session_id: &str) -> Option<PathBuf> {
-    let dir = sessions_dir();
-    if !dir.exists() {
-        return None;
+fn find_session_file(session_id: &str, owner_agent: Option<&str>) -> Option<PathBuf> {
+    let path = session_file(session_id, owner_agent);
+    if path.exists() {
+        Some(path)
+    } else {
+        None
     }
-    let suffix = format!("_{}.json", session_id);
-    let legacy = format!("{}.json", session_id);
-    let entries = fs::read_dir(&dir).ok()?;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-            if name.ends_with(&suffix) || name == legacy {
-                return Some(path);
-            }
-        }
-    }
-    None
 }
 
 fn lock_file(session_id: &str, owner_agent: Option<&str>) -> PathBuf {
@@ -139,6 +131,8 @@ pub fn new_session(display_name: &str, owner_agent: Option<&str>) -> Result<Sess
         context: None,
         logs: Vec::new(),
         pending_tasks: Vec::new(),
+        incoming_stack: Vec::new(),
+        deleted: false,
     };
 
     save_session(&session)?;
@@ -163,15 +157,22 @@ pub fn create_session_with_id(
         context: None,
         logs: Vec::new(),
         pending_tasks: Vec::new(),
+        incoming_stack: Vec::new(),
+        deleted: false,
     };
 
     save_session(&session)?;
     Ok(session)
 }
 
-pub fn load_session(session_id: &str) -> Result<Session> {
-    let path = find_session_file(session_id)
-        .ok_or_else(|| anyhow::anyhow!("Файл сессии '{}' не найден", session_id))?;
+pub fn load_session(session_id: &str, owner_agent: Option<&str>) -> Result<Session> {
+    let path = find_session_file(session_id, owner_agent).ok_or_else(|| {
+        anyhow::anyhow!(
+            "Файл сессии '{}' не найден (owner: {:?})",
+            session_id,
+            owner_agent
+        )
+    })?;
     let content = fs::read_to_string(&path)
         .with_context(|| format!("Не удалось прочитать файл сессии {}", path.display()))?;
     let session: Session = serde_json::from_str(&content)?;
@@ -197,6 +198,21 @@ pub fn save_session(session: &Session) -> Result<()> {
     if let Some(ctx) = session_clone.context.as_mut() {
         ctx.engine_config.api_key = "***".to_string();
     }
+
+    // Защита от race: если в файле уже стоит deleted=true,
+    // не даём перезаписать его в false.
+    if !session_clone.deleted {
+        if let Some(old_path) = find_session_file(&session.session_id, owner) {
+            if let Ok(content) = fs::read_to_string(&old_path) {
+                if let Ok(old) = serde_json::from_str::<Session>(&content) {
+                    if old.deleted {
+                        session_clone.deleted = true;
+                    }
+                }
+            }
+        }
+    }
+
     let json = serde_json::to_string_pretty(&session_clone)?;
 
     {
@@ -206,12 +222,6 @@ pub fn save_session(session: &Session) -> Result<()> {
         tmp_file.flush()?;
     }
 
-    // Если есть файл по старому имени — удаляем, чтобы не было дубликатов.
-    if let Some(old_path) = find_session_file(&session.session_id) {
-        if old_path != final_path && old_path.exists() {
-            let _ = fs::remove_file(&old_path);
-        }
-    }
     if final_path.exists() {
         fs::remove_file(&final_path)
             .with_context(|| format!("Не удалось удалить старый файл {}", final_path.display()))?;
@@ -249,6 +259,9 @@ pub fn list_sessions() -> Result<Vec<SessionSummary>> {
         }
         if let Ok(content) = fs::read_to_string(&path) {
             if let Ok(session) = serde_json::from_str::<Session>(&content) {
+                if session.deleted {
+                    continue;
+                }
                 sessions.push(SessionSummary {
                     session_id: session.session_id,
                     display_name: session.display_name,
@@ -271,8 +284,23 @@ pub fn list_sessions_for_agent(agent_name: &str) -> Result<Vec<SessionSummary>> 
         .collect())
 }
 
-pub fn delete_session(session_id: &str) -> Result<()> {
-    if let Some(json_path) = find_session_file(session_id) {
+pub fn list_chat_projects() -> Result<Vec<SessionSummary>> {
+    let all = list_sessions()?;
+    Ok(all
+        .into_iter()
+        .filter(|s| s.owner_agent.is_none())
+        .collect())
+}
+
+pub fn is_session_deleted_or_missing(session_id: &str, owner_agent: Option<&str>) -> bool {
+    match load_session(session_id, owner_agent) {
+        Ok(s) => s.deleted,
+        Err(_) => true,
+    }
+}
+
+pub fn delete_session(session_id: &str, owner_agent: Option<&str>) -> Result<()> {
+    if let Some(json_path) = find_session_file(session_id, owner_agent) {
         fs::remove_file(&json_path)?;
         let mut lock = json_path.clone();
         let mut new_name = OsString::from(json_path.file_name().unwrap_or_default());
@@ -344,8 +372,12 @@ pub fn restore_api_key(session: &mut Session, api_key: &str) {
     }
 }
 
-pub fn load_session_with_key(session_id: &str, api_key: &str) -> Result<Session> {
-    let mut session = load_session(session_id)?;
+pub fn load_session_with_key(
+    session_id: &str,
+    api_key: &str,
+    owner_agent: Option<&str>,
+) -> Result<Session> {
+    let mut session = load_session(session_id, owner_agent)?;
     restore_api_key(&mut session, api_key);
     Ok(session)
 }
@@ -360,4 +392,116 @@ pub fn remove_pending_task(session: &mut Session, task_id: &str) {
 
 pub fn find_pending_task<'a>(session: &'a Session, task_id: &str) -> Option<&'a PendingTask> {
     session.pending_tasks.iter().find(|t| t.task_id == task_id)
+}
+
+// ==================== Работа с проектами ====================
+
+/// Помечает все файлы проекта (chat + все агентские сессии) как удалённые.
+pub fn mark_project_deleted(session_id: &str) -> Result<Vec<String>> {
+    let mut marked = Vec::new();
+    let dir = sessions_dir();
+    if !dir.exists() {
+        return Ok(marked);
+    }
+
+    let chat_json = format!("chat_{}.json", session_id);
+    let agent_json_suffix = format!("_{}.json", session_id);
+
+    for entry in fs::read_dir(&dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string();
+        let is_target =
+            name == chat_json || (name.starts_with("agent_") && name.ends_with(&agent_json_suffix));
+        if !is_target {
+            continue;
+        }
+        let content = match fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let mut session: Session = match serde_json::from_str(&content) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("Не удалось распарсить {}: {}", path.display(), e);
+                continue;
+            }
+        };
+        if session.deleted {
+            continue;
+        }
+        session.deleted = true;
+        session.updated_at = now_ts();
+        if let Err(e) = save_session(&session) {
+            eprintln!("Не удалось пометить {}: {}", path.display(), e);
+            continue;
+        }
+        marked.push(session.session_id);
+    }
+
+    Ok(marked)
+}
+
+/// Физически удаляет все файлы проекта.
+pub fn purge_project(session_id: &str) -> Result<Vec<PathBuf>> {
+    let mut deleted = Vec::new();
+
+    let dir = sessions_dir();
+    let chat_json = format!("chat_{}.json", session_id);
+    let chat_lock = format!("chat_{}.json.lock", session_id);
+    let agent_json_suffix = format!("_{}.json", session_id);
+    let agent_lock_suffix = format!("_{}.json.lock", session_id);
+
+    if dir.exists() {
+        for entry in fs::read_dir(&dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_string();
+            let is_target = name == chat_json
+                || name == chat_lock
+                || (name.starts_with("agent_") && name.ends_with(&agent_json_suffix))
+                || (name.starts_with("agent_") && name.ends_with(&agent_lock_suffix));
+            if is_target {
+                if let Err(e) = fs::remove_file(&path) {
+                    eprintln!("Не удалось удалить {}: {}", path.display(), e);
+                } else {
+                    deleted.push(path);
+                }
+            }
+        }
+    }
+
+    let logs = logs_dir();
+    let chat_log = format!("chat_{}.txt", session_id);
+    let agent_log_suffix = format!("_{}.txt", session_id);
+    if logs.exists() {
+        for entry in fs::read_dir(&logs)? {
+            let entry = entry?;
+            let path = entry.path();
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_string();
+            let is_target = name == chat_log
+                || (name.starts_with("agent_") && name.ends_with(&agent_log_suffix));
+            if is_target {
+                if let Err(e) = fs::remove_file(&path) {
+                    eprintln!("Не удалось удалить {}: {}", path.display(), e);
+                } else {
+                    deleted.push(path);
+                }
+            }
+        }
+    }
+
+    Ok(deleted)
 }

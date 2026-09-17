@@ -24,11 +24,17 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let config = TomlConfig::load(&args.config)?;
 
-    let agent_config = config
+    let mut agent_config = config
         .agents
         .iter()
         .find(|a| a.name == args.agent_name)
+        .cloned()
         .ok_or_else(|| anyhow::anyhow!("Агент '{}' не найден в конфиге", args.agent_name))?;
+
+    // Если у агента не задан max_cost_rub — берём глобальный.
+    if agent_config.max_cost_rub.is_none() {
+        agent_config.max_cost_rub = config.max_cost_rub;
+    }
 
     let storage_config = config
         .local_storage_http_server
@@ -62,5 +68,5 @@ async fn main() -> anyhow::Result<()> {
         outgoing_tasks,
     )?;
 
-    agent_http_api::run_server(agent_config.clone(), context).await
+    agent_http_api::run_server(agent_config, context).await
 }

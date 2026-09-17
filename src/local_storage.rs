@@ -651,15 +651,16 @@ impl LocalStorage {
             if name == ".about" || name == ".summary" {
                 continue;
             }
+            let rel_path = self.relativize(&entry.path());
             if entry.file_type()?.is_dir() {
                 entries.push(Entry::Dir {
                     name,
-                    path: entry.path(),
+                    path: rel_path,
                 });
             } else {
                 entries.push(Entry::File {
                     name,
-                    path: entry.path(),
+                    path: rel_path,
                     size: entry.metadata()?.len(),
                 });
             }

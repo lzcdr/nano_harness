@@ -13,6 +13,20 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::runtime::Handle;
 
+/// Контекст для регистрации board-функций в Rhai.
+/// Заполняется при каждом `run_code` — свой для каждого хода LLM.
+pub struct BoardContext {
+    pub board_url: String,
+    pub board_token: String,
+    pub self_agent_name: String,
+    pub self_session_id: Option<String>,
+    pub parent_chain: Vec<String>,
+    pub pending_calls: PendingCalls,
+    pub agent_call_timeout_sec: u64,
+    pub posted_flag: Arc<AtomicBool>,
+    pub outgoing_tasks: OutgoingTasks,
+}
+
 pub fn available_tools() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
@@ -26,8 +40,9 @@ pub fn available_tools() -> Vec<ToolDefinition> {
                               storage_walk, storage_search_by_name, storage_search_similar, \
                               storage_read_about, storage_write_about, storage_read_summary, \
                               storage_write_summary, а также функции работы с доской: \
-                              call_agent(to_agent, to_session_id, prompt) — синхронно, \
-                              post_task(to_agent, to_session_id, prompt) — асинхронно."
+                              call_agent(to_agent, prompt) — синхронный вызов, \
+                              post_task(to_agent, prompt) — асинхронный. \
+                              session_id передаётся автоматически из текущей сессии."
                     .to_string(),
                 parameters: json!({
                     "type": "object",
@@ -72,7 +87,7 @@ pub fn register_basic_functions(engine: &mut Engine) {
     });
 }
 
-/// Регистрирует функции для работы с доской сообщений.
+/// Регистрирует функции работы с доской: post_task и call_agent.
 #[allow(clippy::too_many_arguments)]
 pub fn register_board_functions(
     engine: &mut Engine,
@@ -80,12 +95,13 @@ pub fn register_board_functions(
     board_token: String,
     self_agent_name: String,
     self_session_id: Option<String>,
+    parent_chain: Vec<String>,
     pending_calls: PendingCalls,
     agent_call_timeout_sec: u64,
     posted_flag: Arc<AtomicBool>,
     outgoing_tasks: OutgoingTasks,
 ) {
-    // post_task
+    // post_task — асинхронный
     {
         let url = board_url.clone();
         let token = board_token.clone();
@@ -93,25 +109,44 @@ pub fn register_board_functions(
         let sess = self_session_id.clone();
         let flag = posted_flag.clone();
         let outgoing = outgoing_tasks.clone();
+        let chain = parent_chain.clone();
         engine.register_fn(
             "post_task",
-            move |to_agent: String, to_session_id: String, prompt: String| -> String {
+            move |to_agent: String, prompt: String| -> String {
+                if to_agent == agent {
+                    return format!("Ошибка: агент '{}' не может вызывать сам себя", to_agent);
+                }
+                if chain.contains(&to_agent) {
+                    return format!(
+                        "Ошибка: циклический вызов. Агент '{}' уже в цепочке: {:?}",
+                        to_agent, chain
+                    );
+                }
+                let mut new_chain = chain.clone();
+                new_chain.push(to_agent.clone());
+
+                let to_session = match sess.as_deref() {
+                    Some(s) if !s.is_empty() => s.to_string(),
+                    _ => return "Ошибка: агент не привязан к сессии".to_string(),
+                };
                 let result = post_task_request(
                     &url,
                     &token,
                     &agent,
                     sess.as_deref(),
                     &to_agent,
-                    &to_session_id,
+                    &to_session,
                     &prompt,
+                    &new_chain,
                 );
                 if let Some(task_id) = result.strip_prefix("posted:") {
                     let handle = Handle::current();
                     let tid = task_id.to_string();
                     let to_a = to_agent.clone();
-                    let to_s = to_session_id.clone();
+                    let to_s = to_session.clone();
                     let from_s = sess.clone().unwrap_or_default();
                     let outgoing = outgoing.clone();
+                    let chain_for_outgoing = new_chain.clone();
                     handle.block_on(async move {
                         let mut map = outgoing.lock().await;
                         map.insert(
@@ -121,6 +156,7 @@ pub fn register_board_functions(
                                 session_id: from_s,
                                 to_agent_name: to_a,
                                 to_session_id: to_s,
+                                chain: chain_for_outgoing,
                             },
                         );
                     });
@@ -131,7 +167,7 @@ pub fn register_board_functions(
         );
     }
 
-    // call_agent — синхронный, с таймаутом
+    // call_agent — синхронный
     {
         let url = board_url.clone();
         let token = board_token.clone();
@@ -139,17 +175,35 @@ pub fn register_board_functions(
         let sess = self_session_id.clone();
         let pc = pending_calls.clone();
         let timeout_sec = agent_call_timeout_sec;
+        let chain = parent_chain.clone();
         engine.register_fn(
             "call_agent",
-            move |to_agent: String, to_session_id: String, prompt: String| -> String {
+            move |to_agent: String, prompt: String| -> String {
+                if to_agent == agent {
+                    return format!("Ошибка: агент '{}' не может вызывать сам себя", to_agent);
+                }
+                if chain.contains(&to_agent) {
+                    return format!(
+                        "Ошибка: циклический вызов. Агент '{}' уже в цепочке: {:?}",
+                        to_agent, chain
+                    );
+                }
+                let mut new_chain = chain.clone();
+                new_chain.push(to_agent.clone());
+
+                let to_session = match sess.as_deref() {
+                    Some(s) if !s.is_empty() => s.to_string(),
+                    _ => return "Ошибка: агент не привязан к сессии".to_string(),
+                };
                 let result = post_task_request(
                     &url,
                     &token,
                     &agent,
                     sess.as_deref(),
                     &to_agent,
-                    &to_session_id,
+                    &to_session,
                     &prompt,
+                    &new_chain,
                 );
                 let task_id = match result.strip_prefix("posted:") {
                     Some(id) => id.to_string(),
@@ -212,6 +266,7 @@ pub fn register_board_functions(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn post_task_request(
     url: &str,
     token: &str,
@@ -220,6 +275,7 @@ fn post_task_request(
     to_agent: &str,
     to_session: &str,
     prompt: &str,
+    chain: &[String],
 ) -> String {
     let client = reqwest::blocking::Client::new();
     let body = serde_json::json!({
@@ -228,7 +284,8 @@ fn post_task_request(
         "to_agent": to_agent,
         "to_session_id": to_session,
         "payload": { "prompt": prompt },
-        "parent_task_id": null
+        "parent_task_id": null,
+        "chain": chain
     });
     match client
         .post(format!("{}/tasks", url.trim_end_matches('/')))
@@ -376,6 +433,7 @@ pub async fn execute_tool(
     storage_base_url: &str,
     storage_auth_token: &str,
     rhai_timeout_sec: u64,
+    board_ctx: Option<BoardContext>,
 ) -> String {
     match name {
         "run_code" => {
@@ -393,7 +451,9 @@ pub async fn execute_tool(
 
             match tokio::time::timeout(
                 timeout_duration,
-                tokio::task::spawn_blocking(move || run_rhai_code(&code, &base_url, &token)),
+                tokio::task::spawn_blocking(move || {
+                    run_rhai_code(&code, &base_url, &token, board_ctx)
+                }),
             )
             .await
             {
@@ -413,7 +473,12 @@ pub async fn execute_tool(
     }
 }
 
-fn run_rhai_code(code: &str, storage_base_url: &str, storage_auth_token: &str) -> String {
+fn run_rhai_code(
+    code: &str,
+    storage_base_url: &str,
+    storage_auth_token: &str,
+    board_ctx: Option<BoardContext>,
+) -> String {
     let mut engine = Engine::new();
     engine.set_max_operations(10_000);
     engine.set_max_call_levels(32);
@@ -425,6 +490,21 @@ fn run_rhai_code(code: &str, storage_base_url: &str, storage_auth_token: &str) -
 
     register_basic_functions(&mut engine);
     register_storage_functions(&mut engine, storage_base_url, storage_auth_token);
+
+    if let Some(bc) = board_ctx {
+        register_board_functions(
+            &mut engine,
+            bc.board_url,
+            bc.board_token,
+            bc.self_agent_name,
+            bc.self_session_id,
+            bc.parent_chain,
+            bc.pending_calls,
+            bc.agent_call_timeout_sec,
+            bc.posted_flag,
+            bc.outgoing_tasks,
+        );
+    }
 
     match engine.eval::<Dynamic>(code) {
         Ok(result) => {

@@ -12,8 +12,10 @@ use tokio_stream::StreamExt;
 
 use axum::{
     extract::{Path, Query, State},
+    http::{HeaderMap, StatusCode},
+    middleware::{self, Next},
     response::sse::{Event as SseEvent, KeepAlive, Sse},
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
@@ -25,7 +27,6 @@ pub struct MessageBoardConfig {
     pub bind_addr: String,
     pub auth_token: String,
     pub tasks_dir: String,
-    /// Через сколько секунд без обновления задача InProgress помечается Failed.
     #[serde(default = "default_task_timeout_sec")]
     pub task_timeout_sec: u64,
 }
@@ -55,6 +56,9 @@ pub struct Task {
     pub payload: Value,
     pub status: TaskStatus,
     pub parent_task_id: Option<String>,
+    /// Цепочка агентов, участвовавших в вызове (от корня до текущего).
+    #[serde(default)]
+    pub chain: Vec<String>,
     pub result: Option<String>,
     pub error: Option<String>,
     pub created_at: u64,
@@ -85,13 +89,11 @@ pub enum BoardEvent {
 #[derive(Debug, Deserialize)]
 pub struct RegisterSessionRequest {
     pub agent_name: String,
-    pub session_id: String,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct UnregisterSessionRequest {
     pub agent_name: String,
-    pub session_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -102,6 +104,8 @@ pub struct CreateTaskRequest {
     pub to_session_id: String,
     pub payload: Value,
     pub parent_task_id: Option<String>,
+    #[serde(default)]
+    pub chain: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -124,12 +128,10 @@ pub struct FailTaskRequest {
 enum BoardCommand {
     RegisterSession {
         agent_name: String,
-        session_id: String,
         sender: mpsc::UnboundedSender<BoardEvent>,
     },
     UnregisterSession {
         agent_name: String,
-        session_id: String,
     },
     CreateTask {
         request: CreateTaskRequest,
@@ -149,7 +151,10 @@ enum BoardCommand {
         task_id: String,
         response_tx: oneshot::Sender<Option<Task>>,
     },
-    ListTasks {
+    ListTasksFiltered {
+        session_id: Option<String>,
+        from_agent: Option<String>,
+        statuses: Option<Vec<TaskStatus>>,
         response_tx: oneshot::Sender<Vec<Task>>,
     },
 }
@@ -170,12 +175,8 @@ impl MessageBoard {
         let tasks_dir_actor = tasks_dir.clone();
 
         let mut tasks: HashMap<String, Task> = HashMap::new();
-        let mut connections: HashMap<(String, String), mpsc::UnboundedSender<BoardEvent>> =
-            HashMap::new();
+        let mut connections: HashMap<String, mpsc::UnboundedSender<BoardEvent>> = HashMap::new();
 
-        // Загрузка задач с диска.
-        // - Pending: не поддерживается новой моделью — удаляем файл.
-        // - InProgress: исполнитель был потерян при рестарте — помечаем Failed.
         let mut entries = tokio::fs::read_dir(&tasks_dir).await?;
         while let Some(entry) = entries.next_entry().await? {
             let path = entry.path();
@@ -203,27 +204,31 @@ impl MessageBoard {
                         eprintln!("Ошибка сохранения задачи {}: {}", task.id, e);
                     }
                 }
-                _ => {}
+                TaskStatus::Completed | TaskStatus::Failed => {
+                    let age = now_ts().saturating_sub(task.updated_at);
+                    if age > task_timeout_sec {
+                        let _ = tokio::fs::remove_file(&path).await;
+                        continue;
+                    }
+                }
             }
             tasks.insert(task.id.clone(), task);
         }
 
-        // Актор
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(30));
-            interval.tick().await; // пропустить немедленный первый тик
+            interval.tick().await;
 
             loop {
                 tokio::select! {
                     maybe_cmd = command_rx.recv() => {
                         let Some(cmd) = maybe_cmd else { break };
                         match cmd {
-                            BoardCommand::RegisterSession { agent_name, session_id, sender } => {
-                                let key = (agent_name, session_id);
-                                connections.insert(key, sender);
+                            BoardCommand::RegisterSession { agent_name, sender } => {
+                                connections.insert(agent_name, sender);
                             }
-                            BoardCommand::UnregisterSession { agent_name, session_id } => {
-                                connections.remove(&(agent_name, session_id));
+                            BoardCommand::UnregisterSession { agent_name } => {
+                                connections.remove(&agent_name);
                             }
                             BoardCommand::CreateTask { request, response_tx } => {
                                 match request.payload.get("prompt").and_then(|v| v.as_str()) {
@@ -236,14 +241,10 @@ impl MessageBoard {
                                     }
                                 }
 
-                                let key = (request.to_agent.clone(), request.to_session_id.clone());
-
-                                // Отклоняем, если получатель не подключён.
-                                let Some(conn) = connections.get(&key).cloned() else {
+                                let Some(conn) = connections.get(&request.to_agent).cloned() else {
                                     let _ = response_tx.send(Err(anyhow::anyhow!(
-                                        "Session (agent='{}', session_id='{}') is not connected",
-                                        request.to_agent,
-                                        request.to_session_id
+                                        "Agent '{}' is not connected",
+                                        request.to_agent
                                     )));
                                     continue;
                                 };
@@ -259,6 +260,7 @@ impl MessageBoard {
                                     payload: request.payload.clone(),
                                     status: TaskStatus::InProgress,
                                     parent_task_id: request.parent_task_id.clone(),
+                                    chain: request.chain.clone(),
                                     result: None,
                                     error: None,
                                     created_at: now,
@@ -293,7 +295,7 @@ impl MessageBoard {
                                     if let Err(e) = save_task(&tasks_dir_actor, task).await {
                                         eprintln!("Ошибка сохранения задачи {}: {}", task.id, e);
                                     }
-                                    let key = (task.from_agent.clone(), task.from_session_id.clone());
+                                    let key = task.from_agent.clone();
                                     if let Some(conn) = connections.get(&key) {
                                         if let Err(e) = conn.send(BoardEvent::TaskCompleted {
                                             task_id: task_id.clone(),
@@ -318,7 +320,7 @@ impl MessageBoard {
                                     if let Err(e) = save_task(&tasks_dir_actor, task).await {
                                         eprintln!("Ошибка сохранения задачи {}: {}", task.id, e);
                                     }
-                                    let key = (task.from_agent.clone(), task.from_session_id.clone());
+                                    let key = task.from_agent.clone();
                                     if let Some(conn) = connections.get(&key) {
                                         if let Err(e) = conn.send(BoardEvent::TaskFailed {
                                             task_id: task_id.clone(),
@@ -340,15 +342,40 @@ impl MessageBoard {
                                     eprintln!("Ошибка отправки ответа get_task для {}: {:?}", task_id, e);
                                 }
                             }
-                            BoardCommand::ListTasks { response_tx } => {
-                                if let Err(e) = response_tx.send(tasks.values().cloned().collect()) {
-                                    eprintln!("Ошибка отправки ответа list_tasks: {:?}", e);
+                            BoardCommand::ListTasksFiltered {
+                                session_id,
+                                from_agent,
+                                statuses,
+                                response_tx,
+                            } => {
+                                let filtered: Vec<Task> = tasks
+                                    .values()
+                                    .filter(|t| {
+                                        let session_match = match &session_id {
+                                            Some(sid) => {
+                                                t.from_session_id == *sid || t.to_session_id == *sid
+                                            }
+                                            None => true,
+                                        };
+                                        let agent_match = match &from_agent {
+                                            Some(a) => t.from_agent == *a,
+                                            None => true,
+                                        };
+                                        let status_match = match &statuses {
+                                            Some(sts) => sts.contains(&t.status),
+                                            None => true,
+                                        };
+                                        session_match && agent_match && status_match
+                                    })
+                                    .cloned()
+                                    .collect();
+                                if let Err(e) = response_tx.send(filtered) {
+                                    eprintln!("Ошибка отправки ответа list_tasks_filtered: {:?}", e);
                                 }
                             }
                         }
                     }
-                    _ = interval.tick() => {
-                        // Watchdog: помечаем зависшие InProgress как Failed.
+                                        _ = interval.tick() => {
                         let now = now_ts();
                         let mut to_fail: Vec<String> = Vec::new();
                         for (id, task) in tasks.iter() {
@@ -368,7 +395,7 @@ impl MessageBoard {
                                 if let Err(e) = save_task(&tasks_dir_actor, task).await {
                                     eprintln!("Ошибка сохранения задачи {}: {}", task.id, e);
                                 }
-                                let key = (task.from_agent.clone(), task.from_session_id.clone());
+                                let key = task.from_agent.clone();
                                 if let Some(conn) = connections.get(&key) {
                                     if let Err(e) = conn.send(BoardEvent::TaskFailed {
                                         task_id: id.clone(),
@@ -382,6 +409,32 @@ impl MessageBoard {
                                 eprintln!("⏱️ Задача {} помечена Failed (таймаут)", id);
                             }
                         }
+
+                        // Очистка терминальных задач старше task_timeout_sec.
+                        let mut to_evict: Vec<String> = Vec::new();
+                        for (id, task) in tasks.iter() {
+                            let terminal = matches!(
+                                task.status,
+                                TaskStatus::Completed | TaskStatus::Failed
+                            );
+                            if terminal
+                                && now.saturating_sub(task.updated_at) > task_timeout_sec
+                            {
+                                to_evict.push(id.clone());
+                            }
+                        }
+                        for id in &to_evict {
+                            tasks.remove(id);
+                            let file = tasks_dir_actor.join(format!("{}.json", id));
+                            if let Err(e) = tokio::fs::remove_file(&file).await {
+                                if e.kind() != std::io::ErrorKind::NotFound {
+                                    eprintln!("Очистка файла задачи {}: {}", id, e);
+                                }
+                            }
+                        }
+                        if !to_evict.is_empty() {
+                            eprintln!("🧹 Очищено {} завершённых задач", to_evict.len());
+                        }
                     }
                 }
             }
@@ -393,28 +446,24 @@ impl MessageBoard {
         })
     }
 
-    // ----- Клиентские методы -----
-
     pub async fn register_session(
         &self,
         agent_name: String,
-        session_id: String,
         sender: mpsc::UnboundedSender<BoardEvent>,
     ) {
-        if let Err(e) = self.command_tx.send(BoardCommand::RegisterSession {
-            agent_name,
-            session_id,
-            sender,
-        }) {
+        if let Err(e) = self
+            .command_tx
+            .send(BoardCommand::RegisterSession { agent_name, sender })
+        {
             eprintln!("Ошибка отправки команды RegisterSession: {}", e);
         }
     }
 
-    pub async fn unregister_session(&self, agent_name: String, session_id: String) {
-        if let Err(e) = self.command_tx.send(BoardCommand::UnregisterSession {
-            agent_name,
-            session_id,
-        }) {
+    pub async fn unregister_session(&self, agent_name: String) {
+        if let Err(e) = self
+            .command_tx
+            .send(BoardCommand::UnregisterSession { agent_name })
+        {
             eprintln!("Ошибка отправки команды UnregisterSession: {}", e);
         }
     }
@@ -496,19 +545,26 @@ impl MessageBoard {
         }
     }
 
-    pub async fn list_tasks(&self) -> Vec<Task> {
+    pub async fn list_tasks_filtered(
+        &self,
+        session_id: Option<String>,
+        from_agent: Option<String>,
+        statuses: Option<Vec<TaskStatus>>,
+    ) -> Vec<Task> {
         let (tx, rx) = oneshot::channel();
-        if let Err(e) = self
-            .command_tx
-            .send(BoardCommand::ListTasks { response_tx: tx })
-        {
-            eprintln!("Ошибка отправки команды ListTasks: {}", e);
+        if let Err(e) = self.command_tx.send(BoardCommand::ListTasksFiltered {
+            session_id,
+            from_agent,
+            statuses,
+            response_tx: tx,
+        }) {
+            eprintln!("Ошибка отправки команды ListTasksFiltered: {}", e);
             return vec![];
         }
         match rx.await {
             Ok(tasks) => tasks,
             Err(e) => {
-                eprintln!("Ошибка получения ответа ListTasks: {}", e);
+                eprintln!("Ошибка получения ответа ListTasksFiltered: {}", e);
                 vec![]
             }
         }
@@ -544,13 +600,37 @@ struct AppState {
 #[derive(Deserialize)]
 struct EventsQuery {
     agent_name: String,
-    session_id: String,
 }
 
 #[derive(Deserialize)]
 struct UnregisterQuery {
     agent_name: String,
-    session_id: String,
+}
+
+#[derive(Deserialize)]
+struct ListTasksQuery {
+    session_id: Option<String>,
+    from_agent: Option<String>,
+    status: Option<String>,
+}
+
+async fn auth_middleware(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    request: axum::extract::Request,
+    next: Next,
+) -> Response {
+    let token = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(|s| s.to_string());
+
+    if token.as_deref() == Some(state.auth_token.as_str()) {
+        next.run(request).await
+    } else {
+        (StatusCode::UNAUTHORIZED, "Unauthorized").into_response()
+    }
 }
 
 pub fn build_router(board: std::sync::Arc<MessageBoard>, auth_token: String) -> Router {
@@ -558,11 +638,15 @@ pub fn build_router(board: std::sync::Arc<MessageBoard>, auth_token: String) -> 
     Router::new()
         .route("/register_session", post(register_session))
         .route("/unregister_session", post(unregister_session))
-        .route("/tasks", post(create_task))
+        .route("/tasks", post(create_task).get(list_tasks))
         .route("/tasks/{id}", get(get_task))
         .route("/tasks/{id}/complete", post(complete_task))
         .route("/tasks/{id}/fail", post(fail_task))
         .route("/events", get(sse_handler))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ))
         .with_state(state)
 }
 
@@ -578,14 +662,8 @@ async fn unregister_session(
     State(state): State<AppState>,
     Query(query): Query<UnregisterQuery>,
 ) -> impl IntoResponse {
-    eprintln!(
-        "Запрос на /unregister_session: agent={}, session={}",
-        query.agent_name, query.session_id
-    );
-    state
-        .board
-        .unregister_session(query.agent_name, query.session_id)
-        .await;
+    eprintln!("Запрос на /unregister_session: agent={}", query.agent_name);
+    state.board.unregister_session(query.agent_name).await;
     (axum::http::StatusCode::OK, "Unregistered")
 }
 
@@ -607,6 +685,28 @@ async fn create_task(
                 .into_response()
         }
     }
+}
+
+async fn list_tasks(
+    State(state): State<AppState>,
+    Query(query): Query<ListTasksQuery>,
+) -> axum::response::Response {
+    let statuses = query.status.as_ref().map(|s| {
+        s.split(',')
+            .filter_map(|p| match p.trim() {
+                "pending" => Some(TaskStatus::Pending),
+                "in_progress" => Some(TaskStatus::InProgress),
+                "completed" => Some(TaskStatus::Completed),
+                "failed" => Some(TaskStatus::Failed),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    });
+    let tasks = state
+        .board
+        .list_tasks_filtered(query.session_id, query.from_agent, statuses)
+        .await;
+    (axum::http::StatusCode::OK, Json(tasks)).into_response()
 }
 
 async fn get_task(
@@ -668,12 +768,9 @@ async fn sse_handler(
     let (tx, rx) = mpsc::unbounded_channel::<BoardEvent>();
     state
         .board
-        .register_session(query.agent_name.clone(), query.session_id.clone(), tx)
+        .register_session(query.agent_name.clone(), tx)
         .await;
-    eprintln!(
-        "Новое SSE-подключение: agent={}, session={}",
-        query.agent_name, query.session_id
-    );
+    eprintln!("Новое SSE-подключение: agent={}", query.agent_name);
 
     let stream = UnboundedReceiverStream::new(rx).map(|event| {
         let data = serde_json::to_string(&event).unwrap_or_default();
@@ -691,7 +788,7 @@ mod tests {
     use tokio::sync::mpsc;
 
     #[tokio::test]
-    async fn test_create_task_rejected_for_offline_session() {
+    async fn test_create_task_rejected_for_offline_agent() {
         let dir = tempfile::tempdir().unwrap();
         let board = MessageBoard::new(dir.path().to_path_buf(), 300)
             .await
@@ -704,9 +801,9 @@ mod tests {
             to_session_id: "s2".into(),
             payload: serde_json::json!({"prompt": "hi"}),
             parent_task_id: None,
+            chain: vec!["b".into()],
         };
-        let res = board.create_task(req).await;
-        assert!(res.is_err());
+        assert!(board.create_task(req).await.is_err());
     }
 
     #[tokio::test]
@@ -717,9 +814,7 @@ mod tests {
             .unwrap();
 
         let (tx, mut rx) = mpsc::unbounded_channel::<BoardEvent>();
-        board
-            .register_session("b".to_string(), "s2".to_string(), tx)
-            .await;
+        board.register_session("b".to_string(), tx).await;
 
         let req = CreateTaskRequest {
             from_agent: "a".into(),
@@ -728,12 +823,132 @@ mod tests {
             to_session_id: "s2".into(),
             payload: serde_json::json!({"prompt": "hi"}),
             parent_task_id: None,
+            chain: vec!["b".into()],
         };
         let resp = board.create_task(req).await.unwrap();
         let event = rx.recv().await.unwrap();
         match event {
-            BoardEvent::TaskCreated { task } => assert_eq!(task.id, resp.task_id),
+            BoardEvent::TaskCreated { task } => {
+                assert_eq!(task.id, resp.task_id);
+                assert_eq!(task.chain, vec!["b".to_string()]);
+            }
             _ => panic!(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_create_task_rejected_for_missing_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = MessageBoard::new(dir.path().to_path_buf(), 300)
+            .await
+            .unwrap();
+
+        let (tx, _rx) = mpsc::unbounded_channel::<BoardEvent>();
+        board.register_session("b".to_string(), tx).await;
+
+        let req = CreateTaskRequest {
+            from_agent: "a".into(),
+            from_session_id: "s".into(),
+            to_agent: "b".into(),
+            to_session_id: "s2".into(),
+            payload: serde_json::json!({}),
+            parent_task_id: None,
+            chain: vec![],
+        };
+        assert!(board.create_task(req).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_complete_task_sends_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = MessageBoard::new(dir.path().to_path_buf(), 300)
+            .await
+            .unwrap();
+
+        let (tx_sender, mut rx_sender) = mpsc::unbounded_channel::<BoardEvent>();
+        board.register_session("a".to_string(), tx_sender).await;
+        let (tx_receiver, mut rx_receiver) = mpsc::unbounded_channel::<BoardEvent>();
+        board.register_session("b".to_string(), tx_receiver).await;
+
+        let resp = board
+            .create_task(CreateTaskRequest {
+                from_agent: "a".into(),
+                from_session_id: "s".into(),
+                to_agent: "b".into(),
+                to_session_id: "s2".into(),
+                payload: serde_json::json!({"prompt": "hi"}),
+                parent_task_id: None,
+                chain: vec!["b".into()],
+            })
+            .await
+            .unwrap();
+
+        let _ = rx_receiver.recv().await.unwrap();
+        board
+            .complete_task(resp.task_id.clone(), "ok".into())
+            .await
+            .unwrap();
+
+        let event = rx_sender.recv().await.unwrap();
+        match event {
+            BoardEvent::TaskCompleted {
+                task_id,
+                result,
+                from_agent,
+                ..
+            } => {
+                assert_eq!(task_id, resp.task_id);
+                assert_eq!(result, "ok");
+                assert_eq!(from_agent, "b");
+            }
+            _ => panic!("expected TaskCompleted"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_fail_task_sends_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = MessageBoard::new(dir.path().to_path_buf(), 300)
+            .await
+            .unwrap();
+
+        let (tx_sender, mut rx_sender) = mpsc::unbounded_channel::<BoardEvent>();
+        board.register_session("a".to_string(), tx_sender).await;
+        let (tx_receiver, mut rx_receiver) = mpsc::unbounded_channel::<BoardEvent>();
+        board.register_session("b".to_string(), tx_receiver).await;
+
+        let resp = board
+            .create_task(CreateTaskRequest {
+                from_agent: "a".into(),
+                from_session_id: "s".into(),
+                to_agent: "b".into(),
+                to_session_id: "s2".into(),
+                payload: serde_json::json!({"prompt": "hi"}),
+                parent_task_id: None,
+                chain: vec!["b".into()],
+            })
+            .await
+            .unwrap();
+
+        let _ = rx_receiver.recv().await.unwrap();
+        board
+            .fail_task(resp.task_id.clone(), "err".into())
+            .await
+            .unwrap();
+
+        let event = rx_sender.recv().await.unwrap();
+        match event {
+            BoardEvent::TaskFailed {
+                task_id,
+                error,
+                from_agent,
+                ..
+            } => {
+                assert_eq!(task_id, resp.task_id);
+                assert_eq!(error, "err");
+                assert_eq!(from_agent, "b");
+            }
+            _ => panic!("expected TaskFailed"),
         }
     }
 
@@ -745,9 +960,7 @@ mod tests {
             .unwrap();
 
         let (tx, _rx) = mpsc::unbounded_channel::<BoardEvent>();
-        board
-            .register_session("b".to_string(), "s2".to_string(), tx)
-            .await;
+        board.register_session("b".to_string(), tx).await;
 
         let resp = board
             .create_task(CreateTaskRequest {
@@ -757,6 +970,7 @@ mod tests {
                 to_session_id: "s2".into(),
                 payload: serde_json::json!({"prompt": "hi"}),
                 parent_task_id: None,
+                chain: vec!["b".into()],
             })
             .await
             .unwrap();
@@ -764,38 +978,5 @@ mod tests {
         let task = board.get_task(resp.task_id.clone()).await.unwrap();
         assert_eq!(task.id, resp.task_id);
         assert_eq!(task.status, TaskStatus::InProgress);
-    }
-
-    #[tokio::test]
-    async fn test_create_task_rejected_for_missing_prompt() {
-        let dir = tempfile::tempdir().unwrap();
-        let board = MessageBoard::new(dir.path().to_path_buf(), 300)
-            .await
-            .unwrap();
-
-        let (tx, _rx) = mpsc::unbounded_channel::<BoardEvent>();
-        board
-            .register_session("b".to_string(), "s2".to_string(), tx)
-            .await;
-
-        let req = CreateTaskRequest {
-            from_agent: "a".into(),
-            from_session_id: "s".into(),
-            to_agent: "b".into(),
-            to_session_id: "s2".into(),
-            payload: serde_json::json!({}),
-            parent_task_id: None,
-        };
-        assert!(board.create_task(req).await.is_err());
-
-        let req = CreateTaskRequest {
-            from_agent: "a".into(),
-            from_session_id: "s".into(),
-            to_agent: "b".into(),
-            to_session_id: "s2".into(),
-            payload: serde_json::json!({"prompt": "   "}),
-            parent_task_id: None,
-        };
-        assert!(board.create_task(req).await.is_err());
     }
 }
