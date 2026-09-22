@@ -1,0 +1,58 @@
+# ============================================================================
+# Тема control_center. Всё визуальное — здесь.
+# ============================================================================
+
+[window]
+title = "NANO_HARNESS // CONTROL CONSOLE"
+subtitle = "SIGNAL ROUTING HUB // V0.1"
+
+[font]
+ui = "Inter, 'Segoe UI', system-ui, sans-serif"
+mono = "'JetBrains Mono', 'Cascadia Mono', Consolas, monospace"
+size_label = "10px"
+size_value = "13px"
+size_title = "14px"
+size_big = "18px"
+
+[colors]
+bg_base     = "#05080d"
+bg_panel    = "#0b1018"
+bg_row_alt  = "#0f1824"
+edge        = "#1a2332"
+edge_accent = "#ff8a50"    # уголковые скобки
+
+text_main   = "#e6f1ff"
+text_dim    = "#6b7a8f"
+text_caps   = "#8fa3bd"
+
+accent      = "#00e5ff"    # cyan
+accent_dim  = "#1b6a7a"
+warning     = "#ff8a50"
+danger      = "#ff4757"
+success     = "#22c55e"
+
+[status.running]
+bg = "rgba(0,229,255,.12)"
+fg = "#00e5ff"
+
+[status.starting]
+bg = "rgba(255,138,80,.12)"
+fg = "#ff8a50"
+
+[status.stopped]
+bg = "rgba(107,122,143,.10)"
+fg = "#6b7a8f"
+
+[status.error]
+bg = "rgba(255,71,87,.12)"
+fg = "#ff4757"
+
+[panel]
+corner_size = "14px"
+corner_width = "1px"
+padding = "14px"
+
+[button]
+padding_x = "18px"
+padding_y = "8px"
+radius = "2px"

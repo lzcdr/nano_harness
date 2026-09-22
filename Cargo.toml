@@ -1,3 +1,6 @@
+[workspace]
+members = ["control_center"]
+
 [package]
 name = "nano_harness"
 version = "0.1.0"

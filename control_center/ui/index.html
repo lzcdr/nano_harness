@@ -1,0 +1,749 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NANO_HARNESS // CONTROL CONSOLE</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <style>
+    /* Значения по умолчанию. Перезаписываются из theme.toml через get_theme. */
+    :root {
+      --bg-base: #05080d;
+      --bg-panel: #0b1018;
+      --bg-row-alt: #0f1824;
+      --edge: #1a2332;
+      --edge-accent: #ff8a50;
+      --text-main: #e6f1ff;
+      --text-dim: #6b7a8f;
+      --text-caps: #8fa3bd;
+      --accent: #00e5ff;
+      --accent-dim: #1b6a7a;
+      --warning: #ff8a50;
+      --danger: #ff4757;
+      --success: #22c55e;
+      --font-ui: Inter, "Segoe UI", system-ui, sans-serif;
+      --font-mono: "JetBrains Mono", "Cascadia Mono", Consolas, monospace;
+      --size-label: 10px;
+      --size-value: 13px;
+      --size-title: 14px;
+      --size-big: 18px;
+      --corner-size: 14px;
+      --corner-width: 1px;
+      --panel-padding: 14px;
+      --button-padding-x: 18px;
+      --button-padding-y: 8px;
+      --button-radius: 2px;
+      --status-running-bg: rgba(0,229,255,.12);
+      --status-running-fg: #00e5ff;
+      --status-starting-bg: rgba(255,138,80,.12);
+      --status-starting-fg: #ff8a50;
+      --status-stopped-bg: rgba(107,122,143,.10);
+      --status-stopped-fg: #6b7a8f;
+      --status-error-bg: rgba(255,71,87,.12);
+      --status-error-fg: #ff4757;
+    }
+
+    * { box-sizing: border-box; }
+
+    html, body {
+      margin: 0;
+      padding: 0;
+      height: 100%;
+      background: var(--bg-base);
+      color: var(--text-main);
+      font-family: var(--font-ui);
+      font-size: var(--size-value);
+      overflow: hidden;
+      user-select: none;
+    }
+
+    #app {
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+    }
+
+    /* ---- Titlebar ---- */
+    .titlebar {
+      display: flex;
+      align-items: center;
+      padding: 10px 16px;
+      border-bottom: 1px solid var(--edge);
+    }
+    .titlebar .brand { display: flex; align-items: center; gap: 12px; }
+    .titlebar .dot {
+      width: 10px; height: 10px; border-radius: 50%;
+      background: var(--accent);
+      box-shadow: 0 0 12px var(--accent);
+    }
+    .titlebar .title {
+      font-family: var(--font-mono);
+      font-size: var(--size-title);
+      letter-spacing: 0.08em;
+      color: var(--text-main);
+    }
+    .titlebar .subtitle {
+      font-size: var(--size-label);
+      letter-spacing: 0.12em;
+      color: var(--text-dim);
+      text-transform: uppercase;
+      margin-left: 12px;
+    }
+    .titlebar-spacer {
+      flex: 1;
+      align-self: stretch;
+      min-width: 8px;
+    }
+    .titlebar .window-controls { display: flex; gap: 6px; }
+    .titlebar .window-controls button {
+      width: 32px; height: 24px;
+      background: transparent;
+      border: 1px solid var(--edge);
+      color: var(--text-dim);
+      cursor: pointer;
+      font-family: var(--font-mono);
+    }
+    .titlebar .window-controls button:hover {
+      color: var(--text-main);
+      border-color: var(--accent-dim);
+    }
+    .titlebar .window-controls button.close:hover {
+      color: var(--danger);
+      border-color: var(--danger);
+    }
+
+    /* ---- Actions ---- */
+    .actions {
+      display: flex;
+      gap: 8px;
+      justify-content: flex-end;
+      padding: 10px 16px;
+      border-bottom: 1px solid var(--edge);
+    }
+    .btn {
+      font-family: var(--font-ui);
+      font-size: 11px;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      padding: var(--button-padding-y) var(--button-padding-x);
+      border-radius: var(--button-radius);
+      cursor: pointer;
+      border: 1px solid var(--accent-dim);
+      background: transparent;
+      color: var(--accent);
+      transition: background 80ms, color 80ms, border-color 80ms, opacity 80ms;
+    }
+    .btn:hover { background: rgba(0,229,255,.08); border-color: var(--accent); }
+    .btn.primary { background: var(--accent); color: var(--bg-base); border-color: var(--accent); }
+    .btn.primary:hover { background: #33eaff; }
+    .btn.danger { border-color: rgba(255,71,87,.4); color: var(--danger); }
+    .btn.danger:hover { background: rgba(255,71,87,.08); border-color: var(--danger); }
+    .btn[disabled],
+    .btn[disabled]:hover {
+      opacity: 0.35;
+      cursor: not-allowed;
+      background: transparent;
+      border-color: var(--edge);
+      color: var(--text-dim);
+    }
+    .btn.primary[disabled],
+    .btn.primary[disabled]:hover {
+      background: transparent;
+      border-color: var(--edge);
+      color: var(--text-dim);
+    }
+    .btn.danger[disabled],
+    .btn.danger[disabled]:hover {
+      background: transparent;
+      border-color: var(--edge);
+      color: var(--text-dim);
+    }
+
+    /* ---- Layout ---- */
+    .main {
+      display: grid;
+      grid-template-columns: 200px 1fr;
+      gap: 14px;
+      padding: 14px 16px;
+      flex: 1;
+      min-height: 0;
+    }
+    .sidebar { display: flex; flex-direction: column; gap: 14px; }
+    .content { display: flex; flex-direction: column; gap: 14px; min-width: 0; min-height: 0; }
+
+    .panel {
+      position: relative;
+      background: var(--bg-panel);
+      border: 1px solid var(--edge);
+      padding: var(--panel-padding);
+    }
+    .panel > .corner {
+      position: absolute;
+      width: var(--corner-size);
+      height: var(--corner-size);
+      pointer-events: none;
+    }
+    .panel > .corner.tl { top: -1px; left: -1px; border-top: var(--corner-width) solid var(--edge-accent); border-left: var(--corner-width) solid var(--edge-accent); }
+    .panel > .corner.tr { top: -1px; right: -1px; border-top: var(--corner-width) solid var(--edge-accent); border-right: var(--corner-width) solid var(--edge-accent); }
+    .panel > .corner.bl { bottom: -1px; left: -1px; border-bottom: var(--corner-width) solid var(--edge-accent); border-left: var(--corner-width) solid var(--edge-accent); }
+    .panel > .corner.br { bottom: -1px; right: -1px; border-bottom: var(--corner-width) solid var(--edge-accent); border-right: var(--corner-width) solid var(--edge-accent); }
+
+    .panel-label {
+      font-size: var(--size-label);
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+      color: var(--text-dim);
+      margin-bottom: 10px;
+    }
+
+    /* ---- Overview ---- */
+    .overview-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 6px 8px;
+      font-family: var(--font-mono);
+      font-size: 12px;
+      cursor: pointer;
+      border-left: 2px solid transparent;
+      margin-left: -8px;
+      transition: background 80ms, border-color 80ms;
+    }
+    .overview-row:hover { background: var(--bg-row-alt); border-left-color: var(--accent-dim); }
+    .overview-row.active {
+      background: var(--bg-row-alt);
+      border-left-color: var(--accent);
+    }
+    .overview-row.active .count { color: var(--accent); }
+    .overview-row .label {
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      font-size: var(--size-label);
+      color: var(--text-caps);
+    }
+    .overview-row .count { color: var(--text-main); font-weight: 500; }
+
+    /* ---- Services table ---- */
+    .services-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-family: var(--font-mono);
+      font-size: 12px;
+    }
+    .services-table thead th {
+      text-align: left;
+      font-size: var(--size-label);
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+      color: var(--text-dim);
+      font-weight: 500;
+      padding: 8px 10px;
+      border-bottom: 1px solid var(--edge);
+    }
+    .services-table tbody tr {
+      cursor: pointer;
+      border-bottom: 1px solid rgba(26,35,50,.5);
+      transition: background 80ms;
+    }
+    .services-table tbody tr:hover { background: var(--bg-row-alt); }
+    .services-table tbody tr.selected {
+      background: var(--bg-row-alt);
+      box-shadow: inset 2px 0 0 var(--accent);
+    }
+    .services-table td { padding: 9px 10px; vertical-align: middle; }
+    .services-table td.num { color: var(--text-dim); width: 32px; }
+    .services-table td.name { color: var(--text-main); font-weight: 500; }
+    .services-table td.bind,
+    .services-table td.uptime,
+    .services-table td.title { color: var(--text-caps); }
+
+    /* ---- Status pill ---- */
+    .status {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 3px 9px;
+      border-radius: 2px;
+      font-size: 10px;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      font-weight: 500;
+      background: var(--status-stopped-bg);
+      color: var(--status-stopped-fg);
+    }
+    .status .dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+    .status.running  { background: var(--status-running-bg);  color: var(--status-running-fg); }
+    .status.starting { background: var(--status-starting-bg); color: var(--status-starting-fg); }
+    .status.starting .dot { animation: pulse 1s ease-in-out infinite; }
+    .status.stopped  { background: var(--status-stopped-bg);  color: var(--status-stopped-fg); }
+    .status.error    { background: var(--status-error-bg);    color: var(--status-error-fg); }
+    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+
+    /* ---- Detail ---- */
+    .detail-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px 32px;
+      font-family: var(--font-mono);
+      font-size: 12px;
+      margin-bottom: 16px;
+    }
+    .detail-grid .field .k {
+      font-size: var(--size-label);
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+      color: var(--text-dim);
+      margin-bottom: 4px;
+    }
+    .detail-grid .field .v { color: var(--text-main); word-break: break-all; }
+    .detail-grid .field .v.error { color: var(--danger); }
+    .detail-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+    .placeholder { color: var(--text-dim); font-style: italic; font-size: 12px; padding: 8px 0; }
+
+    /* ---- Toasts ---- */
+    #toasts {
+      position: fixed;
+      top: 64px;
+      right: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      z-index: 1000;
+      max-width: 520px;
+      pointer-events: none;
+    }
+    .toast {
+      position: relative;
+      padding: 12px 36px 12px 14px;
+      border: 1px solid var(--danger);
+      border-left: 3px solid var(--danger);
+      background: #1a0a0d;
+      color: #ffd9de;
+      font-family: var(--font-mono);
+      font-size: 12px;
+      line-height: 1.4;
+      border-radius: 2px;
+      pointer-events: auto;
+      animation: slideIn 180ms ease-out;
+      word-break: break-word;
+      box-shadow: 0 4px 16px rgba(0,0,0,.6);
+    }
+    .toast.success {
+      border-color: var(--success);
+      border-left-color: var(--success);
+      background: #06140a;
+      color: #d4f7dd;
+    }
+    .toast .close {
+      position: absolute;
+      top: 6px;
+      right: 10px;
+      cursor: pointer;
+      color: #ff8a95;
+      font-size: 16px;
+      line-height: 1;
+    }
+    .toast.success .close { color: #7ee39a; }
+    @keyframes slideIn {
+      from { opacity: 0; transform: translateX(20px); }
+      to   { opacity: 1; transform: translateX(0); }
+    }
+  </style>
+</head>
+<body>
+  <div id="app">
+
+    <div class="titlebar">
+      <div class="brand" data-tauri-drag-region>
+        <div class="dot"></div>
+        <div class="title" id="tb-title">NANO_HARNESS // CONTROL CONSOLE</div>
+        <div class="subtitle" id="tb-subtitle">SIGNAL ROUTING HUB // V0.1</div>
+      </div>
+      <div class="titlebar-spacer" data-tauri-drag-region></div>
+      <div class="window-controls">
+        <button id="btn-min" title="Minimize">—</button>
+        <button id="btn-max" title="Maximize">□</button>
+        <button id="btn-close" class="close" title="Close">×</button>
+      </div>
+    </div>
+
+    <div class="actions">
+      <button class="btn primary" id="btn-start-all">Start all</button>
+      <button class="btn danger"  id="btn-stop-all">Stop all</button>
+      <button class="btn"         id="btn-reload">Reload config</button>
+    </div>
+
+    <div class="main">
+
+      <aside class="sidebar">
+        <div class="panel">
+          <div class="corner tl"></div><div class="corner tr"></div>
+          <div class="corner bl"></div><div class="corner br"></div>
+          <div class="panel-label">Overview</div>
+          <div class="overview-row active" data-filter="all">
+            <span class="label">All</span><span class="count" id="ov-all">0</span>
+          </div>
+          <div class="overview-row" data-filter="running">
+            <span class="label">Running</span><span class="count" id="ov-running">0</span>
+          </div>
+          <div class="overview-row" data-filter="stopped">
+            <span class="label">Stopped</span><span class="count" id="ov-stopped">0</span>
+          </div>
+          <div class="overview-row" data-filter="errors">
+            <span class="label">Errors</span><span class="count" id="ov-errors">0</span>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="corner tl"></div><div class="corner tr"></div>
+          <div class="corner bl"></div><div class="corner br"></div>
+          <div class="panel-label">Tools</div>
+          <div class="overview-row" style="cursor:default;">
+            <span class="label">Settings</span>
+          </div>
+          <div class="overview-row" style="cursor:default;">
+            <span class="label">Config</span>
+          </div>
+        </div>
+      </aside>
+
+      <section class="content">
+
+        <div class="panel">
+          <div class="corner tl"></div><div class="corner tr"></div>
+          <div class="corner bl"></div><div class="corner br"></div>
+          <div class="panel-label">Active services</div>
+          <table class="services-table">
+            <thead>
+              <tr>
+                <th class="num">#</th>
+                <th>Service</th>
+                <th>Bind</th>
+                <th>State</th>
+                <th>Uptime</th>
+                <th>Title</th>
+              </tr>
+            </thead>
+            <tbody id="services-body">
+              <tr><td colspan="6" class="placeholder">Список пуст. Нажми Start all или Reload config.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="panel" style="flex:1; min-height:0;">
+          <div class="corner tl"></div><div class="corner tr"></div>
+          <div class="corner bl"></div><div class="corner br"></div>
+          <div class="panel-label" id="detail-label">Detail</div>
+          <div id="detail-body">
+            <div class="placeholder">Выбери сервис в таблице.</div>
+          </div>
+        </div>
+
+      </section>
+    </div>
+  </div>
+
+  <div id="toasts"></div>
+
+  <script type="module">
+    const invoke = window.__TAURI__?.core?.invoke;
+    const appWindow = window.__TAURI__?.window?.getCurrentWindow?.();
+
+    // ---- Theme ----
+    async function applyTheme() {
+      if (!invoke) return;
+      let theme;
+      try {
+        theme = await invoke('get_theme');
+      } catch (e) {
+        console.warn('theme load failed, using defaults', e);
+        return;
+      }
+      const root = document.documentElement;
+      const setVar = (name, value) => {
+        if (value != null && value !== '') root.style.setProperty(name, String(value));
+      };
+
+      if (theme.window?.title) {
+        document.getElementById('tb-title').textContent = theme.window.title;
+        document.title = theme.window.title;
+      }
+      if (theme.window?.subtitle) {
+        document.getElementById('tb-subtitle').textContent = theme.window.subtitle;
+      }
+
+      const f = theme.font || {};
+      setVar('--font-ui', f.ui);
+      setVar('--font-mono', f.mono);
+      setVar('--size-label', f.size_label);
+      setVar('--size-value', f.size_value);
+      setVar('--size-title', f.size_title);
+      setVar('--size-big', f.size_big);
+
+      const c = theme.colors || {};
+      setVar('--bg-base', c.bg_base);
+      setVar('--bg-panel', c.bg_panel);
+      setVar('--bg-row-alt', c.bg_row_alt);
+      setVar('--edge', c.edge);
+      setVar('--edge-accent', c.edge_accent);
+      setVar('--text-main', c.text_main);
+      setVar('--text-dim', c.text_dim);
+      setVar('--text-caps', c.text_caps);
+      setVar('--accent', c.accent);
+      setVar('--accent-dim', c.accent_dim);
+      setVar('--warning', c.warning);
+      setVar('--danger', c.danger);
+      setVar('--success', c.success);
+
+      const st = theme.status || {};
+      setVar('--status-running-bg', st.running?.bg);
+      setVar('--status-running-fg', st.running?.fg);
+      setVar('--status-starting-bg', st.starting?.bg);
+      setVar('--status-starting-fg', st.starting?.fg);
+      setVar('--status-stopped-bg', st.stopped?.bg);
+      setVar('--status-stopped-fg', st.stopped?.fg);
+      setVar('--status-error-bg', st.error?.bg);
+      setVar('--status-error-fg', st.error?.fg);
+
+      const p = theme.panel || {};
+      setVar('--corner-size', p.corner_size);
+      setVar('--corner-width', p.corner_width);
+      setVar('--panel-padding', p.padding);
+
+      const b = theme.button || {};
+      setVar('--button-padding-x', b.padding_x);
+      setVar('--button-padding-y', b.padding_y);
+      setVar('--button-radius', b.radius);
+    }
+
+    // ---- Toasts ----
+    function notify(message, kind = 'error') {
+      const container = document.getElementById('toasts');
+      if (!container) return;
+      const el = document.createElement('div');
+      el.className = 'toast ' + kind;
+      const close = document.createElement('span');
+      close.className = 'close';
+      close.textContent = '×';
+      close.addEventListener('click', () => el.remove());
+      const text = document.createElement('span');
+      text.textContent = message;
+      el.appendChild(text);
+      el.appendChild(close);
+      container.appendChild(el);
+      setTimeout(() => el.remove(), 6000);
+    }
+
+    async function call(method, args) {
+      try {
+        await invoke(method, args);
+        return true;
+      } catch (e) {
+        const msg = typeof e === 'string' ? e : (e?.message || JSON.stringify(e));
+        notify(method + ': ' + msg, 'error');
+        return false;
+      }
+    }
+
+    // ---- Window controls ----
+    document.getElementById('btn-min')?.addEventListener('click', () => appWindow?.minimize());
+    document.getElementById('btn-max')?.addEventListener('click', () => appWindow?.toggleMaximize());
+    document.getElementById('btn-close')?.addEventListener('click', () => appWindow?.close());
+
+    document.querySelectorAll('.window-controls button').forEach((btn) => {
+      btn.addEventListener('mousedown', (e) => e.stopPropagation());
+    });
+
+    // ---- Top actions ----
+    document.getElementById('btn-start-all')?.addEventListener('click', async () => {
+      await call('start_all');
+      refreshServices();
+    });
+    document.getElementById('btn-stop-all')?.addEventListener('click', async () => {
+      await call('stop_all');
+      refreshServices();
+    });
+    document.getElementById('btn-reload')?.addEventListener('click', async () => {
+      await call('reload_config');
+      refreshServices();
+    });
+
+    // ---- State ----
+    let services = [];
+    let selectedKey = null;
+    let filter = 'all';
+
+    const STATE_LABEL = {
+      running:  'running',
+      starting: 'starting',
+      stopped:  'stopped',
+      error:    'error',
+    };
+
+    function fmtUptime(sec) {
+      if (sec == null) return '—';
+      const h = Math.floor(sec / 3600);
+      const m = Math.floor((sec % 3600) / 60);
+      const s = sec % 60;
+      const pad = (n) => String(n).padStart(2, '0');
+      return h > 0 ? `${h}h ${pad(m)}m` : `${m}m ${pad(s)}s`;
+    }
+
+    function filteredServices() {
+      if (filter === 'all') return services;
+      if (filter === 'running') return services.filter(s => s.state === 'running' || s.state === 'starting');
+      if (filter === 'stopped') return services.filter(s => s.state === 'stopped');
+      if (filter === 'errors') return services.filter(s => s.state === 'error');
+      return services;
+    }
+
+    function escapeHtml(v) {
+      if (v == null) return '';
+      return String(v)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    }
+
+    function renderServices() {
+      const body = document.getElementById('services-body');
+      if (!body) return;
+
+      const list = filteredServices();
+
+      if (list.length === 0) {
+        body.innerHTML = `<tr><td colspan="6" class="placeholder">${
+          services.length === 0
+            ? 'Список пуст. Проверь config.toml.'
+            : 'Нет сервисов, удовлетворяющих фильтру.'
+        }</td></tr>`;
+        return;
+      }
+
+      body.innerHTML = list.map((s, i) => {
+        const sel = s.key === selectedKey ? ' selected' : '';
+        const stateCls = STATE_LABEL[s.state] || 'stopped';
+        const uptime = fmtUptime(s.uptime_sec);
+        const errTitle = s.error ? ` title="${escapeHtml(s.error)}"` : '';
+        return `
+          <tr data-key="${escapeHtml(s.key)}" class="${sel}"${errTitle}>
+            <td class="num">${i + 1}</td>
+            <td class="name">${escapeHtml(s.label)}</td>
+            <td class="bind">${escapeHtml(s.bind)}</td>
+            <td><span class="status ${stateCls}"><span class="dot"></span>${stateCls}</span></td>
+            <td class="uptime">${uptime}</td>
+            <td class="title">${escapeHtml(s.title)}</td>
+          </tr>
+        `;
+      }).join('');
+
+      body.querySelectorAll('tr[data-key]').forEach((tr) => {
+        tr.addEventListener('click', () => {
+          selectedKey = tr.dataset.key;
+          renderServices();
+          renderDetail();
+        });
+      });
+    }
+
+    function updateOverview() {
+      const counts = { all: services.length, running: 0, stopped: 0, errors: 0 };
+      for (const s of services) {
+        if (s.state === 'running' || s.state === 'starting') counts.running++;
+        else if (s.state === 'error') counts.errors++;
+        else counts.stopped++;
+      }
+      document.getElementById('ov-all').textContent     = counts.all;
+      document.getElementById('ov-running').textContent = counts.running;
+      document.getElementById('ov-stopped').textContent = counts.stopped;
+      document.getElementById('ov-errors').textContent  = counts.errors;
+    }
+
+    function renderDetail() {
+      const labelEl = document.getElementById('detail-label');
+      const bodyEl  = document.getElementById('detail-body');
+      if (!labelEl || !bodyEl) return;
+
+      const s = services.find((x) => x.key === selectedKey);
+      if (!s) {
+        labelEl.textContent = 'Detail';
+        bodyEl.innerHTML = `<div class="placeholder">Выбери сервис в таблице.</div>`;
+        return;
+      }
+
+      labelEl.textContent = `Detail · ${s.label}`;
+      const stateCls = STATE_LABEL[s.state] || 'stopped';
+
+      const canStart   = s.state !== 'running' && s.state !== 'starting';
+      const canStop    = s.state === 'running' || s.state === 'starting';
+      const canRestart = s.state === 'running' || s.state === 'starting' || s.state === 'error';
+
+      const errBlock = s.error
+        ? `<div class="field"><div class="k">Last error</div><div class="v error">${escapeHtml(s.error)}</div></div>`
+        : '';
+
+      bodyEl.innerHTML = `
+        <div class="detail-grid">
+          <div class="field"><div class="k">Key</div><div class="v">${escapeHtml(s.key)}</div></div>
+          <div class="field"><div class="k">Bind</div><div class="v">${escapeHtml(s.bind)}</div></div>
+          <div class="field"><div class="k">State</div><div class="v"><span class="status ${stateCls}"><span class="dot"></span>${stateCls}</span></div></div>
+          <div class="field"><div class="k">Uptime</div><div class="v">${fmtUptime(s.uptime_sec)}</div></div>
+          <div class="field"><div class="k">Title</div><div class="v">${escapeHtml(s.title)}</div></div>
+          ${errBlock}
+        </div>
+        <div class="detail-actions">
+          <button class="btn primary" data-action="start" ${canStart ? '' : 'disabled'}>▶ Start</button>
+          <button class="btn"         data-action="restart" ${canRestart ? '' : 'disabled'}>↻ Restart</button>
+          <button class="btn danger"  data-action="stop" ${canStop ? '' : 'disabled'}>■ Stop</button>
+        </div>
+      `;
+
+      bodyEl.querySelectorAll('[data-action]').forEach((btn) => {
+        btn.addEventListener('click', async () => {
+          if (btn.disabled) return;
+          const method = {
+            start:   'start_service',
+            restart: 'restart_service',
+            stop:    'stop_service',
+          }[btn.dataset.action];
+          if (!method) return;
+          await call(method, { key: s.key });
+          refreshServices();
+        });
+      });
+    }
+
+    async function refreshServices() {
+      if (!invoke) return;
+      try {
+        const next = await invoke('list_services');
+        services = next;
+        renderServices();
+        updateOverview();
+        renderDetail();
+      } catch (e) {
+        console.error('list_services failed', e);
+      }
+    }
+
+    // Фильтры в сайдбаре.
+    document.querySelectorAll('.overview-row[data-filter]').forEach((row) => {
+      row.addEventListener('click', () => {
+        filter = row.dataset.filter || 'all';
+        document.querySelectorAll('.overview-row[data-filter]').forEach((r) => {
+          r.classList.toggle('active', r === row);
+        });
+        renderServices();
+      });
+    });
+
+    await applyTheme();
+    refreshServices();
+    setInterval(refreshServices, 1000);
+  </script>
+</body>
+</html>
