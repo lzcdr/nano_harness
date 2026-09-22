@@ -13,7 +13,7 @@ use tokio_stream::StreamExt;
 
 use nano_harness::agent_core::{OutgoingTasks, PendingCalls};
 use nano_harness::config::{build_engine_config, TomlConfig};
-use nano_harness::engine::{ChatEngine, EngineConfig, Role};
+use nano_harness::engine::{ChatEngine, EngineConfig, Message, Role};
 use nano_harness::local_storage_http_api::LocalStorageServerConfig;
 use nano_harness::message_board::BoardEvent;
 use nano_harness::session_store::{self, ContextBlock, Session};
@@ -154,7 +154,14 @@ fn open_project(
             s.context = Some(ContextBlock {
                 engine_config: engine_config.clone(),
                 engine_state: nano_harness::session_store::EngineState {
-                    system_messages: vec![],
+                    system_messages: vec![Message {
+                        role: Role::System,
+                        content: Some(default_system_prompt.to_string()),
+                        reasoning: None,
+                        tool_calls: None,
+                        tool_call_id: None,
+                        name: None,
+                    }],
                     prefix_turns: vec![],
                     tail_turns: vec![],
                     pending_turn: None,

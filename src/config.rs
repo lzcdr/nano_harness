@@ -34,6 +34,7 @@ pub struct TomlConfig {
     pub vector_db: Option<VectorDbConfig>,
     pub local_storage_http_server: Option<LocalStorageServerConfig>,
     pub message_board: Option<MessageBoardConfig>,
+
     #[serde(default)]
     pub agents: Vec<AgentConfig>,
 }
