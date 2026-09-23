@@ -1,6 +1,7 @@
 // src/bin/agent_server.rs
 
 use clap::Parser;
+use dotenvy::{self, dotenv};
 use nano_harness::agent_core::{AgentContext, OutgoingTasks, PendingCalls};
 use nano_harness::agent_http_api;
 use nano_harness::config::TomlConfig;
@@ -21,6 +22,7 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let _ = dotenvy::dotenv();
     let args = Args::parse();
     let config = TomlConfig::load(&args.config)?;
 
@@ -36,21 +38,39 @@ async fn main() -> anyhow::Result<()> {
         agent_config.max_cost_rub = config.max_cost_rub;
     }
 
-    let storage_config = config
+    if agent_config.auth_token.is_empty() {
+        let key = format!(
+            "AGENT_{}_AUTH_TOKEN",
+            agent_config.name.to_ascii_uppercase()
+        );
+        agent_config.auth_token = std::env::var(&key).unwrap_or_default();
+    }
+
+    let mut storage_config = config
         .local_storage_http_server
         .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("Секция [local_storage_http_server] не найдена"))?;
+        .ok_or_else(|| anyhow::anyhow!("Секция [local_storage_http_server] не найдена"))?
+        .clone();
+
+    if storage_config.auth_token.is_empty() {
+        storage_config.auth_token = std::env::var("LOCAL_STORAGE_AUTH_TOKEN").unwrap_or_default();
+    }
 
     let board_url = config
         .message_board
         .as_ref()
         .map(|c| c.bind_addr.clone())
         .unwrap_or_else(|| "127.0.0.1:8090".to_string());
-    let board_token = config
+
+    let mut board_token = config
         .message_board
         .as_ref()
         .map(|c| c.auth_token.clone())
-        .unwrap_or_else(|| "board_token".to_string());
+        .unwrap_or_default();
+
+    if board_token.is_empty() {
+        board_token = std::env::var("MESSAGE_BOARD_AUTH_TOKEN").unwrap_or_default();
+    }
 
     let pending_calls: PendingCalls = Arc::new(Mutex::new(HashMap::new()));
     let outgoing_tasks: OutgoingTasks = Arc::new(Mutex::new(HashMap::new()));

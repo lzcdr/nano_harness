@@ -1,6 +1,7 @@
 // src/bin/message_board_server.rs
 
 use clap::Parser;
+use dotenvy;
 use nano_harness::config::TomlConfig;
 use nano_harness::message_board::{build_router, MessageBoard};
 use std::path::PathBuf;
@@ -32,6 +33,7 @@ async fn shutdown_signal() {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let _ = dotenvy::dotenv();
     let args = Args::parse();
     let toml_config = TomlConfig::load(&args.config)?;
     let board_config = toml_config.message_board.as_ref();
@@ -41,10 +43,14 @@ async fn main() -> anyhow::Result<()> {
         .or_else(|| board_config.map(|c| c.bind_addr.clone()))
         .unwrap_or_else(|| "127.0.0.1:8090".to_string());
 
-    let auth_token = args
+    let mut auth_token = args
         .auth_token
         .or_else(|| board_config.map(|c| c.auth_token.clone()))
-        .unwrap_or_else(|| "board_token".to_string());
+        .unwrap_or_default();
+
+    if auth_token.is_empty() {
+        auth_token = std::env::var("MESSAGE_BOARD_AUTH_TOKEN").unwrap_or_default();
+    }
 
     let tasks_dir = args
         .tasks_dir

@@ -2,6 +2,7 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use dotenvy;
 use reqwest::Client;
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -541,6 +542,7 @@ async fn continue_chat_turn(shared: &SharedChat, ctx: &ReplyContext) {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let _ = dotenvy::dotenv();
     let args = Args::parse();
 
     let toml_config = TomlConfig::load(&args.config_path)?;
@@ -574,11 +576,14 @@ async fn main() -> Result<()> {
         .as_ref()
         .map(|c| c.bind_addr.clone())
         .unwrap_or_else(|| "127.0.0.1:8090".to_string());
-    let board_token = toml_config
+    let mut board_token = toml_config
         .message_board
         .as_ref()
         .map(|c| c.auth_token.clone())
-        .unwrap_or_else(|| "board_token".to_string());
+        .unwrap_or_default();
+    if board_token.is_empty() {
+        board_token = std::env::var("MESSAGE_BOARD_AUTH_TOKEN").unwrap_or_default();
+    }
     let board_url = if board_url.starts_with("http") {
         board_url
     } else {
@@ -693,7 +698,7 @@ async fn main() -> Result<()> {
     println!("       purge <id> [--force] — удалить файлы");
     println!();
 
-    let storage_http_config = toml_config
+    let mut storage_http_config = toml_config
         .local_storage_http_server
         .clone()
         .unwrap_or_else(|| LocalStorageServerConfig {
@@ -701,6 +706,11 @@ async fn main() -> Result<()> {
             storage_name: "default_storage".to_string(),
             auth_token: String::new(),
         });
+
+    if storage_http_config.auth_token.is_empty() {
+        storage_http_config.auth_token =
+            std::env::var("LOCAL_STORAGE_AUTH_TOKEN").unwrap_or_default();
+    }
 
     let rhai_timeout_sec = toml_config.rhai_timeout_sec.unwrap_or(30);
     let agent_call_timeout_sec = args.agent_call_timeout_sec;

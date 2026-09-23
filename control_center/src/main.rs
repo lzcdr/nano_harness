@@ -60,17 +60,17 @@ fn kill_tree(child: &mut Child) -> Result<(), String> {
             .output();
 
         // 2. Дать сервису шанс погаситься.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             match child.try_wait() {
                 Ok(Some(_)) => return Ok(()),
                 Ok(None) => {}
                 Err(_) => break,
             }
-            if std::time::Instant::now() >= deadline {
+            if Instant::now() >= deadline {
                 break;
             }
-            std::thread::sleep(std::time::Duration::from_millis(100));
+            std::thread::sleep(Duration::from_millis(100));
         }
 
         // 3. Fallback: hard kill.
@@ -204,11 +204,12 @@ struct AppStateInner {
     services: Mutex<Vec<ServiceDef>>,
     running: Mutex<HashMap<String, RunningService>>,
     errors: Mutex<HashMap<String, ServiceError>>,
+    config_error: Mutex<Option<String>>,
 }
 
 type AppState = Arc<AppStateInner>;
 
-fn load_config() -> Option<TomlConfig> {
+fn load_config() -> Result<TomlConfig, String> {
     let mut candidates: Vec<PathBuf> = Vec::new();
 
     if let Ok(p) = std::env::var("NH_CONFIG") {
@@ -228,11 +229,11 @@ fn load_config() -> Option<TomlConfig> {
     for p in candidates {
         if p.exists() {
             eprintln!("[cfg] loaded {}", p.display());
-            return TomlConfig::load(&p).ok();
+            return TomlConfig::load(&p).map_err(|e| format!("{:#}", e));
         }
     }
-    eprintln!("[err] config.toml not found");
-    None
+
+    Err("config.toml not found".to_string())
 }
 
 #[derive(Serialize)]
@@ -427,6 +428,13 @@ async fn list_services(state: State<'_, AppState>) -> Result<Vec<ServiceInfo>, S
 }
 
 #[tauri::command]
+async fn get_config_error(state: State<'_, AppState>) -> Result<Option<String>, String> {
+    let st = state.inner().clone();
+    let guard = st.config_error.lock().unwrap();
+    Ok(guard.clone())
+}
+
+#[tauri::command]
 async fn start_service(key: String, state: State<'_, AppState>) -> Result<(), String> {
     let st = state.inner().clone();
     tokio::task::spawn_blocking(move || do_start_blocking(&key, st.as_ref()))
@@ -606,7 +614,14 @@ async fn reload_config(state: State<'_, AppState>) -> Result<(), String> {
     eprintln!("[cmd] reload_config");
     let st = state.inner().clone();
 
-    let cfg = load_config().ok_or_else(|| "config.toml not found".to_string())?;
+    let cfg = match load_config() {
+        Ok(c) => c,
+        Err(e) => {
+            *st.config_error.lock().unwrap() = Some(e.clone());
+            return Err(e);
+        }
+    };
+
     let services = build_services(&cfg);
     let valid_keys: HashSet<String> = services.iter().map(|s| s.key.clone()).collect();
 
@@ -621,40 +636,11 @@ async fn reload_config(state: State<'_, AppState>) -> Result<(), String> {
             .lock()
             .unwrap()
             .retain(|k, _| valid_keys.contains(k));
+        *st.config_error.lock().unwrap() = None;
     }
 
     eprintln!("[ok] config reloaded");
     Ok(())
-}
-
-#[tauri::command]
-async fn get_theme() -> Result<serde_json::Value, String> {
-    let mut candidates: Vec<PathBuf> = Vec::new();
-
-    if let Ok(p) = std::env::var("NH_THEME") {
-        candidates.push(PathBuf::from(p));
-    }
-    candidates.push(PathBuf::from("theme.toml"));
-    candidates.push(PathBuf::from("../theme.toml"));
-    candidates.push(PathBuf::from("control_center/theme.toml"));
-
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            candidates.push(dir.join("theme.toml"));
-            candidates.push(dir.join("../../control_center/theme.toml"));
-            candidates.push(dir.join("../../../control_center/theme.toml"));
-        }
-    }
-
-    for p in candidates {
-        if p.exists() {
-            eprintln!("[theme] loaded {}", p.display());
-            let content = std::fs::read_to_string(&p).map_err(|e| e.to_string())?;
-            let toml_val: toml::Value = toml::from_str(&content).map_err(|e| e.to_string())?;
-            return serde_json::to_value(toml_val).map_err(|e| e.to_string());
-        }
-    }
-    Err("theme.toml not found".to_string())
 }
 
 // ============================================================================
@@ -663,8 +649,14 @@ async fn get_theme() -> Result<serde_json::Value, String> {
 
 fn main() {
     eprintln!("[boot] control_center");
-    let cfg = load_config();
-    let services = cfg.as_ref().map(build_services).unwrap_or_default();
+
+    let (services, config_error) = match load_config() {
+        Ok(cfg) => (build_services(&cfg), None),
+        Err(e) => {
+            eprintln!("[err] config load failed: {}", e);
+            (Vec::new(), Some(e))
+        }
+    };
 
     eprintln!("[boot] services={}", services.len());
 
@@ -672,19 +664,20 @@ fn main() {
         services: Mutex::new(services),
         running: Mutex::new(HashMap::new()),
         errors: Mutex::new(HashMap::new()),
+        config_error: Mutex::new(config_error),
     });
 
     tauri::Builder::default()
         .manage(state)
         .invoke_handler(tauri::generate_handler![
             list_services,
+            get_config_error,
             start_service,
             stop_service,
             restart_service,
             start_all,
             stop_all,
             reload_config,
-            get_theme,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

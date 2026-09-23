@@ -5,7 +5,6 @@
 # ---------------------------------------------------------------------------
 # Глобальные параметры LLM (используются CLI-чатом и как fallback для агентов)
 # ---------------------------------------------------------------------------
-api_key = "pza_IkoixbZBxwg0Fndv8IXcqU2U2u_IIFyH"
 base_url = "https://polza.ai/api/v1"
 model = "google/gemini-3.1-flash-lite"
 
@@ -131,14 +130,14 @@ top_k = 5
 [local_storage_http_server]
 bind_addr = "127.0.0.1:8080"
 storage_name = "default_storage"
-auth_token = "secret"
+auth_token = ""
 
 # ---------------------------------------------------------------------------
 # Доска сообщений (сервис message_board_server)
 # ---------------------------------------------------------------------------
 [message_board]
 bind_addr = "127.0.0.1:8090"
-auth_token = "board_token"
+auth_token = ""
 tasks_dir = ".board/tasks"
 task_timeout_sec = 300
 
@@ -147,8 +146,9 @@ task_timeout_sec = 300
 # ============================================================================
 [[agents]]
 name = "assistant"
+api_key = ""
 bind_addr = "127.0.0.1:8081"
-auth_token = "agent_token_1"
+auth_token = ""
 
 # Таймаут HTTP-запроса к LLM (в секундах)
 timeout_sec = 120
@@ -205,7 +205,6 @@ storage_write_file("hello.txt", "Привет")
 Всегда передавай код в параметре "code" инструмента run_code."""
 
 # Параметры LLM для этого агента
-api_key = "pza_IkoixbZBxwg0Fndv8IXcqU2U2u_IIFyH"
 base_url = "https://polza.ai/api/v1"
 model = "google/gemini-3.1-flash-lite"
 temperature = 0.7
@@ -253,8 +252,9 @@ max_cost_rub = 10.0
 # ============================================================================
 [[agents]]
 name = "helper"
+api_key = ""
 bind_addr = "127.0.0.1:8082"
-auth_token = "agent_token_2"
+auth_token = ""
 
 timeout_sec = 120
 max_iterations = 3
@@ -262,7 +262,6 @@ tools = ["run_code", "local_storage"]
 
 system_prompt = """Ты — вспомогательный агент. Отвечай кратко."""
 
-api_key = "pza_IkoixbZBxwg0Fndv8IXcqU2U2u_IIFyH"
 base_url = "https://polza.ai/api/v1"
 model = "google/gemini-3.1-flash-lite"
 temperature = 0.7

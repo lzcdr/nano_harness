@@ -741,6 +741,16 @@
       });
     });
 
+    // ---- Инициализация ----
+    if (invoke) {
+      try {
+        const err = await invoke('get_config_error');
+        if (err) notify('Config error: ' + err, 'error');
+      } catch (e) {
+        console.error('get_config_error failed', e);
+      }
+    }
+
     await applyTheme();
     refreshServices();
     setInterval(refreshServices, 1000);

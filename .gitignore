@@ -5,3 +5,4 @@
 /.local_storage
 /chats
 Cargo.lock
+.env
