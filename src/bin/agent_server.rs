@@ -1,7 +1,7 @@
 // src/bin/agent_server.rs
 
 use clap::Parser;
-use dotenvy::{self, dotenv};
+use dotenvy::{self};
 use nano_harness::agent_core::{AgentContext, OutgoingTasks, PendingCalls};
 use nano_harness::agent_http_api;
 use nano_harness::config::TomlConfig;

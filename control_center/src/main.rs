@@ -117,6 +117,19 @@ struct ServiceDef {
     args: Vec<String>,
 }
 
+fn cargo_run(bin: &str, extra: &[&str]) -> Vec<String> {
+    let mut args: Vec<String> = vec!["run".into()];
+    if !cfg!(debug_assertions) {
+        args.push("--release".into());
+    }
+    args.push("--bin".into());
+    args.push(bin.into());
+    for e in extra {
+        args.push((*e).into());
+    }
+    args
+}
+
 fn build_services(cfg: &TomlConfig) -> Vec<ServiceDef> {
     let mut out = Vec::new();
 
@@ -131,7 +144,7 @@ fn build_services(cfg: &TomlConfig) -> Vec<ServiceDef> {
         bind: board_bind,
         title: "Message Board".into(),
         cmd: "cargo".into(),
-        args: vec!["run".into(), "--bin".into(), "message_board_server".into()],
+        args: cargo_run("message_board_server", &[]),
     });
 
     let storage_bind = cfg
@@ -145,11 +158,7 @@ fn build_services(cfg: &TomlConfig) -> Vec<ServiceDef> {
         bind: storage_bind,
         title: "Local Storage".into(),
         cmd: "cargo".into(),
-        args: vec![
-            "run".into(),
-            "--bin".into(),
-            "local_storage_http_server".into(),
-        ],
+        args: cargo_run("local_storage_http_server", &[]),
     });
 
     out.push(ServiceDef {
@@ -158,7 +167,7 @@ fn build_services(cfg: &TomlConfig) -> Vec<ServiceDef> {
         bind: "—".into(),
         title: "Chat".into(),
         cmd: "cargo".into(),
-        args: vec!["run".into(), "--bin".into(), "nano_harness".into()],
+        args: cargo_run("nano_harness", &[]),
     });
 
     for a in &cfg.agents {
@@ -169,14 +178,7 @@ fn build_services(cfg: &TomlConfig) -> Vec<ServiceDef> {
             bind: a.bind_addr.clone(),
             title: display,
             cmd: "cargo".into(),
-            args: vec![
-                "run".into(),
-                "--bin".into(),
-                "agent_server".into(),
-                "--".into(),
-                "--agent-name".into(),
-                a.name.clone(),
-            ],
+            args: cargo_run("agent_server", &["--", "--agent-name", a.name.as_str()]),
         });
     }
 
