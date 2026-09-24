@@ -722,9 +722,9 @@ fn run_code_with_storage(
     code: &str,
 ) -> Result<String> {
     let mut engine = rhai::Engine::new();
-    engine.set_max_operations(10_000);
-    engine.set_max_call_levels(32);
-    engine.set_max_string_size(1024 * 10);
+    engine.set_max_operations(crate::tools::RHAI_MAX_OPERATIONS);
+    engine.set_max_call_levels(crate::tools::RHAI_MAX_CALL_LEVELS);
+    engine.set_max_string_size(crate::tools::RHAI_MAX_STRING_SIZE);
 
     let output = Rc::new(RefCell::new(String::new()));
     let output_clone = output.clone();

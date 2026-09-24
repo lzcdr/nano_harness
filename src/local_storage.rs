@@ -13,6 +13,11 @@ use tokenizers::Tokenizer;
 
 const STORAGE_BASE: &str = ".local_storage";
 const META_FILE: &str = "vector_meta.json";
+const RESERVED_NAMES: &[&str] = &[".about", ".summary", META_FILE];
+
+pub fn is_reserved_name(name: &str) -> bool {
+    RESERVED_NAMES.iter().any(|r| name.eq_ignore_ascii_case(r))
+}
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct VectorDbConfig {
@@ -560,23 +565,29 @@ impl LocalStorage {
     }
 
     fn resolve(&self, path: &str) -> io::Result<PathBuf> {
-        let rel = Path::new(path);
-        if rel.is_absolute() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "absolute path not allowed",
-            ));
+        let mut out = PathBuf::new();
+        for c in Path::new(path).components() {
+            match c {
+                std::path::Component::Normal(p) => {
+                    if p.to_str().map(is_reserved_name) == Some(true) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "path refers to reserved file",
+                        ));
+                    }
+                    out.push(p)
+                }
+                std::path::Component::CurDir => {}
+                std::path::Component::RootDir => {}
+                std::path::Component::ParentDir | std::path::Component::Prefix(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "path escapes storage root",
+                    ));
+                }
+            }
         }
-        if rel
-            .components()
-            .any(|c| c == std::path::Component::ParentDir)
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "path escapes storage root",
-            ));
-        }
-        Ok(self.root.join(rel))
+        Ok(self.root.join(out))
     }
 
     fn ensure_system_files(dir: &Path) -> io::Result<()> {
@@ -648,7 +659,7 @@ impl LocalStorage {
         for entry in fs::read_dir(full)? {
             let entry = entry?;
             let name = entry.file_name().to_string_lossy().to_string();
-            if name == ".about" || name == ".summary" {
+            if is_reserved_name(&name) {
                 continue;
             }
             let rel_path = self.relativize(&entry.path());
@@ -680,7 +691,7 @@ impl LocalStorage {
             let entry = entry?;
             let path = entry.path();
             let name = entry.file_name().to_string_lossy().to_string();
-            if name == ".about" || name == ".summary" {
+            if is_reserved_name(&name) {
                 continue;
             }
             if entry.file_type()?.is_dir() {

@@ -13,6 +13,10 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::runtime::Handle;
 
+pub const RHAI_MAX_OPERATIONS: u64 = 1_000_000;
+pub const RHAI_MAX_CALL_LEVELS: usize = 64;
+pub const RHAI_MAX_STRING_SIZE: usize = 1024 * 256;
+
 /// Контекст для регистрации board-функций в Rhai.
 /// Заполняется при каждом `run_code` — свой для каждого хода LLM.
 pub struct BoardContext {
@@ -480,9 +484,9 @@ fn run_rhai_code(
     board_ctx: Option<BoardContext>,
 ) -> String {
     let mut engine = Engine::new();
-    engine.set_max_operations(10_000);
-    engine.set_max_call_levels(32);
-    engine.set_max_string_size(1024 * 10);
+    engine.set_max_operations(RHAI_MAX_OPERATIONS);
+    engine.set_max_call_levels(RHAI_MAX_CALL_LEVELS);
+    engine.set_max_string_size(RHAI_MAX_STRING_SIZE);
 
     let output = Rc::new(RefCell::new(String::new()));
     let output_clone = output.clone();

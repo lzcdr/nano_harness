@@ -34,23 +34,29 @@ struct FileStorage {
 
 impl FileStorage {
     fn resolve(&self, path: &str) -> std::io::Result<std::path::PathBuf> {
-        let rel = std::path::Path::new(path);
-        if rel.is_absolute() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "absolute path not allowed",
-            ));
+        let mut out = std::path::PathBuf::new();
+        for c in std::path::Path::new(path).components() {
+            match c {
+                std::path::Component::Normal(p) => {
+                    if p.to_str().map(crate::local_storage::is_reserved_name) == Some(true) {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            "path refers to reserved file",
+                        ));
+                    }
+                    out.push(p)
+                }
+                std::path::Component::CurDir => {}
+                std::path::Component::RootDir => {}
+                std::path::Component::ParentDir | std::path::Component::Prefix(_) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "path escapes storage root",
+                    ));
+                }
+            }
         }
-        if rel
-            .components()
-            .any(|c| c == std::path::Component::ParentDir)
-        {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "path escapes storage root",
-            ));
-        }
-        Ok(self.root.join(rel))
+        Ok(self.root.join(out))
     }
 
     fn ensure_system_files(dir: &std::path::Path) -> std::io::Result<()> {
@@ -96,7 +102,7 @@ impl FileStorage {
         let mut dir = tokio::fs::read_dir(full).await?;
         while let Some(entry) = dir.next_entry().await? {
             let name = entry.file_name().to_string_lossy().to_string();
-            if name == ".about" || name == ".summary" {
+            if crate::local_storage::is_reserved_name(&name) {
                 continue;
             }
             let rel_path = self.relativize(&entry.path());
@@ -127,7 +133,7 @@ impl FileStorage {
             while let Some(entry) = dir.next_entry().await? {
                 let path = entry.path();
                 let name = entry.file_name().to_string_lossy().to_string();
-                if name == ".about" || name == ".summary" {
+                if crate::local_storage::is_reserved_name(&name) {
                     continue;
                 }
                 if entry.file_type().await?.is_dir() {
