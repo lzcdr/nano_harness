@@ -53,6 +53,8 @@ pub struct Task {
     pub from_session_id: String,
     pub to_agent: String,
     pub to_session_id: String,
+    #[serde(default)]
+    pub project_id: String,
     pub payload: Value,
     pub status: TaskStatus,
     pub parent_task_id: Option<String>,
@@ -102,6 +104,7 @@ pub struct CreateTaskRequest {
     pub from_session_id: String,
     pub to_agent: String,
     pub to_session_id: String,
+    pub project_id: String,
     pub payload: Value,
     pub parent_task_id: Option<String>,
     #[serde(default)]
@@ -231,6 +234,12 @@ impl MessageBoard {
                                 connections.remove(&agent_name);
                             }
                             BoardCommand::CreateTask { request, response_tx } => {
+                                if !crate::local_storage::valid_project_id(&request.project_id) {
+                                    let _ = response_tx.send(Err(anyhow::anyhow!(
+                                        "project_id is required and must be non-empty"
+                                    )));
+                                    continue;
+                                }
                                 match request.payload.get("prompt").and_then(|v| v.as_str()) {
                                     Some(s) if !s.trim().is_empty() => {}
                                     _ => {
@@ -257,6 +266,7 @@ impl MessageBoard {
                                     from_session_id: request.from_session_id.clone(),
                                     to_agent: request.to_agent.clone(),
                                     to_session_id: request.to_session_id.clone(),
+                                    project_id: request.project_id.clone(),
                                     payload: request.payload.clone(),
                                     status: TaskStatus::InProgress,
                                     parent_task_id: request.parent_task_id.clone(),
@@ -375,7 +385,7 @@ impl MessageBoard {
                             }
                         }
                     }
-                                        _ = interval.tick() => {
+                    _ = interval.tick() => {
                         let now = now_ts();
                         let mut to_fail: Vec<String> = Vec::new();
                         for (id, task) in tasks.iter() {
@@ -410,7 +420,6 @@ impl MessageBoard {
                             }
                         }
 
-                        // Очистка терминальных задач старше task_timeout_sec.
                         let mut to_evict: Vec<String> = Vec::new();
                         for (id, task) in tasks.iter() {
                             let terminal = matches!(
@@ -799,6 +808,7 @@ mod tests {
             from_session_id: "s".into(),
             to_agent: "b".into(),
             to_session_id: "s2".into(),
+            project_id: "test_project".into(),
             payload: serde_json::json!({"prompt": "hi"}),
             parent_task_id: None,
             chain: vec!["b".into()],
@@ -821,6 +831,7 @@ mod tests {
             from_session_id: "s".into(),
             to_agent: "b".into(),
             to_session_id: "s2".into(),
+            project_id: "test_project".into(),
             payload: serde_json::json!({"prompt": "hi"}),
             parent_task_id: None,
             chain: vec!["b".into()],
@@ -831,6 +842,7 @@ mod tests {
             BoardEvent::TaskCreated { task } => {
                 assert_eq!(task.id, resp.task_id);
                 assert_eq!(task.chain, vec!["b".to_string()]);
+                assert_eq!(task.project_id, "test_project");
             }
             _ => panic!(),
         }
@@ -851,7 +863,31 @@ mod tests {
             from_session_id: "s".into(),
             to_agent: "b".into(),
             to_session_id: "s2".into(),
+            project_id: "test_project".into(),
             payload: serde_json::json!({}),
+            parent_task_id: None,
+            chain: vec![],
+        };
+        assert!(board.create_task(req).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_create_task_rejected_for_invalid_project_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = MessageBoard::new(dir.path().to_path_buf(), 300)
+            .await
+            .unwrap();
+
+        let (tx, _rx) = mpsc::unbounded_channel::<BoardEvent>();
+        board.register_session("b".to_string(), tx).await;
+
+        let req = CreateTaskRequest {
+            from_agent: "a".into(),
+            from_session_id: "s".into(),
+            to_agent: "b".into(),
+            to_session_id: "s2".into(),
+            project_id: "".into(),
+            payload: serde_json::json!({"prompt": "hi"}),
             parent_task_id: None,
             chain: vec![],
         };
@@ -876,6 +912,7 @@ mod tests {
                 from_session_id: "s".into(),
                 to_agent: "b".into(),
                 to_session_id: "s2".into(),
+                project_id: "test_project".into(),
                 payload: serde_json::json!({"prompt": "hi"}),
                 parent_task_id: None,
                 chain: vec!["b".into()],
@@ -923,6 +960,7 @@ mod tests {
                 from_session_id: "s".into(),
                 to_agent: "b".into(),
                 to_session_id: "s2".into(),
+                project_id: "test_project".into(),
                 payload: serde_json::json!({"prompt": "hi"}),
                 parent_task_id: None,
                 chain: vec!["b".into()],
@@ -968,6 +1006,7 @@ mod tests {
                 from_session_id: "s".into(),
                 to_agent: "b".into(),
                 to_session_id: "s2".into(),
+                project_id: "test_project".into(),
                 payload: serde_json::json!({"prompt": "hi"}),
                 parent_task_id: None,
                 chain: vec!["b".into()],
@@ -978,5 +1017,6 @@ mod tests {
         let task = board.get_task(resp.task_id.clone()).await.unwrap();
         assert_eq!(task.id, resp.task_id);
         assert_eq!(task.status, TaskStatus::InProgress);
+        assert_eq!(task.project_id, "test_project");
     }
 }

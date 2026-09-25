@@ -35,6 +35,8 @@ pub struct PendingTask {
     pub to_agent_name: String,
     pub to_session_id: String,
     #[serde(default)]
+    pub project_id: String,
+    #[serde(default)]
     pub chain: Vec<String>,
 }
 

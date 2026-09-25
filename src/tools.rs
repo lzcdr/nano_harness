@@ -18,12 +18,12 @@ pub const RHAI_MAX_CALL_LEVELS: usize = 64;
 pub const RHAI_MAX_STRING_SIZE: usize = 1024 * 256;
 
 /// Контекст для регистрации board-функций в Rhai.
-/// Заполняется при каждом `run_code` — свой для каждого хода LLM.
 pub struct BoardContext {
     pub board_url: String,
     pub board_token: String,
     pub self_agent_name: String,
     pub self_session_id: Option<String>,
+    pub project_id: String,
     pub parent_chain: Vec<String>,
     pub pending_calls: PendingCalls,
     pub agent_call_timeout_sec: u64,
@@ -46,7 +46,7 @@ pub fn available_tools() -> Vec<ToolDefinition> {
                               storage_write_summary, а также функции работы с доской: \
                               call_agent(to_agent, prompt) — синхронный вызов, \
                               post_task(to_agent, prompt) — асинхронный. \
-                              session_id передаётся автоматически из текущей сессии."
+                              session_id и project_id передаются автоматически из текущей сессии."
                     .to_string(),
                 parameters: json!({
                     "type": "object",
@@ -89,9 +89,32 @@ pub fn register_basic_functions(engine: &mut Engine) {
     engine.register_fn("get_weather", |city: String| -> String {
         format!("Погода в городе {}: солнечно, +22°C (заглушка)", city)
     });
+    engine.register_fn("slice", |s: String, start: i64, len: i64| -> String {
+        let chars: Vec<char> = s.chars().collect();
+        let start_idx = if start < 0 {
+            (chars.len() as i64 + start).max(0) as usize
+        } else {
+            start as usize
+        };
+        chars
+            .into_iter()
+            .skip(start_idx)
+            .take(len.max(0) as usize)
+            .collect()
+    });
+    engine.register_fn("join", |arr: rhai::Array, sep: String| -> String {
+        arr.iter()
+            .map(|v| {
+                v.clone()
+                    .try_cast::<rhai::ImmutableString>()
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| v.to_string())
+            })
+            .collect::<Vec<_>>()
+            .join(&sep)
+    });
 }
 
-/// Регистрирует функции работы с доской: post_task и call_agent.
 #[allow(clippy::too_many_arguments)]
 pub fn register_board_functions(
     engine: &mut Engine,
@@ -99,6 +122,7 @@ pub fn register_board_functions(
     board_token: String,
     self_agent_name: String,
     self_session_id: Option<String>,
+    project_id: String,
     parent_chain: Vec<String>,
     pending_calls: PendingCalls,
     agent_call_timeout_sec: u64,
@@ -111,6 +135,7 @@ pub fn register_board_functions(
         let token = board_token.clone();
         let agent = self_agent_name.clone();
         let sess = self_session_id.clone();
+        let pid = project_id.clone();
         let flag = posted_flag.clone();
         let outgoing = outgoing_tasks.clone();
         let chain = parent_chain.clone();
@@ -140,6 +165,7 @@ pub fn register_board_functions(
                     sess.as_deref(),
                     &to_agent,
                     &to_session,
+                    &pid,
                     &prompt,
                     &new_chain,
                 );
@@ -149,6 +175,7 @@ pub fn register_board_functions(
                     let to_a = to_agent.clone();
                     let to_s = to_session.clone();
                     let from_s = sess.clone().unwrap_or_default();
+                    let pid_for_outgoing = pid.clone();
                     let outgoing = outgoing.clone();
                     let chain_for_outgoing = new_chain.clone();
                     handle.block_on(async move {
@@ -160,6 +187,7 @@ pub fn register_board_functions(
                                 session_id: from_s,
                                 to_agent_name: to_a,
                                 to_session_id: to_s,
+                                project_id: pid_for_outgoing,
                                 chain: chain_for_outgoing,
                             },
                         );
@@ -177,6 +205,7 @@ pub fn register_board_functions(
         let token = board_token.clone();
         let agent = self_agent_name.clone();
         let sess = self_session_id.clone();
+        let pid = project_id.clone();
         let pc = pending_calls.clone();
         let timeout_sec = agent_call_timeout_sec;
         let chain = parent_chain.clone();
@@ -206,6 +235,7 @@ pub fn register_board_functions(
                     sess.as_deref(),
                     &to_agent,
                     &to_session,
+                    &pid,
                     &prompt,
                     &new_chain,
                 );
@@ -278,6 +308,7 @@ fn post_task_request(
     from_session: Option<&str>,
     to_agent: &str,
     to_session: &str,
+    project_id: &str,
     prompt: &str,
     chain: &[String],
 ) -> String {
@@ -287,6 +318,7 @@ fn post_task_request(
         "from_session_id": from_session.unwrap_or(""),
         "to_agent": to_agent,
         "to_session_id": to_session,
+        "project_id": project_id,
         "payload": { "prompt": prompt },
         "parent_task_id": null,
         "chain": chain
@@ -436,6 +468,7 @@ pub async fn execute_tool(
     http_client: Option<&reqwest::Client>,
     storage_base_url: &str,
     storage_auth_token: &str,
+    project_id: &str,
     rhai_timeout_sec: u64,
     board_ctx: Option<BoardContext>,
 ) -> String {
@@ -451,12 +484,13 @@ pub async fn execute_tool(
 
             let base_url = storage_base_url.to_string();
             let token = storage_auth_token.to_string();
+            let pid = project_id.to_string();
             let timeout_duration = Duration::from_secs(rhai_timeout_sec);
 
             match tokio::time::timeout(
                 timeout_duration,
                 tokio::task::spawn_blocking(move || {
-                    run_rhai_code(&code, &base_url, &token, board_ctx)
+                    run_rhai_code(&code, &base_url, &token, &pid, board_ctx)
                 }),
             )
             .await
@@ -468,7 +502,14 @@ pub async fn execute_tool(
         }
         "local_storage" => {
             if let Some(client) = http_client {
-                execute_local_storage_tool(client, storage_base_url, storage_auth_token, args).await
+                execute_local_storage_tool(
+                    client,
+                    storage_base_url,
+                    storage_auth_token,
+                    project_id,
+                    args,
+                )
+                .await
             } else {
                 "Ошибка: HTTP-клиент не инициализирован".to_string()
             }
@@ -481,19 +522,25 @@ fn run_rhai_code(
     code: &str,
     storage_base_url: &str,
     storage_auth_token: &str,
+    project_id: &str,
     board_ctx: Option<BoardContext>,
 ) -> String {
     let mut engine = Engine::new();
-    engine.set_max_operations(RHAI_MAX_OPERATIONS);
-    engine.set_max_call_levels(RHAI_MAX_CALL_LEVELS);
-    engine.set_max_string_size(RHAI_MAX_STRING_SIZE);
+    engine.set_max_operations(1_000_000);
+    engine.set_max_call_levels(64);
+    engine.set_max_string_size(1024 * 256);
 
     let output = Rc::new(RefCell::new(String::new()));
     let output_clone = output.clone();
     engine.on_print(move |s| output_clone.borrow_mut().push_str(s));
 
     register_basic_functions(&mut engine);
-    register_storage_functions(&mut engine, storage_base_url, storage_auth_token);
+    register_storage_functions(
+        &mut engine,
+        storage_base_url,
+        storage_auth_token,
+        project_id,
+    );
 
     if let Some(bc) = board_ctx {
         register_board_functions(
@@ -502,6 +549,7 @@ fn run_rhai_code(
             bc.board_token,
             bc.self_agent_name,
             bc.self_session_id,
+            bc.project_id,
             bc.parent_chain,
             bc.pending_calls,
             bc.agent_call_timeout_sec,
@@ -528,12 +576,14 @@ fn storage_request(
     method: Method,
     url: String,
     token: &str,
+    project_id: &str,
     query: Vec<(&str, String)>,
     body: Option<String>,
 ) -> String {
     let mut req = client
         .request(method, &url)
-        .header("Authorization", format!("Bearer {}", token));
+        .header("Authorization", format!("Bearer {}", token))
+        .header("X-NH-Project", project_id);
     if !query.is_empty() {
         req = req.query(&query);
     }
@@ -559,32 +609,39 @@ fn storage_request(
 }
 
 macro_rules! register_storage_fn {
-    ($engine:expr, $client:expr, $base:expr, $token:expr,
+    ($engine:expr, $client:expr, $base:expr, $token:expr, $project:expr,
      $name:expr, $method:expr, $path:expr,
      $($arg:ident : $ty:ty => $q:expr),* $(,)?) => {
         {
             let c = $client.clone();
             let b = $base.clone();
             let t = $token.clone();
+            let p = $project.clone();
             $engine.register_fn($name, move |$($arg: $ty),*| -> String {
                 let mut query = Vec::new();
                 $( query.push($q); )*
-                storage_request(&c, $method, format!("{}{}", b.trim_end_matches('/'), $path), &t, query, None)
+                storage_request(&c, $method, format!("{}{}", b.trim_end_matches('/'), $path), &t, &p, query, None)
             });
         }
     };
 }
 
-pub fn register_storage_functions(engine: &mut Engine, base_url: &str, auth_token: &str) {
+pub fn register_storage_functions(
+    engine: &mut Engine,
+    base_url: &str,
+    auth_token: &str,
+    project_id: &str,
+) {
     let base = if base_url.starts_with("http://") || base_url.starts_with("https://") {
         base_url.to_string()
     } else {
         format!("http://{}", base_url)
     };
     let token = auth_token.to_string();
+    let project = project_id.to_string();
     let client = Client::new();
 
-    register_storage_fn!(engine, client, base, token,
+    register_storage_fn!(engine, client, base, token, project,
         "storage_read_file", Method::GET, "/files",
         path: String => ("path", path));
 
@@ -592,6 +649,7 @@ pub fn register_storage_functions(engine: &mut Engine, base_url: &str, auth_toke
         let c = client.clone();
         let b = base.clone();
         let t = token.clone();
+        let p = project.clone();
         engine.register_fn(
             "storage_write_file",
             move |path: String, content: String| -> String {
@@ -600,6 +658,7 @@ pub fn register_storage_functions(engine: &mut Engine, base_url: &str, auth_toke
                     Method::POST,
                     format!("{}/files", b.trim_end_matches('/')),
                     &t,
+                    &p,
                     vec![("path", path)],
                     Some(content),
                 )
@@ -607,36 +666,36 @@ pub fn register_storage_functions(engine: &mut Engine, base_url: &str, auth_toke
         );
     }
 
-    register_storage_fn!(engine, client, base, token,
+    register_storage_fn!(engine, client, base, token, project,
         "storage_delete_file", Method::DELETE, "/files",
         path: String => ("path", path));
 
-    register_storage_fn!(engine, client, base, token,
+    register_storage_fn!(engine, client, base, token, project,
         "storage_create_dir", Method::POST, "/dirs",
         path: String => ("path", path));
 
-    register_storage_fn!(engine, client, base, token,
+    register_storage_fn!(engine, client, base, token, project,
         "storage_list_dir", Method::GET, "/list",
         path: String => ("path", path));
 
-    register_storage_fn!(engine, client, base, token,
+    register_storage_fn!(engine, client, base, token, project,
         "storage_walk", Method::GET, "/walk",
         path: String => ("path", path));
 
-    register_storage_fn!(engine, client, base, token,
+    register_storage_fn!(engine, client, base, token, project,
         "storage_search_by_name", Method::GET, "/search_name",
         pattern: String => ("pattern", pattern));
 
-    register_storage_fn!(engine, client, base, token,
+    register_storage_fn!(engine, client, base, token, project,
         "storage_search_similar", Method::GET, "/search",
         query: String => ("query", query),
         top_k: i64 => ("top_k", top_k.to_string()));
 
-    register_storage_fn!(engine, client, base, token,
+    register_storage_fn!(engine, client, base, token, project,
         "storage_read_about", Method::GET, "/about",
         path: String => ("path", path));
 
-    register_storage_fn!(engine, client, base, token,
+    register_storage_fn!(engine, client, base, token, project,
         "storage_read_summary", Method::GET, "/summary",
         path: String => ("path", path));
 
@@ -644,6 +703,7 @@ pub fn register_storage_functions(engine: &mut Engine, base_url: &str, auth_toke
         let c = client.clone();
         let b = base.clone();
         let t = token.clone();
+        let p = project.clone();
         engine.register_fn(
             "storage_write_about",
             move |path: String, content: String| -> String {
@@ -652,6 +712,7 @@ pub fn register_storage_functions(engine: &mut Engine, base_url: &str, auth_toke
                     Method::POST,
                     format!("{}/about", b.trim_end_matches('/')),
                     &t,
+                    &p,
                     vec![("path", path)],
                     Some(content),
                 )
@@ -663,6 +724,7 @@ pub fn register_storage_functions(engine: &mut Engine, base_url: &str, auth_toke
         let c = client.clone();
         let b = base.clone();
         let t = token.clone();
+        let p = project.clone();
         engine.register_fn(
             "storage_write_summary",
             move |path: String, content: String| -> String {
@@ -671,6 +733,7 @@ pub fn register_storage_functions(engine: &mut Engine, base_url: &str, auth_toke
                     Method::POST,
                     format!("{}/summary", b.trim_end_matches('/')),
                     &t,
+                    &p,
                     vec![("path", path)],
                     Some(content),
                 )
@@ -683,6 +746,7 @@ async fn execute_local_storage_tool(
     client: &reqwest::Client,
     base_url: &str,
     auth_token: &str,
+    project_id: &str,
     args: &str,
 ) -> String {
     let base_url = if base_url.starts_with("http://") || base_url.starts_with("https://") {
@@ -713,13 +777,16 @@ async fn execute_local_storage_tool(
     let mut request_builder = match action {
         "write_file" | "create_dir" | "write_about" | "write_summary" => client
             .post(&url)
-            .header("Authorization", format!("Bearer {}", auth_token)),
+            .header("Authorization", format!("Bearer {}", auth_token))
+            .header("X-NH-Project", project_id),
         "delete_file" => client
             .delete(&url)
-            .header("Authorization", format!("Bearer {}", auth_token)),
+            .header("Authorization", format!("Bearer {}", auth_token))
+            .header("X-NH-Project", project_id),
         _ => client
             .get(&url)
-            .header("Authorization", format!("Bearer {}", auth_token)),
+            .header("Authorization", format!("Bearer {}", auth_token))
+            .header("X-NH-Project", project_id),
     };
 
     let mut query_params = Vec::new();

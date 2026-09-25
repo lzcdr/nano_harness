@@ -273,7 +273,6 @@ async fn connect_and_listen_chat(
     reply_ctx: &ReplyContext,
 ) -> anyhow::Result<()> {
     let url = format!("{}/events?agent_name=chat", board_url.trim_end_matches('/'));
-    //eprintln!("⏳ Подключаю SSE чата -> {}", url);
     let client = reqwest::Client::new();
     let resp = client
         .get(&url)
@@ -283,7 +282,6 @@ async fn connect_and_listen_chat(
     if !resp.status().is_success() {
         return Err(anyhow::anyhow!("HTTP {}", resp.status()));
     }
-    //eprintln!("🔌 SSE чата подключён");
 
     let mut stream = resp.bytes_stream();
     let mut buffer = String::new();
@@ -406,7 +404,6 @@ async fn handle_chat_result(
     );
     let _ = from_session_id;
 
-    // Освобождаем lock перед продолжением диалога.
     drop(rt);
 
     continue_chat_turn(shared, reply_ctx).await;
@@ -474,21 +471,23 @@ async fn continue_chat_turn(shared: &SharedChat, ctx: &ReplyContext) {
                 continue;
             }
 
-            let (board_ctx, posted_flag) = {
+            let (board_ctx, posted_flag, project_id) = {
                 let rt = shared.lock().await;
                 let pf = Arc::new(AtomicBool::new(false));
+                let pid = rt.project_id.clone();
                 let bctx = BoardContext {
                     board_url: ctx.board_url.clone(),
                     board_token: ctx.board_token.clone(),
                     self_agent_name: "chat".to_string(),
-                    self_session_id: Some(rt.project_id.clone()),
+                    self_session_id: Some(pid.clone()),
+                    project_id: pid.clone(),
                     parent_chain: vec![],
                     pending_calls: rt.pending_calls.clone(),
                     agent_call_timeout_sec: ctx.agent_call_timeout_sec,
                     posted_flag: pf.clone(),
                     outgoing_tasks: rt.outgoing_tasks.clone(),
                 };
-                (bctx, pf)
+                (bctx, pf, pid)
             };
 
             let result = execute_tool(
@@ -497,6 +496,7 @@ async fn continue_chat_turn(shared: &SharedChat, ctx: &ReplyContext) {
                 Some(&ctx.client),
                 &ctx.storage_http_config.bind_addr,
                 &ctx.storage_http_config.auth_token,
+                &project_id,
                 ctx.rhai_timeout_sec,
                 Some(board_ctx),
             )
@@ -746,7 +746,6 @@ async fn main() -> Result<()> {
     let mut input = String::new();
 
     loop {
-        // Печатаем приглашение с текущим проектом.
         let display_name = {
             let rt = shared.lock().await;
             rt.session.display_name.clone()
@@ -1091,14 +1090,12 @@ async fn main() -> Result<()> {
 
         // ==================== Обычный ход ====================
 
-        // Добавляем user-message и логируем.
         {
             let mut rt = shared.lock().await;
             rt.engine.add_message(Role::User, user_input.to_string());
             write_log(&mut rt.log_file, "user", user_input)?;
         }
 
-        // Первый send.
         let response = {
             let mut rt = shared.lock().await;
             match rt.engine.send().await {
@@ -1193,21 +1190,23 @@ async fn main() -> Result<()> {
                 }
 
                 // Собираем BoardContext из текущего чата.
-                let (board_ctx, posted_flag_check) = {
+                let (board_ctx, posted_flag_check, project_id) = {
                     let rt = shared.lock().await;
                     let posted_flag = Arc::new(AtomicBool::new(false));
+                    let pid = rt.project_id.clone();
                     let bctx = BoardContext {
                         board_url: board_url.clone(),
                         board_token: board_token.clone(),
                         self_agent_name: "chat".to_string(),
-                        self_session_id: Some(rt.project_id.clone()),
+                        self_session_id: Some(pid.clone()),
+                        project_id: pid.clone(),
                         parent_chain: vec![],
                         pending_calls: rt.pending_calls.clone(),
                         agent_call_timeout_sec,
                         posted_flag: posted_flag.clone(),
                         outgoing_tasks: rt.outgoing_tasks.clone(),
                     };
-                    (bctx, posted_flag)
+                    (bctx, posted_flag, pid)
                 };
 
                 let result = execute_tool(
@@ -1216,6 +1215,7 @@ async fn main() -> Result<()> {
                     Some(&client),
                     &storage_http_config.bind_addr,
                     &storage_http_config.auth_token,
+                    &project_id,
                     rhai_timeout_sec,
                     Some(board_ctx),
                 )
@@ -1243,8 +1243,6 @@ async fn main() -> Result<()> {
             }
 
             if posted_async {
-                // Сохраняем сессию и продолжаем цикл. Ответ придёт асинхронно через SSE,
-                // и continue_chat_turn доиграет диалог после получения ответа.
                 let mut rt = shared.lock().await;
                 save_current(&mut *rt)?;
                 continue;
@@ -1281,7 +1279,6 @@ async fn main() -> Result<()> {
             }
         }
 
-        // Сохраняем сессию после хода.
         {
             let mut rt = shared.lock().await;
             save_current(&mut *rt)?;

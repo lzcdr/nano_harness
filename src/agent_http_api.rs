@@ -36,9 +36,7 @@ struct AppState {
     context: Arc<AgentContext>,
     auth_token: String,
     sessions: Arc<AsyncMutex<HashMap<String, Arc<AsyncMutex<Session>>>>>,
-    /// Один SSE-листенер на агента. Ключ — имя агента.
     sse_listeners: Arc<AsyncMutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
-    /// Стек входящих task_id на сессию.
     incoming_tasks: Arc<AsyncMutex<HashMap<String, Vec<String>>>>,
 }
 
@@ -103,6 +101,7 @@ async fn persist_session(
                 task_id: t.task_id.clone(),
                 to_agent_name: t.to_agent_name.clone(),
                 to_session_id: t.to_session_id.clone(),
+                project_id: t.project_id.clone(),
                 chain: t.chain.clone(),
             })
             .collect()
@@ -456,6 +455,7 @@ async fn handle_task_created(state: Arc<AppState>, task: crate::message_board::T
         return;
     }
     let session_id = task.to_session_id.clone();
+    let project_id = task.project_id.clone();
     let prompt = task
         .payload
         .get("prompt")
@@ -487,6 +487,7 @@ async fn handle_task_created(state: Arc<AppState>, task: crate::message_board::T
         tools: None,
         system_prompt: None,
         session_id: Some(session_id.clone()),
+        project_id: Some(project_id.clone()),
     };
 
     let parent_chain = task.chain.clone();
@@ -501,6 +502,7 @@ async fn handle_task_created(state: Arc<AppState>, task: crate::message_board::T
         &request,
         log_file,
         Some(session_id.clone()),
+        project_id,
         parent_chain,
     )
     .await;
@@ -531,6 +533,7 @@ async fn handle_task_created(state: Arc<AppState>, task: crate::message_board::T
         }
         Err(e) => {
             drop(guard);
+            eprintln!("❌ Ошибка обработки задачи {}: {:#}", task.id, e);
             let _ = publish_fail(&state, &task.id, &format!("{:#}", e)).await;
         }
     }
@@ -564,6 +567,7 @@ async fn handle_task_result(
     };
 
     let session_id = outgoing.session_id.clone();
+    let project_id = outgoing.project_id.clone();
     let parent_chain = outgoing.chain.clone();
 
     if session_id.is_empty() {
@@ -606,6 +610,7 @@ async fn handle_task_result(
         tools: None,
         system_prompt: None,
         session_id: Some(session_id.clone()),
+        project_id: Some(project_id.clone()),
     };
 
     let Session {
@@ -619,6 +624,7 @@ async fn handle_task_result(
         &request,
         log_file,
         Some(session_id.clone()),
+        project_id,
         parent_chain,
     )
     .await;
@@ -730,7 +736,6 @@ async fn poll_pending_tasks(state: Arc<AppState>) {
         return;
     }
 
-    // Один запрос на все завершённые задачи этого агента.
     let url = format!(
         "{}/tasks?from_agent={}&status=completed,failed",
         state.context.board_base_url.trim_end_matches('/'),
@@ -819,7 +824,11 @@ async fn poll_pending_tasks_loop(state: Arc<AppState>, mut shutdown_rx: watch::R
 
 // ==================== HTTP-обработчики ====================
 
-async fn run_stateful_agent(state: &AppState, request: AgentRequest) -> Response {
+async fn run_stateful_agent(
+    state: &AppState,
+    request: AgentRequest,
+    project_id: String,
+) -> Response {
     let session_id = match request.session_id.clone() {
         Some(id) if !id.trim().is_empty() => id,
         _ => {
@@ -827,8 +836,8 @@ async fn run_stateful_agent(state: &AppState, request: AgentRequest) -> Response
         }
     };
     eprintln!(
-        "📨 HTTP /agent/run: agent='{}', session_id={}",
-        state.config.name, session_id
+        "📨 HTTP /agent/run: agent='{}', session_id={}, project_id={}",
+        state.config.name, session_id, project_id
     );
 
     let state_arc = Arc::new(state.clone());
@@ -863,6 +872,7 @@ async fn run_stateful_agent(state: &AppState, request: AgentRequest) -> Response
         &request,
         log_file,
         Some(sid.clone()),
+        project_id,
         vec![],
     )
     .await
@@ -883,12 +893,23 @@ async fn run_agent_handler(
     State(state): State<AppState>,
     Json(request): Json<AgentRequest>,
 ) -> Response {
+    let project_id = match request.project_id.clone() {
+        Some(p) if !p.trim().is_empty() => p,
+        _ => {
+            return error_response(anyhow::anyhow!(
+                "project_id is required (either in body or via message board task)"
+            ));
+        }
+    };
+
     match state.config.agent_type {
-        AgentType::Stateless => match run_agent(&state.config, &state.context, request).await {
-            Ok(response) => Json(response).into_response(),
-            Err(e) => error_response(e),
-        },
-        AgentType::Stateful => run_stateful_agent(&state, request).await,
+        AgentType::Stateless => {
+            match run_agent(&state.config, &state.context, request, project_id).await {
+                Ok(response) => Json(response).into_response(),
+                Err(e) => error_response(e),
+            }
+        }
+        AgentType::Stateful => run_stateful_agent(&state, request, project_id).await,
     }
 }
 
@@ -913,10 +934,8 @@ pub async fn run_server(config: AgentConfig, context: AgentContext) -> anyhow::R
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     if matches!(config.agent_type, AgentType::Stateful) {
-        // Одно SSE на агента.
         spawn_sse_listener(state_arc.clone());
 
-        // Восстановление pending_tasks из файлов сессий.
         match session_store::list_sessions_for_agent(&config.name) {
             Ok(sessions) => {
                 if sessions.is_empty() {
@@ -937,6 +956,7 @@ pub async fn run_server(config: AgentConfig, context: AgentContext) -> anyhow::R
                                         session_id: s.session_id.clone(),
                                         to_agent_name: pt.to_agent_name.clone(),
                                         to_session_id: pt.to_session_id.clone(),
+                                        project_id: pt.project_id.clone(),
                                         chain: pt.chain.clone(),
                                     },
                                 );

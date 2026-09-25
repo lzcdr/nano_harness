@@ -1,4 +1,4 @@
-// local_storage.rs
+// src/local_storage.rs
 use candle_core::{Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::bert::{BertModel, Config};
@@ -14,9 +14,18 @@ use tokenizers::Tokenizer;
 const STORAGE_BASE: &str = ".local_storage";
 const META_FILE: &str = "vector_meta.json";
 const RESERVED_NAMES: &[&str] = &[".about", ".summary", ".skills", META_FILE];
+pub const SKILLS_PROJECT: &str = "_skills";
+const PROJECTS_DIR: &str = "projects";
 
 pub fn is_reserved_name(name: &str) -> bool {
     RESERVED_NAMES.iter().any(|r| name.eq_ignore_ascii_case(r))
+}
+
+pub fn valid_project_id(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -51,6 +60,8 @@ pub struct ChunkMeta {
     pub embedding: Vec<f32>,
     pub file_size: u64,
     pub modified: u64,
+    #[serde(default)]
+    pub project_id: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -59,9 +70,11 @@ pub struct SearchResult {
     pub chunk_index: u32,
     pub distance: f32,
     pub content_fragment: String,
+    pub project_id: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
 pub enum Entry {
     File {
         name: String,
@@ -170,7 +183,7 @@ impl VectorDb {
                 db.next_id += 1;
                 db.hnsw.insert((&emb, id));
                 db.label_to_id.insert(label.clone(), id);
-                db.id_to_label.insert(id, label.clone()); // ← ДОБАВЛЕНО
+                db.id_to_label.insert(id, label.clone());
                 valid_entries.push((label, meta));
             }
             db.entries = valid_entries;
@@ -298,8 +311,13 @@ impl VectorDb {
         Ok(embeddings.into_iter().next().unwrap_or_default())
     }
 
-    fn index_text(&mut self, file_path: &Path, content: &str) -> io::Result<()> {
-        let label_prefix = format!("{}#", file_path.to_string_lossy());
+    fn index_text(&mut self, project_id: &str, rel_path: &Path, content: &str) -> io::Result<()> {
+        let storage_rel = if project_id == SKILLS_PROJECT {
+            Path::new(".skills").join(rel_path)
+        } else {
+            Path::new(PROJECTS_DIR).join(project_id).join(rel_path)
+        };
+        let label_prefix = format!("{}#", storage_rel.to_string_lossy());
         let mut old_labels = Vec::new();
         for (label, _) in &self.entries {
             if label.starts_with(&label_prefix) {
@@ -309,7 +327,7 @@ impl VectorDb {
         for label in old_labels {
             if let Some(id) = self.label_to_id.remove(&label) {
                 self.deleted_ids.insert(id);
-                self.id_to_label.remove(&id); // ← ДОБАВЛЕНО
+                self.id_to_label.remove(&id);
             }
             self.entries.retain(|(l, _)| l != &label);
         }
@@ -322,13 +340,13 @@ impl VectorDb {
             .collect();
         eprintln!(
             "🔄 Индексация файла {} ({} чанков)...",
-            file_path.display(),
+            storage_rel.display(),
             chunk_texts.len()
         );
 
         let start = std::time::Instant::now();
         let embeddings = self.embed_batch(&chunk_texts)?;
-        let full_path = self.root.join(file_path);
+        let full_path = self.root.join(&storage_rel);
         let (file_size, modified) = match fs::metadata(&full_path) {
             Ok(metadata) => {
                 let modified = metadata
@@ -347,14 +365,14 @@ impl VectorDb {
             .zip(embeddings.into_iter())
             .enumerate()
         {
-            let label = format!("{}#{}", file_path.to_string_lossy(), i);
+            let label = format!("{}#{}", storage_rel.to_string_lossy(), i);
             let id = self.next_id;
             self.next_id += 1;
             self.hnsw.insert((&emb, id));
             self.label_to_id.insert(label.clone(), id);
             self.id_to_label.insert(id, label.clone());
             let meta = ChunkMeta {
-                file_path: file_path.to_path_buf(),
+                file_path: storage_rel.clone(),
                 chunk_index: i as u32,
                 start_byte,
                 end_byte,
@@ -362,6 +380,7 @@ impl VectorDb {
                 embedding: emb,
                 file_size,
                 modified,
+                project_id: project_id.to_string(),
             };
             self.entries.push((label.clone(), meta.clone()));
             self.id_to_meta.insert(id, meta);
@@ -370,24 +389,52 @@ impl VectorDb {
         Ok(())
     }
 
-    fn search(&self, query: &str, top_k: usize) -> io::Result<Vec<SearchResult>> {
+    fn search(
+        &self,
+        project_id: Option<&str>,
+        query: &str,
+        top_k: usize,
+    ) -> io::Result<Vec<SearchResult>> {
         let start = std::time::Instant::now();
         let query_embedding = self.embed_single(query)?;
-        let neighbours = self.hnsw.search(&query_embedding, top_k * 2, top_k * 2);
+
+        let mut ef = (top_k * 8).max(64);
+        let max_ef = self.entries.len().max(64);
+        if ef > max_ef {
+            ef = max_ef;
+        }
+
+        let neighbours = self.hnsw.search(&query_embedding, ef, ef);
         let mut results = Vec::new();
         for neighbour in neighbours {
             let id = neighbour.d_id;
             if self.deleted_ids.contains(&id) {
                 continue;
             }
-            if let Some(meta) = self.id_to_meta.get(&id) {
-                results.push(SearchResult {
-                    file_path: meta.file_path.clone(),
-                    chunk_index: meta.chunk_index,
-                    distance: neighbour.distance,
-                    content_fragment: meta.content.clone(),
-                });
+            let Some(meta) = self.id_to_meta.get(&id) else {
+                continue;
+            };
+            if let Some(pid) = project_id {
+                if meta.project_id != pid {
+                    continue;
+                }
             }
+            let user_path = if meta.project_id == SKILLS_PROJECT {
+                meta.file_path.clone()
+            } else {
+                let prefix = Path::new(PROJECTS_DIR).join(&meta.project_id);
+                meta.file_path
+                    .strip_prefix(&prefix)
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(|_| meta.file_path.clone())
+            };
+            results.push(SearchResult {
+                file_path: user_path,
+                chunk_index: meta.chunk_index,
+                distance: neighbour.distance,
+                content_fragment: meta.content.clone(),
+                project_id: meta.project_id.clone(),
+            });
             if results.len() >= top_k {
                 break;
             }
@@ -410,14 +457,52 @@ impl VectorDb {
         self.deleted_ids.clear();
         self.next_id = 0;
         self.hnsw = Hnsw::new(16, 100_000, 32, 200, DistCosine);
-        let mut files = Vec::new();
-        collect_files(root, &mut files)?;
-        for file in files {
-            if let Ok(content) = fs::read_to_string(&file) {
-                let rel = file.strip_prefix(root).unwrap_or(&file).to_path_buf();
-                self.index_text(&rel, &content)?;
+
+        let projects_root = root.join(PROJECTS_DIR);
+        if projects_root.exists() {
+            let mut files = Vec::new();
+            collect_files(&projects_root, &mut files)?;
+            for file in files {
+                let rel_to_root = match file.strip_prefix(root) {
+                    Ok(p) => p.to_path_buf(),
+                    Err(_) => continue,
+                };
+                let mut comps = rel_to_root.components();
+                if comps.next().map(|c| c.as_os_str()) != Some(std::ffi::OsStr::new(PROJECTS_DIR)) {
+                    continue;
+                }
+                let project_id = match comps.next().and_then(|c| c.as_os_str().to_str()) {
+                    Some(s) => s.to_string(),
+                    None => continue,
+                };
+                let user_rel: PathBuf = comps.collect();
+                if user_rel.as_os_str().is_empty() {
+                    continue;
+                }
+                if let Ok(content) = fs::read_to_string(&file) {
+                    self.index_text(&project_id, &user_rel, &content)?;
+                }
             }
         }
+
+        let skills_root = root.join(".skills");
+        if skills_root.exists() {
+            let mut files = Vec::new();
+            collect_files(&skills_root, &mut files)?;
+            for file in files {
+                let rel = match file.strip_prefix(&skills_root) {
+                    Ok(p) => p.to_path_buf(),
+                    Err(_) => continue,
+                };
+                if rel.as_os_str().is_empty() {
+                    continue;
+                }
+                if let Ok(content) = fs::read_to_string(&file) {
+                    self.index_text(SKILLS_PROJECT, &rel, &content)?;
+                }
+            }
+        }
+
         eprintln!(
             "✅ Полная переиндексация завершена за {:?}",
             start.elapsed()
@@ -426,13 +511,11 @@ impl VectorDb {
     }
 }
 
-// ← ИСПРАВЛЕННАЯ ФУНКЦИЯ ЧАНКИНГА
 fn chunk_text(text: &str, chunk_size: usize, overlap: usize) -> Vec<(String, u64, u64)> {
     if text.is_empty() {
         return vec![];
     }
 
-    // Если весь текст влезает в один чанк, возвращаем его целиком
     if text.len() <= chunk_size {
         return vec![(text.to_string(), 0, text.len() as u64)];
     }
@@ -556,6 +639,10 @@ impl LocalStorage {
         if !root.exists() {
             fs::create_dir_all(&root)?;
         }
+        let projects_root = root.join(PROJECTS_DIR);
+        if !projects_root.exists() {
+            fs::create_dir_all(&projects_root)?;
+        }
         let mut vector_db = VectorDb::load(&root, vector_db_config)?;
         if !root.join(META_FILE).exists() {
             vector_db.rebuild(&root)?;
@@ -564,8 +651,29 @@ impl LocalStorage {
         Ok(Self { root, vector_db })
     }
 
-    fn resolve(&self, path: &str) -> io::Result<PathBuf> {
-        let mut out = PathBuf::new();
+    pub fn ensure_project(&self, project_id: &str) -> io::Result<()> {
+        if !valid_project_id(project_id) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid project_id",
+            ));
+        }
+        let dir = self.root.join(PROJECTS_DIR).join(project_id);
+        if !dir.exists() {
+            fs::create_dir_all(&dir)?;
+        }
+        Self::ensure_system_files(&dir)?;
+        Ok(())
+    }
+
+    fn resolve(&self, project_id: &str, path: &str) -> io::Result<PathBuf> {
+        if !valid_project_id(project_id) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid project_id",
+            ));
+        }
+        let mut out = PathBuf::from(PROJECTS_DIR).join(project_id);
         for c in Path::new(path).components() {
             match c {
                 std::path::Component::Normal(p) => {
@@ -602,14 +710,16 @@ impl LocalStorage {
         Ok(())
     }
 
-    pub fn create_dir(&mut self, path: &str) -> io::Result<()> {
-        let full = self.resolve(path)?;
+    pub fn create_dir(&mut self, project_id: &str, path: &str) -> io::Result<()> {
+        self.ensure_project(project_id)?;
+        let full = self.resolve(project_id, path)?;
         fs::create_dir_all(&full)?;
         Self::ensure_system_files(&full)
     }
 
-    pub fn create_file(&mut self, path: &str, content: &str) -> io::Result<()> {
-        let full = self.resolve(path)?;
+    pub fn create_file(&mut self, project_id: &str, path: &str, content: &str) -> io::Result<()> {
+        self.ensure_project(project_id)?;
+        let full = self.resolve(project_id, path)?;
         if let Some(parent) = full.parent() {
             if !parent.exists() {
                 fs::create_dir_all(parent)?;
@@ -617,23 +727,53 @@ impl LocalStorage {
             Self::ensure_system_files(parent)?;
         }
         fs::write(&full, content)?;
-        let rel_path = full.strip_prefix(&self.root).unwrap_or(&full).to_path_buf();
-        self.vector_db.index_text(&rel_path, content)?;
+        let rel_path = Path::new(path);
+        self.vector_db.index_text(project_id, rel_path, content)?;
         self.vector_db.save(&self.root)?;
         Ok(())
     }
 
-    pub fn write_file(&mut self, path: &str, content: &str) -> io::Result<()> {
-        self.create_file(path, content)
-    }
-    pub fn read_file(&self, path: &str) -> io::Result<String> {
-        fs::read_to_string(self.resolve(path)?)
+    pub fn write_file(&mut self, project_id: &str, path: &str, content: &str) -> io::Result<()> {
+        self.create_file(project_id, path, content)
     }
 
-    pub fn delete_file(&mut self, path: &str) -> io::Result<()> {
-        let full = self.resolve(path)?;
-        let rel_path = full.strip_prefix(&self.root).unwrap_or(&full).to_path_buf();
-        let label_prefix = format!("{}#", rel_path.to_string_lossy());
+    pub fn create_skill_file(&mut self, rel_path: &str, content: &str) -> io::Result<()> {
+        let rel = Path::new(rel_path.trim_start_matches('/'));
+        self.vector_db.index_text(SKILLS_PROJECT, rel, content)?;
+        self.vector_db.save(&self.root)?;
+        Ok(())
+    }
+
+    pub fn delete_skill_index(&mut self, rel_path: &str) -> io::Result<()> {
+        let rel = Path::new(rel_path.trim_start_matches('/'));
+        let storage_rel = Path::new(".skills").join(rel);
+        let label_prefix = format!("{}#", storage_rel.to_string_lossy());
+        let mut old_labels = Vec::new();
+        for (label, _) in &self.vector_db.entries {
+            if label.starts_with(&label_prefix) {
+                old_labels.push(label.clone());
+            }
+        }
+        for label in old_labels {
+            if let Some(id) = self.vector_db.label_to_id.remove(&label) {
+                self.vector_db.deleted_ids.insert(id);
+                self.vector_db.id_to_label.remove(&id);
+                self.vector_db.id_to_meta.remove(&id);
+            }
+            self.vector_db.entries.retain(|(l, _)| l != &label);
+        }
+        self.vector_db.save(&self.root)?;
+        Ok(())
+    }
+
+    pub fn read_file(&self, project_id: &str, path: &str) -> io::Result<String> {
+        fs::read_to_string(self.resolve(project_id, path)?)
+    }
+
+    pub fn delete_file(&mut self, project_id: &str, path: &str) -> io::Result<()> {
+        let full = self.resolve(project_id, path)?;
+        let storage_rel = Path::new(PROJECTS_DIR).join(project_id).join(path);
+        let label_prefix = format!("{}#", storage_rel.to_string_lossy());
         let mut old_labels = Vec::new();
         for (label, _) in &self.vector_db.entries {
             if label.starts_with(&label_prefix) {
@@ -653,8 +793,9 @@ impl LocalStorage {
         Ok(())
     }
 
-    pub fn list(&self, path: &str) -> io::Result<Vec<Entry>> {
-        let full = self.resolve(path)?;
+    pub fn list(&self, project_id: &str, path: &str) -> io::Result<Vec<Entry>> {
+        let full = self.resolve(project_id, path)?;
+        let project_root = self.root.join(PROJECTS_DIR).join(project_id);
         let mut entries = Vec::new();
         for entry in fs::read_dir(full)? {
             let entry = entry?;
@@ -662,7 +803,11 @@ impl LocalStorage {
             if is_reserved_name(&name) {
                 continue;
             }
-            let rel_path = self.relativize(&entry.path());
+            let rel_path = entry
+                .path()
+                .strip_prefix(&project_root)
+                .unwrap_or(&entry.path())
+                .to_path_buf();
             if entry.file_type()?.is_dir() {
                 entries.push(Entry::Dir {
                     name,
@@ -679,14 +824,20 @@ impl LocalStorage {
         Ok(entries)
     }
 
-    pub fn walk(&self, path: &str) -> io::Result<Vec<Entry>> {
-        let full = self.resolve(path)?;
+    pub fn walk(&self, project_id: &str, path: &str) -> io::Result<Vec<Entry>> {
+        let full = self.resolve(project_id, path)?;
+        let project_root = self.root.join(PROJECTS_DIR).join(project_id);
         let mut result = Vec::new();
-        self.recursive_walk(&full, &mut result)?;
+        self.recursive_walk(&project_root, &full, &mut result)?;
         Ok(result)
     }
 
-    fn recursive_walk(&self, base: &Path, out: &mut Vec<Entry>) -> io::Result<()> {
+    fn recursive_walk(
+        &self,
+        project_root: &Path,
+        base: &Path,
+        out: &mut Vec<Entry>,
+    ) -> io::Result<()> {
         for entry in fs::read_dir(base)? {
             let entry = entry?;
             let path = entry.path();
@@ -694,16 +845,17 @@ impl LocalStorage {
             if is_reserved_name(&name) {
                 continue;
             }
+            let rel = path
+                .strip_prefix(project_root)
+                .unwrap_or(&path)
+                .to_path_buf();
             if entry.file_type()?.is_dir() {
-                out.push(Entry::Dir {
-                    name,
-                    path: self.relativize(&path),
-                });
-                self.recursive_walk(&path, out)?;
+                out.push(Entry::Dir { name, path: rel });
+                self.recursive_walk(project_root, &path, out)?;
             } else {
                 out.push(Entry::File {
                     name,
-                    path: self.relativize(&path),
+                    path: rel,
                     size: entry.metadata()?.len(),
                 });
             }
@@ -711,12 +863,8 @@ impl LocalStorage {
         Ok(())
     }
 
-    fn relativize(&self, path: &Path) -> PathBuf {
-        path.strip_prefix(&self.root).unwrap_or(path).to_path_buf()
-    }
-
-    pub fn search_by_name(&self, pattern: &str) -> io::Result<Vec<PathBuf>> {
-        let all = self.walk("")?;
+    pub fn search_by_name(&self, project_id: &str, pattern: &str) -> io::Result<Vec<PathBuf>> {
+        let all = self.walk(project_id, "")?;
         Ok(all
             .into_iter()
             .filter_map(|e| match e {
@@ -733,28 +881,49 @@ impl LocalStorage {
 
     pub fn search_similar(
         &self,
+        project_id: Option<&str>,
         query: &str,
         top_k: Option<usize>,
     ) -> io::Result<Vec<SearchResult>> {
-        self.vector_db
-            .search(query, top_k.unwrap_or(self.vector_db.config.top_k))
+        self.vector_db.search(
+            project_id,
+            query,
+            top_k.unwrap_or(self.vector_db.config.top_k),
+        )
     }
 
-    pub fn write_about(&mut self, dir_path: &str, content: &str) -> io::Result<()> {
-        fs::write(self.resolve(dir_path)?.join(".about"), content)
+    pub fn write_about(
+        &mut self,
+        project_id: &str,
+        dir_path: &str,
+        content: &str,
+    ) -> io::Result<()> {
+        self.ensure_project(project_id)?;
+        fs::write(self.resolve(project_id, dir_path)?.join(".about"), content)
     }
-    pub fn read_about(&self, dir_path: &str) -> io::Result<String> {
-        fs::read_to_string(self.resolve(dir_path)?.join(".about"))
+
+    pub fn read_about(&self, project_id: &str, dir_path: &str) -> io::Result<String> {
+        fs::read_to_string(self.resolve(project_id, dir_path)?.join(".about"))
     }
-    pub fn write_summary(&mut self, dir_path: &str, content: &str) -> io::Result<()> {
-        fs::write(self.resolve(dir_path)?.join(".summary"), content)
+
+    pub fn write_summary(
+        &mut self,
+        project_id: &str,
+        dir_path: &str,
+        content: &str,
+    ) -> io::Result<()> {
+        self.ensure_project(project_id)?;
+        fs::write(
+            self.resolve(project_id, dir_path)?.join(".summary"),
+            content,
+        )
     }
-    pub fn read_summary(&self, dir_path: &str) -> io::Result<String> {
-        fs::read_to_string(self.resolve(dir_path)?.join(".summary"))
+
+    pub fn read_summary(&self, project_id: &str, dir_path: &str) -> io::Result<String> {
+        fs::read_to_string(self.resolve(project_id, dir_path)?.join(".summary"))
     }
 }
 
-// ← ВОССТАНОВЛЕННЫЕ ТЕСТЫ
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -778,6 +947,7 @@ mod tests {
             return;
         }
         let storage_name = "test_storage";
+        let project = "test_project";
         let mut storage = LocalStorage::new(storage_name, default_config()).unwrap();
         let rust_text = "Rust — это язык системного программирования с безопасной работой с памятью. Он предотвращает гонки данных и утечки памяти благодаря строгой системе владения. Rust отлично подходит для создания надёжного и быстрого программного обеспечения. Многие компании выбирают Rust для системных сервисов, встроенных устройств и веб-разработки. Синтаксис Rust напоминает C++, но семантика гораздо безопаснее.";
         let cooking_text = "Борщ — традиционный украинский суп. Основные ингредиенты: свекла, капуста, картофель, морковь, лук, томатная паста и чеснок. Свеклу обычно тушат отдельно с уксусом для сохранения цвета. Борщ подают со сметаной и зеленью. Это сытное и ароматное блюдо, которое согревает в холодное время года. Рецепт передаётся из поколения в поколение.";
@@ -788,12 +958,14 @@ mod tests {
         rust_content.truncate(1024);
         cooking_content.truncate(1024);
         travel_content.truncate(1024);
-        storage.create_file("docs/rust.txt", &rust_content).unwrap();
         storage
-            .create_file("docs/cooking.txt", &cooking_content)
+            .create_file(project, "docs/rust.txt", &rust_content)
             .unwrap();
         storage
-            .create_file("docs/travel.txt", &travel_content)
+            .create_file(project, "docs/cooking.txt", &cooking_content)
+            .unwrap();
+        storage
+            .create_file(project, "docs/travel.txt", &travel_content)
             .unwrap();
 
         let queries = [
@@ -806,7 +978,9 @@ mod tests {
         ];
         for (query, expected_file) in queries.iter() {
             let start = Instant::now();
-            let results = storage.search_similar(query, Some(3)).unwrap();
+            let results = storage
+                .search_similar(Some(project), query, Some(3))
+                .unwrap();
             let elapsed = start.elapsed();
             println!("\nЗапрос: '{}'", query);
             println!("Время поиска: {:?}", elapsed);
