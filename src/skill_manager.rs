@@ -51,11 +51,10 @@ fn skill_path(relative: &str) -> String {
 }
 
 fn load_catalog(client: &Client, base_url: &str, auth_token: &str) -> Result<SkillCatalog> {
-    let url = format!("{}/files", base_url.trim_end_matches('/'));
-    let catalog_path = skill_path("skills_catalog.json");
+    let url = format!("{}/skills/get", base_url.trim_end_matches('/'));
     let resp = client
         .get(&url)
-        .query(&[("path", &catalog_path)])
+        .query(&[("path", "skills_catalog.json")])
         .header("Authorization", format!("Bearer {}", auth_token))
         .send()?;
     if resp.status().is_success() {
@@ -76,11 +75,10 @@ fn save_catalog(
     auth_token: &str,
 ) -> Result<()> {
     let json = serde_json::to_string_pretty(catalog)?;
-    let url = format!("{}/files", base_url.trim_end_matches('/'));
-    let catalog_path = skill_path("skills_catalog.json");
+    let url = format!("{}/skills/put", base_url.trim_end_matches('/'));
     client
         .post(&url)
-        .query(&[("path", &catalog_path)])
+        .query(&[("path", "skills_catalog.json")])
         .header("Authorization", format!("Bearer {}", auth_token))
         .body(json)
         .send()?;
@@ -94,11 +92,10 @@ fn write_file(
     path: &str,
     content: &str,
 ) -> Result<()> {
-    let url = format!("{}/files", base_url.trim_end_matches('/'));
-    let full_path = skill_path(path);
+    let url = format!("{}/skills/put", base_url.trim_end_matches('/'));
     client
         .post(&url)
-        .query(&[("path", &full_path)])
+        .query(&[("path", path)])
         .header("Authorization", format!("Bearer {}", auth_token))
         .body(content.to_string())
         .send()?;
@@ -106,11 +103,10 @@ fn write_file(
 }
 
 fn read_file(client: &Client, base_url: &str, auth_token: &str, path: &str) -> Result<String> {
-    let url = format!("{}/files", base_url.trim_end_matches('/'));
-    let full_path = skill_path(path);
+    let url = format!("{}/skills/get", base_url.trim_end_matches('/'));
     let resp = client
         .get(&url)
-        .query(&[("path", &full_path)])
+        .query(&[("path", path)])
         .header("Authorization", format!("Bearer {}", auth_token))
         .send()?;
     if resp.status().is_success() {
@@ -166,7 +162,7 @@ pub fn search_best_skill(
     }
 
     // 3. Семантический поиск по промптам
-    let search_url = format!("{}/search", base_url.trim_end_matches('/'));
+    let search_url = format!("{}/skills/search", base_url.trim_end_matches('/'));
     let top_k_str = (top_k * 2).to_string();
     let resp = client
         .get(&search_url)
@@ -240,6 +236,7 @@ pub fn load_skill(
 pub enum SaveSkillOutcome {
     Saved,
     SkippedTooShort { actual: usize, min: usize },
+    SkippedDuplicate,
 }
 
 pub fn save_skill(
@@ -264,6 +261,16 @@ pub fn save_skill(
     let ast_hash = compute_ast_hash(rhai_code);
     if ast_hash.is_empty() {
         return Err(anyhow::anyhow!("Invalid Rhai code"));
+    }
+
+    let mut catalog = load_catalog(client, base_url, auth_token)?;
+
+    if catalog
+        .skills
+        .iter()
+        .any(|r| r.agent_name == agent_name && r.ast_hash == ast_hash)
+    {
+        return Ok(SaveSkillOutcome::SkippedDuplicate);
     }
 
     let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
@@ -296,7 +303,6 @@ pub fn save_skill(
     write_file(client, base_url, auth_token, &description_file, description)?;
     write_file(client, base_url, auth_token, &prompt_file, prompt)?;
 
-    let mut catalog = load_catalog(client, base_url, auth_token)?;
     catalog.skills.push(SkillRecord {
         skill_file,
         description_file,

@@ -59,6 +59,81 @@ impl FileStorage {
         Ok(self.root.join(out))
     }
 
+    fn resolve_skill(&self, path: &str) -> std::io::Result<std::path::PathBuf> {
+        let mut out = std::path::PathBuf::from(".skills");
+        for c in std::path::Path::new(path).components() {
+            match c {
+                std::path::Component::Normal(p) => {
+                    let s = p.to_str().unwrap_or("");
+                    if crate::local_storage::is_reserved_name(s) {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            "path refers to reserved file",
+                        ));
+                    }
+                    out.push(p)
+                }
+                std::path::Component::CurDir => {}
+                std::path::Component::RootDir => {}
+                std::path::Component::ParentDir | std::path::Component::Prefix(_) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "path escapes skills root",
+                    ));
+                }
+            }
+        }
+        Ok(self.root.join(out))
+    }
+
+    async fn read_skill_file(&self, path: &str) -> std::io::Result<String> {
+        tokio::fs::read_to_string(self.resolve_skill(path)?).await
+    }
+
+    async fn write_skill_file(&self, path: &str, content: &str) -> std::io::Result<()> {
+        let full = self.resolve_skill(path)?;
+        if let Some(parent) = full.parent() {
+            if !parent.exists() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+        }
+        tokio::fs::write(&full, content).await
+    }
+
+    async fn delete_skill_file(&self, path: &str) -> std::io::Result<()> {
+        tokio::fs::remove_file(self.resolve_skill(path)?).await
+    }
+
+    async fn list_skill_dir(
+        &self,
+        path: &str,
+    ) -> std::io::Result<Vec<crate::local_storage::Entry>> {
+        let full = self.resolve_skill(path)?;
+        let mut entries = Vec::new();
+        let mut dir = tokio::fs::read_dir(full).await?;
+        while let Some(entry) = dir.next_entry().await? {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let rel_path = entry
+                .path()
+                .strip_prefix(&self.root)
+                .unwrap_or(&entry.path())
+                .to_path_buf();
+            if entry.file_type().await?.is_dir() {
+                entries.push(crate::local_storage::Entry::Dir {
+                    name,
+                    path: rel_path,
+                });
+            } else {
+                entries.push(crate::local_storage::Entry::File {
+                    name,
+                    path: rel_path,
+                    size: entry.metadata().await?.len(),
+                });
+            }
+        }
+        Ok(entries)
+    }
+
     fn ensure_system_files(dir: &std::path::Path) -> std::io::Result<()> {
         let about = dir.join(".about");
         if !about.exists() {
@@ -176,6 +251,7 @@ impl FileStorage {
 struct SearchTask {
     query: String,
     top_k: Option<usize>,
+    filter_reserved: bool,
     response_tx:
         tokio::sync::oneshot::Sender<std::io::Result<Vec<crate::local_storage::SearchResult>>>,
 }
@@ -294,6 +370,7 @@ async fn search_similar(
         .send(SearchTask {
             query: query.query.clone(),
             top_k: query.top_k,
+            filter_reserved: true,
             response_tx: tx,
         })
         .await
@@ -330,6 +407,84 @@ async fn search_by_name(
             Json(results).into_response()
         }
         Err(e) => io_error_response(e),
+    }
+}
+
+async fn skill_get(State(state): State<AppState>, Query(query): Query<PathQuery>) -> Response {
+    match state.files.read().await.read_skill_file(&query.path).await {
+        Ok(content) => (StatusCode::OK, content).into_response(),
+        Err(e) => io_error_response(e),
+    }
+}
+
+async fn skill_put(
+    State(state): State<AppState>,
+    Query(query): Query<PathQuery>,
+    body: String,
+) -> Response {
+    let path = query.path.clone();
+    let content = body.clone();
+    match state
+        .files
+        .read()
+        .await
+        .write_skill_file(&path, &content)
+        .await
+    {
+        Ok(_) => {
+            let index_path = format!(".skills/{}", path.trim_start_matches('/'));
+            let _ = state
+                .index_tx
+                .send(IndexTask {
+                    path: std::path::PathBuf::from(index_path),
+                    content,
+                })
+                .await;
+            StatusCode::OK.into_response()
+        }
+        Err(e) => io_error_response(e),
+    }
+}
+
+async fn skill_delete(State(state): State<AppState>, Query(query): Query<PathQuery>) -> Response {
+    match state
+        .files
+        .read()
+        .await
+        .delete_skill_file(&query.path)
+        .await
+    {
+        Ok(_) => StatusCode::OK.into_response(),
+        Err(e) => io_error_response(e),
+    }
+}
+
+async fn skill_list(State(state): State<AppState>, Query(query): Query<PathQuery>) -> Response {
+    match state.files.read().await.list_skill_dir(&query.path).await {
+        Ok(entries) => Json(entries).into_response(),
+        Err(e) => io_error_response(e),
+    }
+}
+
+async fn skill_search(State(state): State<AppState>, Query(query): Query<SearchQuery>) -> Response {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    if state
+        .search_tx
+        .send(SearchTask {
+            query: query.query.clone(),
+            top_k: query.top_k,
+            filter_reserved: false,
+            response_tx: tx,
+        })
+        .await
+        .is_err()
+    {
+        return (StatusCode::SERVICE_UNAVAILABLE, "Search queue closed").into_response();
+    }
+    match rx.await {
+        Ok(Ok(results)) => Json(results).into_response(),
+        Ok(Err(e)) => io_error_response(e),
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Search task cancelled").into_response(),
     }
 }
 
@@ -416,7 +571,16 @@ pub async fn run_server(
             loop {
                 tokio::select! {
                     Some(task) = search_rx.recv() => {
-                        let result = storage.search_similar(&task.query, task.top_k);
+                        let mut result = storage.search_similar(&task.query, task.top_k);
+                        if task.filter_reserved {
+                            if let Ok(ref mut list) = result {
+                                list.retain(|r| {
+                                    !r.file_path
+                                        .components()
+                                        .any(|c| c.as_os_str() == ".skills")
+                                });
+                            }
+                        }
                         let _ = task.response_tx.send(result);
                     }
                     Some(task) = index_rx.recv() => {
@@ -449,6 +613,11 @@ pub async fn run_server(
         .route("/search_name", get(search_by_name))
         .route("/about", get(read_about).post(write_about))
         .route("/summary", get(read_summary).post(write_summary))
+        .route("/skills/get", get(skill_get))
+        .route("/skills/put", post(skill_put))
+        .route("/skills/delete", post(skill_delete))
+        .route("/skills/list", get(skill_list))
+        .route("/skills/search", get(skill_search))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,

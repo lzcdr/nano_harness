@@ -550,6 +550,10 @@ pub async fn process_agent_turns(
                                 &format!("{} ({} < {})", skill_name_for_log, actual, min),
                             )?;
                         }
+                        crate::skill_manager::SaveSkillOutcome::SkippedDuplicate => {
+                            write_log(log_file, "skill_skipped_duplicate", &skill_name_for_log)?;
+                            eprintln!("♻️ Скилл пропущен (дубликат): {}", skill_name_for_log);
+                        }
                     }
                 }
             }

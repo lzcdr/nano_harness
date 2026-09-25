@@ -13,7 +13,7 @@ use tokenizers::Tokenizer;
 
 const STORAGE_BASE: &str = ".local_storage";
 const META_FILE: &str = "vector_meta.json";
-const RESERVED_NAMES: &[&str] = &[".about", ".summary", META_FILE];
+const RESERVED_NAMES: &[&str] = &[".about", ".summary", ".skills", META_FILE];
 
 pub fn is_reserved_name(name: &str) -> bool {
     RESERVED_NAMES.iter().any(|r| name.eq_ignore_ascii_case(r))
