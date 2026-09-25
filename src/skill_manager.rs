@@ -17,10 +17,10 @@ const SKILLS_DIR: &str = ".skills";
 pub struct SkillRecord {
     pub skill_file: String,
     pub description_file: String,
-    pub prompt_file: String, // новое поле: файл с исходным промптом
+    pub prompt_file: String,
     pub agent_name: String,
     pub description: String,
-    pub prompt: String, // новое поле: исходный промпт
+    pub prompt: String,
     pub success_count: u32,
     pub fail_count: u32,
     pub ast_hash: String,
@@ -48,6 +48,10 @@ fn normalize_skill_name(name: &str) -> String {
 
 fn skill_path(relative: &str) -> String {
     format!("{}/{}", SKILLS_DIR, relative.trim_start_matches('/'))
+}
+
+fn normalize_path(s: &str) -> String {
+    s.replace('\\', "/")
 }
 
 fn load_catalog(client: &Client, base_url: &str, auth_token: &str) -> Result<SkillCatalog> {
@@ -147,21 +151,24 @@ pub fn search_best_skill(
     semantic_threshold: f32,
     top_k: usize,
 ) -> Result<Option<(SkillRecord, f32)>> {
-    // 1. Загружаем каталог
     let catalog = load_catalog(client, base_url, auth_token)?;
+    eprintln!(
+        "🔍 search_best_skill: agent={}, catalog_size={}, threshold={}",
+        current_agent,
+        catalog.skills.len(),
+        semantic_threshold
+    );
     if catalog.skills.is_empty() {
+        eprintln!("🔍 search_best_skill: catalog пуст, возвращаю None");
         return Ok(None);
     }
 
-    // 2. Строим карту: ключ = полный путь с префиксом ".skills/"
-    //    Значение = запись каталога
     let mut prompt_file_to_record: HashMap<String, SkillRecord> = HashMap::new();
     for rec in &catalog.skills {
-        let key = skill_path(&rec.prompt_file);
+        let key = normalize_path(&skill_path(&rec.prompt_file));
         prompt_file_to_record.insert(key, rec.clone());
     }
 
-    // 3. Семантический поиск по промптам
     let search_url = format!("{}/skills/search", base_url.trim_end_matches('/'));
     let top_k_str = (top_k * 2).to_string();
     let resp = client
@@ -169,12 +176,16 @@ pub fn search_best_skill(
         .query(&[("query", prompt), ("top_k", &top_k_str)])
         .header("Authorization", format!("Bearer {}", auth_token))
         .send()?;
+    eprintln!("🔍 search_best_skill: HTTP {}", resp.status());
     if !resp.status().is_success() {
         return Err(anyhow::anyhow!("Search request failed"));
     }
     let results: Vec<serde_json::Value> = resp.json()?;
+    eprintln!(
+        "🔍 search_best_skill: получено {} результатов",
+        results.len()
+    );
 
-    // 4. Отбираем кандидатов: только файлы промптов, расстояние меньше порога
     let mut own_candidates: Vec<(SkillRecord, f32)> = Vec::new();
     let mut all_candidates: Vec<(SkillRecord, f32)> = Vec::new();
 
@@ -182,13 +193,16 @@ pub fn search_best_skill(
         let file_path = item.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
         let distance = item.get("distance").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
 
-        // Игнорируем слишком далёкие
         if distance > semantic_threshold {
+            eprintln!(
+                "🔍   пропуск {}: distance {:.4} > threshold {}",
+                file_path, distance, semantic_threshold
+            );
             continue;
         }
 
-        // Проверяем, есть ли в каталоге запись с таким путём к промпту
-        if let Some(rec) = prompt_file_to_record.get(file_path) {
+        let file_path_norm = normalize_path(file_path);
+        if let Some(rec) = prompt_file_to_record.get(&file_path_norm) {
             if rec.agent_name == current_agent {
                 own_candidates.push((rec.clone(), distance));
             }
@@ -196,12 +210,16 @@ pub fn search_best_skill(
         }
     }
 
-    // 5. Сначала пробуем выбрать среди своих скиллов
+    eprintln!(
+        "🔍 search_best_skill: own_candidates={}, all_candidates={}",
+        own_candidates.len(),
+        all_candidates.len()
+    );
+
     if let Some(best_own) = select_best_by_success_rate(&own_candidates) {
         return Ok(Some(best_own));
     }
 
-    // 6. Если своих нет, выбираем среди всех
     let best_all = select_best_by_success_rate(&all_candidates);
     Ok(best_all)
 }

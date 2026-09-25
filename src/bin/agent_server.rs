@@ -46,6 +46,27 @@ async fn main() -> anyhow::Result<()> {
         agent_config.auth_token = std::env::var(&key).unwrap_or_default();
     }
 
+    if agent_config.api_key.is_empty() {
+        agent_config.api_key = std::env::var("POLZA_API_KEY")
+            .ok()
+            .or_else(|| config.api_key.clone())
+            .unwrap_or_default();
+    }
+
+    if agent_config.base_url.is_empty() {
+        agent_config.base_url = config
+            .base_url
+            .clone()
+            .unwrap_or_else(|| "https://polza.ai/api/v1".to_string());
+    }
+
+    if agent_config.model.is_empty() {
+        agent_config.model = config
+            .model
+            .clone()
+            .unwrap_or_else(|| "openai/gpt-4o".to_string());
+    }
+
     let mut storage_config = config
         .local_storage_http_server
         .as_ref()

@@ -1,7 +1,7 @@
 // src/local_storage_http_api.rs
 use axum::{
-    extract::{Query, State},
-    http::{HeaderMap, StatusCode},
+    extract::{FromRequestParts, Query, State},
+    http::{request::Parts, HeaderMap, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -11,7 +11,7 @@ use serde::Deserialize;
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 
-use crate::local_storage::{LocalStorage, VectorDbConfig};
+use crate::local_storage::{valid_project_id, LocalStorage, VectorDbConfig, SKILLS_PROJECT};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct LocalStorageServerConfig {
@@ -25,6 +25,8 @@ struct AppState {
     files: Arc<RwLock<FileStorage>>,
     search_tx: mpsc::Sender<SearchTask>,
     index_tx: mpsc::Sender<IndexTask>,
+    skill_index_tx: mpsc::Sender<SkillIndexTask>,
+    skill_delete_tx: mpsc::Sender<SkillDeleteTask>,
     auth_token: String,
 }
 
@@ -33,8 +35,14 @@ struct FileStorage {
 }
 
 impl FileStorage {
-    fn resolve(&self, path: &str) -> std::io::Result<std::path::PathBuf> {
-        let mut out = std::path::PathBuf::new();
+    fn resolve(&self, project_id: &str, path: &str) -> std::io::Result<std::path::PathBuf> {
+        if !valid_project_id(project_id) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid project_id",
+            ));
+        }
+        let mut out = std::path::PathBuf::from("projects").join(project_id);
         for c in std::path::Path::new(path).components() {
             match c {
                 std::path::Component::Normal(p) => {
@@ -86,6 +94,173 @@ impl FileStorage {
         Ok(self.root.join(out))
     }
 
+    fn ensure_system_files(dir: &std::path::Path) -> std::io::Result<()> {
+        let about = dir.join(".about");
+        if !about.exists() {
+            std::fs::write(&about, "")?;
+        }
+        let summary = dir.join(".summary");
+        if !summary.exists() {
+            std::fs::write(&summary, "")?;
+        }
+        Ok(())
+    }
+
+    async fn ensure_project(&self, project_id: &str) -> std::io::Result<()> {
+        if !valid_project_id(project_id) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid project_id",
+            ));
+        }
+        let dir = self.root.join("projects").join(project_id);
+        if !dir.exists() {
+            tokio::fs::create_dir_all(&dir).await?;
+        }
+        Self::ensure_system_files(&dir)?;
+        Ok(())
+    }
+
+    async fn create_dir(&self, project_id: &str, path: &str) -> std::io::Result<()> {
+        self.ensure_project(project_id).await?;
+        let full = self.resolve(project_id, path)?;
+        tokio::fs::create_dir_all(&full).await?;
+        Self::ensure_system_files(&full)
+    }
+
+    async fn create_file(
+        &self,
+        project_id: &str,
+        path: &str,
+        content: &str,
+    ) -> std::io::Result<()> {
+        self.ensure_project(project_id).await?;
+        let full = self.resolve(project_id, path)?;
+        if let Some(parent) = full.parent() {
+            if !parent.exists() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+            Self::ensure_system_files(parent)?;
+        }
+        tokio::fs::write(&full, content).await?;
+        Ok(())
+    }
+
+    async fn read_file(&self, project_id: &str, path: &str) -> std::io::Result<String> {
+        tokio::fs::read_to_string(self.resolve(project_id, path)?).await
+    }
+
+    async fn delete_file(&self, project_id: &str, path: &str) -> std::io::Result<()> {
+        tokio::fs::remove_file(self.resolve(project_id, path)?).await
+    }
+
+    async fn list(
+        &self,
+        project_id: &str,
+        path: &str,
+    ) -> std::io::Result<Vec<crate::local_storage::Entry>> {
+        let full = self.resolve(project_id, path)?;
+        let project_root = self.root.join("projects").join(project_id);
+        let mut entries = Vec::new();
+        let mut dir = tokio::fs::read_dir(full).await?;
+        while let Some(entry) = dir.next_entry().await? {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if crate::local_storage::is_reserved_name(&name) {
+                continue;
+            }
+            let rel_path = entry
+                .path()
+                .strip_prefix(&project_root)
+                .unwrap_or(&entry.path())
+                .to_path_buf();
+            if entry.file_type().await?.is_dir() {
+                entries.push(crate::local_storage::Entry::Dir {
+                    name,
+                    path: rel_path,
+                });
+            } else {
+                entries.push(crate::local_storage::Entry::File {
+                    name,
+                    path: rel_path,
+                    size: entry.metadata().await?.len(),
+                });
+            }
+        }
+        Ok(entries)
+    }
+
+    async fn walk(
+        &self,
+        project_id: &str,
+        path: &str,
+    ) -> std::io::Result<Vec<crate::local_storage::Entry>> {
+        let full = self.resolve(project_id, path)?;
+        let project_root = self.root.join("projects").join(project_id);
+        let mut result = Vec::new();
+        let mut stack = vec![full];
+
+        while let Some(current_dir) = stack.pop() {
+            let mut dir = tokio::fs::read_dir(&current_dir).await?;
+            while let Some(entry) = dir.next_entry().await? {
+                let path = entry.path();
+                let name = entry.file_name().to_string_lossy().to_string();
+                if crate::local_storage::is_reserved_name(&name) {
+                    continue;
+                }
+                let rel = path
+                    .strip_prefix(&project_root)
+                    .unwrap_or(&path)
+                    .to_path_buf();
+                if entry.file_type().await?.is_dir() {
+                    result.push(crate::local_storage::Entry::Dir {
+                        name: name.clone(),
+                        path: rel,
+                    });
+                    stack.push(path);
+                } else {
+                    result.push(crate::local_storage::Entry::File {
+                        name,
+                        path: rel,
+                        size: entry.metadata().await?.len(),
+                    });
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    async fn read_about(&self, project_id: &str, dir_path: &str) -> std::io::Result<String> {
+        tokio::fs::read_to_string(self.resolve(project_id, dir_path)?.join(".about")).await
+    }
+
+    async fn write_about(
+        &self,
+        project_id: &str,
+        dir_path: &str,
+        content: &str,
+    ) -> std::io::Result<()> {
+        self.ensure_project(project_id).await?;
+        tokio::fs::write(self.resolve(project_id, dir_path)?.join(".about"), content).await
+    }
+
+    async fn read_summary(&self, project_id: &str, dir_path: &str) -> std::io::Result<String> {
+        tokio::fs::read_to_string(self.resolve(project_id, dir_path)?.join(".summary")).await
+    }
+
+    async fn write_summary(
+        &self,
+        project_id: &str,
+        dir_path: &str,
+        content: &str,
+    ) -> std::io::Result<()> {
+        self.ensure_project(project_id).await?;
+        tokio::fs::write(
+            self.resolve(project_id, dir_path)?.join(".summary"),
+            content,
+        )
+        .await
+    }
+
     async fn read_skill_file(&self, path: &str) -> std::io::Result<String> {
         tokio::fs::read_to_string(self.resolve_skill(path)?).await
     }
@@ -109,13 +284,14 @@ impl FileStorage {
         path: &str,
     ) -> std::io::Result<Vec<crate::local_storage::Entry>> {
         let full = self.resolve_skill(path)?;
+        let skills_root = self.root.join(".skills");
         let mut entries = Vec::new();
         let mut dir = tokio::fs::read_dir(full).await?;
         while let Some(entry) = dir.next_entry().await? {
             let name = entry.file_name().to_string_lossy().to_string();
             let rel_path = entry
                 .path()
-                .strip_prefix(&self.root)
+                .strip_prefix(&skills_root)
                 .unwrap_or(&entry.path())
                 .to_path_buf();
             if entry.file_type().await?.is_dir() {
@@ -133,133 +309,57 @@ impl FileStorage {
         }
         Ok(entries)
     }
-
-    fn ensure_system_files(dir: &std::path::Path) -> std::io::Result<()> {
-        let about = dir.join(".about");
-        if !about.exists() {
-            std::fs::write(&about, "")?;
-        }
-        let summary = dir.join(".summary");
-        if !summary.exists() {
-            std::fs::write(&summary, "")?;
-        }
-        Ok(())
-    }
-
-    async fn create_dir(&self, path: &str) -> std::io::Result<()> {
-        let full = self.resolve(path)?;
-        tokio::fs::create_dir_all(&full).await?;
-        Self::ensure_system_files(&full)
-    }
-
-    async fn create_file(&self, path: &str, content: &str) -> std::io::Result<()> {
-        let full = self.resolve(path)?;
-        if let Some(parent) = full.parent() {
-            if !parent.exists() {
-                tokio::fs::create_dir_all(parent).await?;
-            }
-            Self::ensure_system_files(parent)?;
-        }
-        tokio::fs::write(&full, content).await?;
-        Ok(())
-    }
-
-    async fn read_file(&self, path: &str) -> std::io::Result<String> {
-        tokio::fs::read_to_string(self.resolve(path)?).await
-    }
-    async fn delete_file(&self, path: &str) -> std::io::Result<()> {
-        tokio::fs::remove_file(self.resolve(path)?).await
-    }
-
-    async fn list(&self, path: &str) -> std::io::Result<Vec<crate::local_storage::Entry>> {
-        let full = self.resolve(path)?;
-        let mut entries = Vec::new();
-        let mut dir = tokio::fs::read_dir(full).await?;
-        while let Some(entry) = dir.next_entry().await? {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if crate::local_storage::is_reserved_name(&name) {
-                continue;
-            }
-            let rel_path = self.relativize(&entry.path());
-            if entry.file_type().await?.is_dir() {
-                entries.push(crate::local_storage::Entry::Dir {
-                    name,
-                    path: rel_path,
-                });
-            } else {
-                entries.push(crate::local_storage::Entry::File {
-                    name,
-                    path: rel_path,
-                    size: entry.metadata().await?.len(),
-                });
-            }
-        }
-        Ok(entries)
-    }
-
-    // Итеративный обход вместо рекурсивного async (избегает ошибки E0733)
-    async fn walk(&self, path: &str) -> std::io::Result<Vec<crate::local_storage::Entry>> {
-        let full = self.resolve(path)?;
-        let mut result = Vec::new();
-        let mut stack = vec![full];
-
-        while let Some(current_dir) = stack.pop() {
-            let mut dir = tokio::fs::read_dir(&current_dir).await?;
-            while let Some(entry) = dir.next_entry().await? {
-                let path = entry.path();
-                let name = entry.file_name().to_string_lossy().to_string();
-                if crate::local_storage::is_reserved_name(&name) {
-                    continue;
-                }
-                if entry.file_type().await?.is_dir() {
-                    result.push(crate::local_storage::Entry::Dir {
-                        name: name.clone(),
-                        path: self.relativize(&path),
-                    });
-                    stack.push(path);
-                } else {
-                    result.push(crate::local_storage::Entry::File {
-                        name,
-                        path: self.relativize(&path),
-                        size: entry.metadata().await?.len(),
-                    });
-                }
-            }
-        }
-        Ok(result)
-    }
-
-    fn relativize(&self, path: &std::path::Path) -> std::path::PathBuf {
-        path.strip_prefix(&self.root).unwrap_or(path).to_path_buf()
-    }
-
-    async fn read_about(&self, dir_path: &str) -> std::io::Result<String> {
-        tokio::fs::read_to_string(self.resolve(dir_path)?.join(".about")).await
-    }
-    async fn write_about(&self, dir_path: &str, content: &str) -> std::io::Result<()> {
-        tokio::fs::write(self.resolve(dir_path)?.join(".about"), content).await
-    }
-    async fn read_summary(&self, dir_path: &str) -> std::io::Result<String> {
-        tokio::fs::read_to_string(self.resolve(dir_path)?.join(".summary")).await
-    }
-    async fn write_summary(&self, dir_path: &str, content: &str) -> std::io::Result<()> {
-        tokio::fs::write(self.resolve(dir_path)?.join(".summary"), content).await
-    }
 }
 
 #[derive(Debug)]
 struct SearchTask {
+    project_id: Option<String>,
     query: String,
     top_k: Option<usize>,
-    filter_reserved: bool,
     response_tx:
         tokio::sync::oneshot::Sender<std::io::Result<Vec<crate::local_storage::SearchResult>>>,
 }
 
 #[derive(Debug)]
 struct IndexTask {
+    project_id: String,
     path: std::path::PathBuf,
     content: String,
+}
+
+#[derive(Debug)]
+struct SkillIndexTask {
+    path: std::path::PathBuf,
+    content: String,
+}
+
+#[derive(Debug)]
+struct SkillDeleteTask {
+    path: std::path::PathBuf,
+}
+
+struct ProjectId(String);
+
+impl<S> FromRequestParts<S> for ProjectId
+where
+    S: Send + Sync,
+{
+    type Rejection = Response;
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        let pid = parts
+            .headers
+            .get("x-nh-project")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if !valid_project_id(pid) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "missing or invalid X-NH-Project header",
+            )
+                .into_response());
+        }
+        Ok(ProjectId(pid.to_string()))
+    }
 }
 
 #[derive(Deserialize)]
@@ -305,16 +405,24 @@ fn io_error_response(err: std::io::Error) -> Response {
 
 async fn create_file(
     State(state): State<AppState>,
+    ProjectId(project_id): ProjectId,
     Query(query): Query<PathQuery>,
     body: String,
 ) -> Response {
     let path = query.path.clone();
     let content = body.clone();
-    match state.files.read().await.create_file(&path, &content).await {
+    match state
+        .files
+        .read()
+        .await
+        .create_file(&project_id, &path, &content)
+        .await
+    {
         Ok(_) => {
             let _ = state
                 .index_tx
                 .send(IndexTask {
+                    project_id,
                     path: std::path::PathBuf::from(path),
                     content,
                 })
@@ -325,36 +433,86 @@ async fn create_file(
     }
 }
 
-async fn read_file(State(state): State<AppState>, Query(query): Query<PathQuery>) -> Response {
-    match state.files.read().await.read_file(&query.path).await {
+async fn read_file(
+    State(state): State<AppState>,
+    ProjectId(project_id): ProjectId,
+    Query(query): Query<PathQuery>,
+) -> Response {
+    match state
+        .files
+        .read()
+        .await
+        .read_file(&project_id, &query.path)
+        .await
+    {
         Ok(content) => (StatusCode::OK, content).into_response(),
         Err(e) => io_error_response(e),
     }
 }
 
-async fn delete_file(State(state): State<AppState>, Query(query): Query<PathQuery>) -> Response {
-    match state.files.read().await.delete_file(&query.path).await {
+async fn delete_file(
+    State(state): State<AppState>,
+    ProjectId(project_id): ProjectId,
+    Query(query): Query<PathQuery>,
+) -> Response {
+    match state
+        .files
+        .read()
+        .await
+        .delete_file(&project_id, &query.path)
+        .await
+    {
         Ok(_) => StatusCode::OK.into_response(),
         Err(e) => io_error_response(e),
     }
 }
 
-async fn create_dir(State(state): State<AppState>, Query(query): Query<PathQuery>) -> Response {
-    match state.files.read().await.create_dir(&query.path).await {
+async fn create_dir(
+    State(state): State<AppState>,
+    ProjectId(project_id): ProjectId,
+    Query(query): Query<PathQuery>,
+) -> Response {
+    match state
+        .files
+        .read()
+        .await
+        .create_dir(&project_id, &query.path)
+        .await
+    {
         Ok(_) => StatusCode::OK.into_response(),
         Err(e) => io_error_response(e),
     }
 }
 
-async fn list_dir(State(state): State<AppState>, Query(query): Query<PathQuery>) -> Response {
-    match state.files.read().await.list(&query.path).await {
+async fn list_dir(
+    State(state): State<AppState>,
+    ProjectId(project_id): ProjectId,
+    Query(query): Query<PathQuery>,
+) -> Response {
+    match state
+        .files
+        .read()
+        .await
+        .list(&project_id, &query.path)
+        .await
+    {
         Ok(entries) => Json(entries).into_response(),
         Err(e) => io_error_response(e),
     }
 }
 
-async fn walk_dir(State(state): State<AppState>, Query(query): Query<PathQuery>) -> Response {
-    match state.files.read().await.walk(&query.path).await {
+async fn walk_dir(
+    State(state): State<AppState>,
+    ProjectId(project_id): ProjectId,
+    Query(query): Query<PathQuery>,
+) -> Response {
+    match state
+        .files
+        .read()
+        .await
+        .walk(&project_id, &query.path)
+        .await
+    {
         Ok(entries) => Json(entries).into_response(),
         Err(e) => io_error_response(e),
     }
@@ -362,15 +520,16 @@ async fn walk_dir(State(state): State<AppState>, Query(query): Query<PathQuery>)
 
 async fn search_similar(
     State(state): State<AppState>,
+    ProjectId(project_id): ProjectId,
     Query(query): Query<SearchQuery>,
 ) -> Response {
     let (tx, rx) = tokio::sync::oneshot::channel();
     if state
         .search_tx
         .send(SearchTask {
+            project_id: Some(project_id),
             query: query.query.clone(),
             top_k: query.top_k,
-            filter_reserved: true,
             response_tx: tx,
         })
         .await
@@ -387,9 +546,10 @@ async fn search_similar(
 
 async fn search_by_name(
     State(state): State<AppState>,
+    ProjectId(project_id): ProjectId,
     Query(query): Query<NameSearchQuery>,
 ) -> Response {
-    match state.files.read().await.walk("").await {
+    match state.files.read().await.walk(&project_id, "").await {
         Ok(all) => {
             let results: Vec<_> = all
                 .into_iter()
@@ -406,6 +566,76 @@ async fn search_by_name(
                 .collect();
             Json(results).into_response()
         }
+        Err(e) => io_error_response(e),
+    }
+}
+
+async fn read_about(
+    State(state): State<AppState>,
+    ProjectId(project_id): ProjectId,
+    Query(query): Query<PathQuery>,
+) -> Response {
+    match state
+        .files
+        .read()
+        .await
+        .read_about(&project_id, &query.path)
+        .await
+    {
+        Ok(content) => (StatusCode::OK, content).into_response(),
+        Err(e) => io_error_response(e),
+    }
+}
+
+async fn write_about(
+    State(state): State<AppState>,
+    ProjectId(project_id): ProjectId,
+    Query(query): Query<WriteMetaQuery>,
+    body: String,
+) -> Response {
+    match state
+        .files
+        .read()
+        .await
+        .write_about(&project_id, &query.path, &body)
+        .await
+    {
+        Ok(_) => StatusCode::OK.into_response(),
+        Err(e) => io_error_response(e),
+    }
+}
+
+async fn read_summary(
+    State(state): State<AppState>,
+    ProjectId(project_id): ProjectId,
+    Query(query): Query<PathQuery>,
+) -> Response {
+    match state
+        .files
+        .read()
+        .await
+        .read_summary(&project_id, &query.path)
+        .await
+    {
+        Ok(content) => (StatusCode::OK, content).into_response(),
+        Err(e) => io_error_response(e),
+    }
+}
+
+async fn write_summary(
+    State(state): State<AppState>,
+    ProjectId(project_id): ProjectId,
+    Query(query): Query<WriteMetaQuery>,
+    body: String,
+) -> Response {
+    match state
+        .files
+        .read()
+        .await
+        .write_summary(&project_id, &query.path, &body)
+        .await
+    {
+        Ok(_) => StatusCode::OK.into_response(),
         Err(e) => io_error_response(e),
     }
 }
@@ -432,11 +662,10 @@ async fn skill_put(
         .await
     {
         Ok(_) => {
-            let index_path = format!(".skills/{}", path.trim_start_matches('/'));
             let _ = state
-                .index_tx
-                .send(IndexTask {
-                    path: std::path::PathBuf::from(index_path),
+                .skill_index_tx
+                .send(SkillIndexTask {
+                    path: std::path::PathBuf::from(path),
                     content,
                 })
                 .await;
@@ -447,14 +676,17 @@ async fn skill_put(
 }
 
 async fn skill_delete(State(state): State<AppState>, Query(query): Query<PathQuery>) -> Response {
-    match state
-        .files
-        .read()
-        .await
-        .delete_skill_file(&query.path)
-        .await
-    {
-        Ok(_) => StatusCode::OK.into_response(),
+    let path = query.path.clone();
+    match state.files.read().await.delete_skill_file(&path).await {
+        Ok(_) => {
+            let _ = state
+                .skill_delete_tx
+                .send(SkillDeleteTask {
+                    path: std::path::PathBuf::from(path),
+                })
+                .await;
+            StatusCode::OK.into_response()
+        }
         Err(e) => io_error_response(e),
     }
 }
@@ -471,9 +703,9 @@ async fn skill_search(State(state): State<AppState>, Query(query): Query<SearchQ
     if state
         .search_tx
         .send(SearchTask {
+            project_id: Some(SKILLS_PROJECT.to_string()),
             query: query.query.clone(),
             top_k: query.top_k,
-            filter_reserved: false,
             response_tx: tx,
         })
         .await
@@ -485,54 +717,6 @@ async fn skill_search(State(state): State<AppState>, Query(query): Query<SearchQ
         Ok(Ok(results)) => Json(results).into_response(),
         Ok(Err(e)) => io_error_response(e),
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Search task cancelled").into_response(),
-    }
-}
-
-async fn read_about(State(state): State<AppState>, Query(query): Query<PathQuery>) -> Response {
-    match state.files.read().await.read_about(&query.path).await {
-        Ok(content) => (StatusCode::OK, content).into_response(),
-        Err(e) => io_error_response(e),
-    }
-}
-
-async fn write_about(
-    State(state): State<AppState>,
-    Query(query): Query<WriteMetaQuery>,
-    body: String,
-) -> Response {
-    match state
-        .files
-        .read()
-        .await
-        .write_about(&query.path, &body)
-        .await
-    {
-        Ok(_) => StatusCode::OK.into_response(),
-        Err(e) => io_error_response(e),
-    }
-}
-
-async fn read_summary(State(state): State<AppState>, Query(query): Query<PathQuery>) -> Response {
-    match state.files.read().await.read_summary(&query.path).await {
-        Ok(content) => (StatusCode::OK, content).into_response(),
-        Err(e) => io_error_response(e),
-    }
-}
-
-async fn write_summary(
-    State(state): State<AppState>,
-    Query(query): Query<WriteMetaQuery>,
-    body: String,
-) -> Response {
-    match state
-        .files
-        .read()
-        .await
-        .write_summary(&query.path, &body)
-        .await
-    {
-        Ok(_) => StatusCode::OK.into_response(),
-        Err(e) => io_error_response(e),
     }
 }
 
@@ -550,8 +734,9 @@ pub async fn run_server(
 
     let (search_tx, mut search_rx) = mpsc::channel::<SearchTask>(100);
     let (index_tx, mut index_rx) = mpsc::channel::<IndexTask>(100);
+    let (skill_index_tx, mut skill_index_rx) = mpsc::channel::<SkillIndexTask>(100);
+    let (skill_delete_tx, mut skill_delete_rx) = mpsc::channel::<SkillDeleteTask>(100);
 
-    // ГАРАНТИРОВАННОЕ РЕШЕНИЕ: отдельный поток для VectorDB, чтобы избежать паники "runtime within runtime"
     let vector_db_config_clone = vector_db_config.clone();
     let storage_name = config.storage_name.clone();
     std::thread::spawn(move || {
@@ -571,21 +756,35 @@ pub async fn run_server(
             loop {
                 tokio::select! {
                     Some(task) = search_rx.recv() => {
-                        let mut result = storage.search_similar(&task.query, task.top_k);
-                        if task.filter_reserved {
-                            if let Ok(ref mut list) = result {
-                                list.retain(|r| {
-                                    !r.file_path
-                                        .components()
-                                        .any(|c| c.as_os_str() == ".skills")
-                                });
-                            }
-                        }
+                        let result = storage.search_similar(
+                            task.project_id.as_deref(),
+                            &task.query,
+                            task.top_k,
+                        );
                         let _ = task.response_tx.send(result);
                     }
                     Some(task) = index_rx.recv() => {
-                        if let Err(e) = storage.create_file(&task.path.to_string_lossy(), &task.content) {
+                        if let Err(e) = storage.create_file(
+                            &task.project_id,
+                            &task.path.to_string_lossy(),
+                            &task.content,
+                        ) {
                             eprintln!("⚠️ Indexing failed for {:?}: {}", task.path, e);
+                        }
+                    }
+                    Some(task) = skill_index_rx.recv() => {
+                        if let Err(e) = storage.create_skill_file(
+                            &task.path.to_string_lossy(),
+                            &task.content,
+                        ) {
+                            eprintln!("⚠️ Skill indexing failed for {:?}: {}", task.path, e);
+                        }
+                    }
+                    Some(task) = skill_delete_rx.recv() => {
+                        if let Err(e) = storage.delete_skill_index(
+                            &task.path.to_string_lossy(),
+                        ) {
+                            eprintln!("⚠️ Skill deindex failed for {:?}: {}", task.path, e);
                         }
                     }
                     else => break,
@@ -598,6 +797,8 @@ pub async fn run_server(
         files,
         search_tx,
         index_tx,
+        skill_index_tx,
+        skill_delete_tx,
         auth_token: config.auth_token,
     };
 

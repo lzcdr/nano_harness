@@ -28,6 +28,7 @@ pub struct OutgoingTask {
     pub session_id: String,
     pub to_agent_name: String,
     pub to_session_id: String,
+    pub project_id: String,
     pub chain: Vec<String>,
 }
 
@@ -106,6 +107,8 @@ pub struct AgentRequest {
     pub tools: Option<Vec<String>>,
     pub system_prompt: Option<String>,
     pub session_id: Option<String>,
+    #[serde(default)]
+    pub project_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -241,6 +244,7 @@ pub fn create_agent_engine(config: &AgentConfig) -> Result<ChatEngine> {
     Ok(ChatEngine::new(engine_config, client))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn process_agent_turns(
     engine: &mut ChatEngine,
     config: &AgentConfig,
@@ -248,6 +252,7 @@ pub async fn process_agent_turns(
     request: &AgentRequest,
     log_file: &mut fs::File,
     session_id: Option<String>,
+    project_id: String,
     parent_chain: Vec<String>,
 ) -> Result<AgentResponse> {
     let max_iterations = request.max_iterations.unwrap_or(config.max_iterations);
@@ -317,6 +322,7 @@ pub async fn process_agent_turns(
                     config,
                     code.clone(),
                     session_id.clone(),
+                    project_id.clone(),
                     parent_chain.clone(),
                 )
                 .await;
@@ -400,16 +406,35 @@ pub async fn process_agent_turns(
             }
 
             for tc in &tool_calls {
-                let (result, posted) = execute_agent_tool(
+                let tool_outcome = execute_agent_tool(
                     context,
                     config,
                     tc,
                     rhai_timeout,
                     session_id.clone(),
+                    project_id.clone(),
                     parent_chain.clone(),
                 )
-                .await?;
-                eprintln!("✅ Результат '{}': {}", tc.function.name, result);
+                .await;
+
+                let (result, posted) = match tool_outcome {
+                    Ok(pair) => {
+                        eprintln!("✅ Результат '{}': {}", tc.function.name, pair.0);
+                        pair
+                    }
+                    Err(e) => {
+                        eprintln!("❌ Ошибка '{}': {:#}", tc.function.name, e);
+                        write_log(
+                            log_file,
+                            "tool_error",
+                            &format!(
+                                "{} ({}) -> {:#}",
+                                tc.function.name, tc.function.arguments, e
+                            ),
+                        )?;
+                        return Err(e);
+                    }
+                };
 
                 write_log(
                     log_file,
@@ -426,8 +451,6 @@ pub async fn process_agent_turns(
                     result: result.clone(),
                 });
 
-                // Всегда закрываем tool_call, иначе следующий send() упадёт
-                // на невалидной истории (assistant с tool_calls без tool).
                 engine.add_tool_result(tc.id.clone(), result.clone());
 
                 if posted || result.starts_with("posted:") {
@@ -465,8 +488,6 @@ pub async fn process_agent_turns(
 
     let final_response = final_response.ok_or_else(|| anyhow::anyhow!("No response from agent"))?;
 
-    // Если исчерпали max_iterations, а модель всё ещё хотела инструменты —
-    // финальный ответ пустой. Возвращаем последний tool_result вместо пустоты.
     let final_content =
         if final_response.content.trim().is_empty() && final_response.tool_calls.is_some() {
             tool_calls_log
@@ -482,6 +503,12 @@ pub async fn process_agent_turns(
             .iter()
             .filter(|t| t.name == "run_code" && !t.result.starts_with("Ошибка"))
             .collect();
+        eprintln!(
+            "🔎 auto-save: skill_mode={}, skill_found={}, run_code_ok={}",
+            config.skill_mode,
+            skill_found,
+            rhai_calls.len()
+        );
         for call in rhai_calls {
             if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&call.arguments) {
                 if let Some(code_ref) = parsed.get("code").and_then(|v| v.as_str()) {
@@ -592,6 +619,7 @@ pub async fn run_agent(
     config: &AgentConfig,
     context: &AgentContext,
     request: AgentRequest,
+    project_id: String,
 ) -> Result<AgentResponse> {
     let log_session_id = request
         .session_id
@@ -624,6 +652,7 @@ pub async fn run_agent(
         &request,
         &mut log_file,
         request.session_id.clone(),
+        project_id,
         vec![],
     )
     .await?;
@@ -631,12 +660,14 @@ pub async fn run_agent(
     Ok(response)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_agent_tool(
     context: &AgentContext,
     config: &AgentConfig,
     tool_call: &ToolCall,
     rhai_timeout_sec: u64,
     session_id: Option<String>,
+    project_id: String,
     parent_chain: Vec<String>,
 ) -> Result<(String, bool)> {
     match tool_call.function.name.as_str() {
@@ -659,6 +690,7 @@ async fn execute_agent_tool(
             let outgoing_tasks = context.outgoing_tasks.clone();
             let timeout_duration = Duration::from_secs(rhai_timeout_sec);
             let config_owned = config.clone();
+            let pid = project_id.clone();
 
             let posted_flag = Arc::new(AtomicBool::new(false));
             let posted_flag_clone = posted_flag.clone();
@@ -674,6 +706,7 @@ async fn execute_agent_tool(
                         board_url,
                         board_token,
                         session_id,
+                        pid,
                         parent_chain,
                         pending_calls,
                         outgoing_tasks,
@@ -699,6 +732,7 @@ async fn execute_agent_tool(
                 Some(&context.http_client),
                 &context.storage_base_url,
                 &context.storage_auth_token,
+                &project_id,
                 rhai_timeout_sec,
                 None,
             )
@@ -718,6 +752,7 @@ fn run_code_with_storage(
     board_url: String,
     board_token: String,
     self_session_id: Option<String>,
+    project_id: String,
     parent_chain: Vec<String>,
     pending_calls: PendingCalls,
     outgoing_tasks: OutgoingTasks,
@@ -735,13 +770,19 @@ fn run_code_with_storage(
     engine.on_print(move |s| output_clone.borrow_mut().push_str(s));
 
     crate::tools::register_basic_functions(&mut engine);
-    crate::tools::register_storage_functions(&mut engine, &storage_base_url, &storage_auth_token);
+    crate::tools::register_storage_functions(
+        &mut engine,
+        &storage_base_url,
+        &storage_auth_token,
+        &project_id,
+    );
     crate::tools::register_board_functions(
         &mut engine,
         board_url,
         board_token,
         self_name.unwrap_or_default(),
         self_session_id,
+        project_id,
         parent_chain,
         pending_calls,
         agent_call_timeout_sec,
@@ -782,6 +823,7 @@ async fn execute_skill_code_directly(
     config: &AgentConfig,
     code: String,
     session_id: Option<String>,
+    project_id: String,
     parent_chain: Vec<String>,
 ) -> Result<String> {
     let storage_base_url = context.storage_base_url.clone();
@@ -808,6 +850,7 @@ async fn execute_skill_code_directly(
                 board_url,
                 board_token,
                 session_id,
+                project_id,
                 parent_chain,
                 pending_calls,
                 outgoing_tasks,
