@@ -31,6 +31,9 @@ pub struct TomlConfig {
     // Глобальный таймаут Rhai для CLI (чата), секунды
     pub rhai_timeout_sec: Option<u64>,
 
+    // Редактор для /rebuke_edit. Если не задан — $EDITOR, иначе notepad (Windows) / vi.
+    pub editor: Option<String>,
+
     pub vector_db: Option<VectorDbConfig>,
     pub local_storage_http_server: Option<LocalStorageServerConfig>,
     pub message_board: Option<MessageBoardConfig>,

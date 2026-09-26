@@ -123,26 +123,40 @@ async fn persist_session(
     }
 }
 
-fn load_or_create_engine(
+async fn load_or_create_engine(
     session_id: &str,
     config: &AgentConfig,
+    context: &crate::agent_core::AgentContext,
 ) -> anyhow::Result<(crate::engine::ChatEngine, Option<session_store::Session>)> {
     let store_session =
         session_store::load_session_with_key(session_id, &config.api_key, Some(&config.name)).ok();
     let mut engine = create_agent_engine(config)?;
 
+    let base_prompt = config
+        .system_prompt
+        .clone()
+        .unwrap_or_else(|| "Вы - полезный ассистент.".to_string());
+
+    let rebuke = crate::rebuke_manager::load_rebuke(
+        &context.http_client,
+        &context.storage_base_url,
+        &context.storage_auth_token,
+        &config.name,
+    )
+    .await
+    .unwrap_or_default();
+
+    let system_with_rebuke = crate::rebuke_manager::build_system_with_rebuke(&base_prompt, &rebuke);
+
     if let Some(ref session) = store_session {
         if let Some(ctx) = &session.context {
             engine.set_state(ctx.engine_state.clone());
+            engine.set_system_prompt(system_with_rebuke);
             return Ok((engine, Some(session.clone())));
         }
     }
 
-    let system_prompt = config
-        .system_prompt
-        .clone()
-        .unwrap_or_else(|| "Вы - полезный ассистент.".to_string());
-    engine.add_message(Role::System, system_prompt);
+    engine.add_message(Role::System, system_with_rebuke);
 
     Ok((engine, store_session))
 }
@@ -167,7 +181,8 @@ async fn ensure_session(
         }
     }
 
-    let (engine, store_session_opt) = load_or_create_engine(session_id, &state.config)?;
+    let (engine, store_session_opt) =
+        load_or_create_engine(session_id, &state.config, &state.context).await?;
 
     let mut store_session = match store_session_opt {
         Some(s) => {

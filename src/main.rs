@@ -696,6 +696,8 @@ async fn main() -> Result<()> {
     println!("       last                 — переключиться на предыдущий");
     println!("       delete <id> [--force]— пометить удалённым");
     println!("       purge <id> [--force] — удалить файлы");
+    println!("     /rebuke <агент> <текст>- добавить замечание агенту");
+    println!("     /rebuke_edit <агент>   — редактировать замечания в редакторе");
     println!();
 
     let mut storage_http_config = toml_config
@@ -791,6 +793,97 @@ async fn main() -> Result<()> {
                 rt.engine.set_system_prompt(new_prompt.clone());
                 write_log(&mut rt.log_file, "system", &new_prompt)?;
                 println!("✅ Системный промпт обновлён.\n");
+                continue;
+            }
+            "/rebuke" => {
+                println!("Использование: /rebuke <agent> <TEXT>");
+                continue;
+            }
+            "/rebuke_edit" => {
+                println!("Использование: /rebuke_edit <agent>");
+                continue;
+            }
+            _ if user_input.starts_with("/rebuke ") => {
+                let rest = &user_input[8..];
+                let mut parts = rest.splitn(2, ' ');
+                let agent = parts.next().unwrap_or("").trim();
+                let text = parts.next().unwrap_or("").trim();
+                if agent.is_empty() {
+                    println!("Использование: /rebuke <agent> <TEXT>");
+                    continue;
+                }
+                if text.is_empty() {
+                    println!("Нужен текст замечания.");
+                    continue;
+                }
+                if !toml_config.agents.iter().any(|a| a.name == agent) {
+                    println!("Агент '{}' не найден в конфиге.", agent);
+                    continue;
+                }
+                match nano_harness::rebuke_manager::append_rebuke(
+                    &client,
+                    &storage_http_config.bind_addr,
+                    &storage_http_config.auth_token,
+                    agent,
+                    text,
+                )
+                .await
+                {
+                    Ok(_) => {
+                        println!(
+                            "Rebuke добавлен агенту '{}'. Перезапусти агента, чтобы он его увидел.",
+                            agent
+                        );
+                    }
+                    Err(e) => println!("Ошибка: {:#}", e),
+                }
+                continue;
+            }
+            _ if user_input.starts_with("/rebuke_edit ") => {
+                let agent = user_input[13..].trim();
+                if agent.is_empty() {
+                    println!("Использование: /rebuke_edit <agent>");
+                    continue;
+                }
+                if !toml_config.agents.iter().any(|a| a.name == agent) {
+                    println!("Агент '{}' не найден в конфиге.", agent);
+                    continue;
+                }
+                let path = format!(
+                    ".local_storage/{}/.rebukes/{}.txt",
+                    storage_http_config.storage_name, agent
+                );
+                if let Some(parent) = std::path::Path::new(&path).parent() {
+                    if let Err(e) = std::fs::create_dir_all(parent) {
+                        println!("Не удалось создать каталог {}: {}", parent.display(), e);
+                        continue;
+                    }
+                }
+                if !std::path::Path::new(&path).exists() {
+                    if let Err(e) = std::fs::write(&path, "") {
+                        println!("Не удалось создать файл {}: {}", path, e);
+                        continue;
+                    }
+                }
+                let editor: String = if let Some(e) = &toml_config.editor {
+                    e.clone()
+                } else if let Ok(e) = std::env::var("EDITOR") {
+                    e
+                } else if cfg!(target_os = "windows") {
+                    "notepad".to_string()
+                } else {
+                    "vi".to_string()
+                };
+                match std::process::Command::new(&editor).arg(&path).spawn() {
+                    Ok(_) => {
+                        println!(
+                            "Редактор '{}' запущен для {}.\n\
+                             После сохранения перезапусти агента, чтобы он увидел изменения.",
+                            editor, path
+                        );
+                    }
+                    Err(e) => println!("Не удалось запустить редактор '{}': {}", editor, e),
+                }
                 continue;
             }
             "/metrics" => {
