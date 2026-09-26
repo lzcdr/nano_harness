@@ -279,6 +279,34 @@ impl FileStorage {
         tokio::fs::remove_file(self.resolve_skill(path)?).await
     }
 
+    fn resolve_rebuke(&self, agent: &str) -> std::io::Result<std::path::PathBuf> {
+        if agent.is_empty() || agent.contains('/') || agent.contains('\\') || agent.contains("..") {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid agent name",
+            ));
+        }
+        Ok(self.root.join(".rebukes").join(format!("{}.txt", agent)))
+    }
+
+    async fn read_rebuke_file(&self, agent: &str) -> std::io::Result<String> {
+        match tokio::fs::read_to_string(self.resolve_rebuke(agent)?).await {
+            Ok(s) => Ok(s),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn write_rebuke_file(&self, agent: &str, content: &str) -> std::io::Result<()> {
+        let full = self.resolve_rebuke(agent)?;
+        if let Some(parent) = full.parent() {
+            if !parent.exists() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+        }
+        tokio::fs::write(&full, content).await
+    }
+
     async fn list_skill_dir(
         &self,
         path: &str,
@@ -720,6 +748,41 @@ async fn skill_search(State(state): State<AppState>, Query(query): Query<SearchQ
     }
 }
 
+#[derive(Deserialize)]
+struct AgentQuery {
+    agent: String,
+}
+
+async fn rebuke_get(State(state): State<AppState>, Query(query): Query<AgentQuery>) -> Response {
+    match state
+        .files
+        .read()
+        .await
+        .read_rebuke_file(&query.agent)
+        .await
+    {
+        Ok(content) => (StatusCode::OK, content).into_response(),
+        Err(e) => io_error_response(e),
+    }
+}
+
+async fn rebuke_put(
+    State(state): State<AppState>,
+    Query(query): Query<AgentQuery>,
+    body: String,
+) -> Response {
+    match state
+        .files
+        .read()
+        .await
+        .write_rebuke_file(&query.agent, &body)
+        .await
+    {
+        Ok(_) => StatusCode::OK.into_response(),
+        Err(e) => io_error_response(e),
+    }
+}
+
 async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
 }
@@ -819,6 +882,8 @@ pub async fn run_server(
         .route("/skills/delete", post(skill_delete))
         .route("/skills/list", get(skill_list))
         .route("/skills/search", get(skill_search))
+        .route("/rebukes/get", get(rebuke_get))
+        .route("/rebukes/put", post(rebuke_put))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
