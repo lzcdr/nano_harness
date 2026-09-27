@@ -85,6 +85,10 @@ pub struct AgentConfig {
     pub skill_auto_execute_threshold: f32,
     #[serde(default)]
     pub max_cost_rub: Option<f64>,
+    #[serde(default)]
+    pub compact_threshold_bytes: Option<usize>,
+    #[serde(default)]
+    pub tail_byte_budget: Option<usize>,
 }
 
 fn default_skill_mode() -> String {
@@ -232,6 +236,8 @@ pub fn build_engine_config(config: &AgentConfig) -> EngineConfig {
         max_cost_rub: config.max_cost_rub,
         prefix_message_count: config.prefix_message_count,
         tail_message_count: config.tail_message_count,
+        compact_threshold_bytes: config.compact_threshold_bytes.unwrap_or(512),
+        tail_byte_budget: config.tail_byte_budget.unwrap_or(100 * 1024),
     }
 }
 
@@ -262,6 +268,9 @@ pub async fn process_agent_turns(
     let mut posted_any = false;
 
     let mut skill_found = false;
+
+    // Скилл-контекст живёт только текущий ход. Сбрасываем перед новым поиском.
+    engine.clear_skill_context();
 
     if config.skill_mode == "auto" && !request.prompt.trim().is_empty() {
         let storage_base_url = context.storage_base_url.clone();
@@ -376,10 +385,7 @@ pub async fn process_agent_turns(
                     session_id: None,
                 });
             } else {
-                engine.add_message(
-                    Role::System,
-                    format!("Найден подходящий скилл:\n{}", content),
-                );
+                engine.set_skill_context(format!("Найден подходящий скилл:\n{}", content));
                 write_log(log_file, "skill_injected", &skill_record.skill_file)?;
                 skill_found = true;
             }
@@ -503,16 +509,25 @@ pub async fn process_agent_turns(
             .iter()
             .filter(|t| t.name == "run_code" && !t.result.starts_with("Ошибка"))
             .collect();
-        eprintln!(
-            "🔎 auto-save: skill_mode={}, skill_found={}, run_code_ok={}",
-            config.skill_mode,
-            skill_found,
-            rhai_calls.len()
-        );
         for call in rhai_calls {
             if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&call.arguments) {
                 if let Some(code_ref) = parsed.get("code").and_then(|v| v.as_str()) {
                     let code = code_ref.to_string();
+
+                    let min_len = config.skill_min_code_length;
+                    let trimmed_len = code.trim().len();
+                    if trimmed_len < min_len {
+                        write_log(
+                            log_file,
+                            "skill_skipped",
+                            &format!("(too short) ({} < {})", trimmed_len, min_len),
+                        )?;
+                        eprintln!(
+                            "⏭️ Скилл не сохранён: код {} символов < {}",
+                            trimmed_len, min_len
+                        );
+                        continue;
+                    }
 
                     let engine_config = build_engine_config(config);
                     let (skill_name, skill_description) =
@@ -533,7 +548,6 @@ pub async fn process_agent_turns(
                     let storage_auth_token = context.storage_auth_token.clone();
                     let agent_name = config.name.clone();
                     let prompt = request.prompt.clone();
-                    let min_len = config.skill_min_code_length;
                     let skill_name_for_log = skill_name.clone();
 
                     let outcome = match tokio::task::spawn_blocking(move || {
@@ -576,6 +590,10 @@ pub async fn process_agent_turns(
                                 "skill_skipped",
                                 &format!("{} ({} < {})", skill_name_for_log, actual, min),
                             )?;
+                            eprintln!(
+                                "⏭️ Скилл не сохранён: {} ({} < {})",
+                                skill_name_for_log, actual, min
+                            );
                         }
                         crate::skill_manager::SaveSkillOutcome::SkippedDuplicate => {
                             write_log(log_file, "skill_skipped_duplicate", &skill_name_for_log)?;

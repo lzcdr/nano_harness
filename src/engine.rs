@@ -121,11 +121,10 @@ pub struct EngineResponse {
 // 4. КОНФИГ ДВИЖКА
 // ============================================================================
 
-/// Конфигурация разрешённого инструмента и режима его выполнения
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ToolExecutionConfig {
     pub name: String,
-    pub mode: String, // "auto" или "manual"
+    pub mode: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -138,15 +137,24 @@ pub struct EngineConfig {
     pub top_p: Option<f32>,
     pub stop: Option<Vec<String>>,
     pub stream: bool,
-    /// Список разрешённых инструментов с режимами выполнения
     pub allowed_tools: Option<Vec<ToolExecutionConfig>>,
     pub tool_choice: Option<Value>,
     pub reasoning_effort: Option<String>,
     pub max_cost_rub: Option<f64>,
-    /// Количество первых пар (запрос-ответ) для префикса
     pub prefix_message_count: Option<usize>,
-    /// Количество последних пар для хвоста
     pub tail_message_count: Option<usize>,
+    #[serde(default = "default_compact_threshold_bytes")]
+    pub compact_threshold_bytes: usize,
+    #[serde(default = "default_tail_byte_budget")]
+    pub tail_byte_budget: usize,
+}
+
+fn default_compact_threshold_bytes() -> usize {
+    512
+}
+
+fn default_tail_byte_budget() -> usize {
+    100 * 1024
 }
 
 impl Default for EngineConfig {
@@ -166,6 +174,8 @@ impl Default for EngineConfig {
             max_cost_rub: None,
             prefix_message_count: None,
             tail_message_count: None,
+            compact_threshold_bytes: default_compact_threshold_bytes(),
+            tail_byte_budget: default_tail_byte_budget(),
         }
     }
 }
@@ -176,20 +186,22 @@ impl Default for EngineConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Turn {
-    messages: Vec<Message>,
+    pub messages: Vec<Message>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived_origin: Option<Vec<Turn>>,
 }
 
 pub struct ChatEngine {
     config: EngineConfig,
     system_messages: Vec<Message>,
+    /// Отдельный слот под инжектнутый скилл. Не копится, перезаписывается.
+    skill_context: Option<Message>,
     prefix_turns: Vec<Turn>,
     tail_turns: Vec<Turn>,
     pending_turn: Option<Turn>,
     client: Client,
     pub metrics: SessionMetrics,
-    /// Callback для вывода токенов при стриминге
     pub on_token: Option<Box<dyn Fn(&str) + Send + Sync>>,
-    /// Callback для вывода reasoning-токенов
     pub on_reasoning_token: Option<Box<dyn Fn(&str) + Send + Sync>>,
 }
 
@@ -198,6 +210,7 @@ impl ChatEngine {
         Self {
             config,
             system_messages: Vec::new(),
+            skill_context: None,
             prefix_turns: Vec::new(),
             tail_turns: Vec::new(),
             pending_turn: None,
@@ -230,11 +243,32 @@ impl ChatEngine {
         });
     }
 
+    /// Установить скилл-контекст. Перезаписывает предыдущий.
+    pub fn set_skill_context(&mut self, content: String) {
+        self.skill_context = Some(Message {
+            role: Role::System,
+            content: Some(content),
+            reasoning: None,
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        });
+    }
+
+    pub fn clear_skill_context(&mut self) {
+        self.skill_context = None;
+    }
+
+    pub fn has_skill_context(&self) -> bool {
+        self.skill_context.is_some()
+    }
+
     pub fn clear_context(&mut self) {
         self.finalize_pending_turn();
         self.prefix_turns.clear();
         self.tail_turns.clear();
         self.pending_turn = None;
+        self.skill_context = None;
     }
 
     pub fn set_system_prompt(&mut self, prompt: String) {
@@ -252,8 +286,120 @@ impl ChatEngine {
         }
     }
 
+    // ==================== Компактизация ====================
+
+    /// Применить компактизацию ко всем сохранённым ходам.
+    /// Возвращает (было_байт, стало_байт).
+    pub fn compact_all_turns(&mut self) -> (usize, usize) {
+        let before = self.total_context_bytes();
+        let threshold = self.config.compact_threshold_bytes;
+        for turn in self.prefix_turns.iter_mut() {
+            compact_turn(threshold, turn);
+        }
+        for turn in self.tail_turns.iter_mut() {
+            compact_turn(threshold, turn);
+        }
+        let after = self.total_context_bytes();
+        (before, after)
+    }
+
+    /// Заменить указанный диапазон ходов в tail_turns на новый набор.
+    /// Используется godfather'ом. Оригиналы сохраняются внутри нового turn'а
+    /// в поле `archived_origin`.
+    pub fn replace_tail_range_with_summary(
+        &mut self,
+        start: usize,
+        end: usize,
+        new_messages: Vec<Message>,
+    ) {
+        if start >= end || end > self.tail_turns.len() {
+            return;
+        }
+
+        let originals: Vec<Turn> = self.tail_turns[start..end].to_vec();
+
+        let new_turn = Turn {
+            messages: new_messages,
+            archived_origin: Some(originals),
+        };
+        self.tail_turns
+            .splice(start..end, std::iter::once(new_turn));
+    }
+
+    /// Суммарное количество ходов, скрытых в архивных частях tail_turns.
+    pub fn archive_len(&self) -> usize {
+        fn count(turn: &Turn) -> usize {
+            match &turn.archived_origin {
+                None => 0,
+                Some(orig) => orig.len() + orig.iter().map(count).sum::<usize>(),
+            }
+        }
+        self.tail_turns.iter().map(count).sum()
+    }
+
+    /// Развернуть всё содержимое архива обратно в tail_turns.
+    /// Возвращает количество восстановленных ходов.
+    pub fn unfreeze_all(&mut self) -> usize {
+        fn flatten(turn: Turn) -> Vec<Turn> {
+            match turn.archived_origin {
+                None => vec![turn],
+                Some(orig) => orig.into_iter().flat_map(flatten).collect(),
+            }
+        }
+
+        let mut count = 0;
+        let mut new_tail = Vec::new();
+        for turn in self.tail_turns.drain(..) {
+            if turn.archived_origin.is_some() {
+                let flat = flatten(turn);
+                count += flat.len();
+                new_tail.extend(flat);
+            } else {
+                new_tail.push(turn);
+            }
+        }
+        self.tail_turns = new_tail;
+        count
+    }
+
+    /// Развернуть последний сжатый turn обратно.
+    /// Возвращает количество восстановленных ходов, или 0, если архив пуст.
+    pub fn unfreeze_last(&mut self) -> usize {
+        for i in (0..self.tail_turns.len()).rev() {
+            if self.tail_turns[i].archived_origin.is_some() {
+                let turn = self.tail_turns.remove(i);
+                let originals = turn.archived_origin.unwrap();
+                let count = originals.len();
+                for (j, t) in originals.into_iter().enumerate() {
+                    self.tail_turns.insert(i + j, t);
+                }
+                return count;
+            }
+        }
+        0
+    }
+
+    /// Публичная функция для godfather'а: вернуть срез tail_turns для сжатия.
+    pub fn tail_turns_snapshot(&self) -> Vec<Turn> {
+        self.tail_turns.clone()
+    }
+
+    /// Публичная функция для godfather'а: применить результат.
+    pub fn apply_godfather_result(&mut self, new_messages: Vec<Message>) {
+        if self.tail_turns.is_empty() {
+            return;
+        }
+        let start = 0;
+        let end = self.tail_turns.len();
+        self.replace_tail_range_with_summary(start, end, new_messages);
+    }
+
+    // ==================== Служебное ====================
+
     fn finalize_pending_turn(&mut self) {
-        if let Some(turn) = self.pending_turn.take() {
+        if let Some(mut turn) = self.pending_turn.take() {
+            let threshold = self.config.compact_threshold_bytes;
+            compact_turn(threshold, &mut turn);
             let prefix_limit = self.config.prefix_message_count.unwrap_or(0);
             if self.prefix_turns.len() < prefix_limit {
                 self.prefix_turns.push(turn);
@@ -309,10 +455,40 @@ impl ChatEngine {
             .sum()
     }
 
+    /// Приблизительный размер всего контекста в байтах.
+    pub fn total_context_bytes(&self) -> usize {
+        let mut total = 0usize;
+        for m in &self.system_messages {
+            total += message_bytes(m);
+        }
+        if let Some(m) = &self.skill_context {
+            total += message_bytes(m);
+        }
+        for t in &self.prefix_turns {
+            for m in &t.messages {
+                total += message_bytes(m);
+            }
+        }
+        for t in &self.tail_turns {
+            for m in &t.messages {
+                total += message_bytes(m);
+            }
+        }
+        if let Some(t) = &self.pending_turn {
+            for m in &t.messages {
+                total += message_bytes(m);
+            }
+        }
+        total
+    }
+
     #[allow(dead_code)]
     pub fn get_messages(&self) -> Vec<Message> {
         let mut result = Vec::new();
         result.extend(self.system_messages.iter().cloned());
+        if let Some(skill) = &self.skill_context {
+            result.push(skill.clone());
+        }
         for turn in &self.prefix_turns {
             result.extend(turn.messages.iter().cloned());
         }
@@ -331,23 +507,21 @@ impl ChatEngine {
                 self.system_messages.push(msg);
             }
             Role::User => {
-                // Завершаем предыдущий обмен (если был)
                 self.finalize_pending_turn();
 
-                // Создаём новый Turn с этим сообщением
                 let turn = Turn {
                     messages: vec![msg],
+                    archived_origin: None,
                 };
                 self.pending_turn = Some(turn);
             }
             _ => {
-                // Добавляем сообщение в текущий обмен
                 if let Some(ref mut pending) = self.pending_turn {
                     pending.messages.push(msg);
                 } else {
-                    // Если нет активного обмена — создаём Turn в хвосте
                     let turn = Turn {
                         messages: vec![msg],
+                        archived_origin: None,
                     };
                     self.tail_turns.push(turn);
                     self.trim_tail();
@@ -372,12 +546,32 @@ impl ChatEngine {
         });
     }
 
+    /// Трим хвоста по двум лимитам одновременно: число ходов и байты.
+    /// Ход выкидывается, если его выкидывает хотя бы один лимит.
+    /// Новый ход никогда не выкидывается.
     fn trim_tail(&mut self) {
-        let limit = self.config.tail_message_count.unwrap_or(usize::MAX);
-        while self.tail_turns.len() > limit {
+        let count_limit = self.config.tail_message_count.unwrap_or(usize::MAX);
+        let byte_limit = self.config.tail_byte_budget;
+
+        while self.tail_turns.len() > 1 {
+            let count_ok = self.tail_turns.len() <= count_limit;
+            let bytes: usize = self
+                .tail_turns
+                .iter()
+                .flat_map(|t| t.messages.iter())
+                .map(message_bytes)
+                .sum();
+            let bytes_ok = bytes <= byte_limit;
+
+            if count_ok && bytes_ok {
+                break;
+            }
+
             self.tail_turns.remove(0);
         }
     }
+
+    // ==================== Запрос ====================
 
     fn build_request(&self) -> Value {
         let all_messages = self.get_messages();
@@ -643,6 +837,7 @@ impl ChatEngine {
     pub fn get_state(&self) -> crate::session_store::EngineState {
         crate::session_store::EngineState {
             system_messages: self.system_messages.clone(),
+            skill_context: self.skill_context.clone(),
             prefix_turns: self.prefix_turns.clone(),
             tail_turns: self.tail_turns.clone(),
             pending_turn: self.pending_turn.clone(),
@@ -652,6 +847,7 @@ impl ChatEngine {
 
     pub fn set_state(&mut self, state: crate::session_store::EngineState) {
         self.system_messages = state.system_messages;
+        self.skill_context = state.skill_context;
         self.prefix_turns = state.prefix_turns;
         self.tail_turns = state.tail_turns;
         self.pending_turn = state.pending_turn;
@@ -660,6 +856,44 @@ impl ChatEngine {
 
     pub fn get_config(&self) -> &EngineConfig {
         &self.config
+    }
+}
+
+fn message_bytes(m: &Message) -> usize {
+    let mut total = 0usize;
+    if let Some(c) = &m.content {
+        total += c.len();
+    }
+    if let Some(r) = &m.reasoning {
+        total += r.len();
+    }
+    if let Some(tc) = &m.tool_calls {
+        for t in tc {
+            total += t.function.name.len() + t.function.arguments.len();
+        }
+    }
+    total
+}
+
+/// Заменяет тело tool-сообщения на плейсхолдер, если оно больше порога.
+/// Обнуляет reasoning у assistant-сообщений.
+fn compact_turn(threshold: usize, turn: &mut Turn) {
+    for msg in turn.messages.iter_mut() {
+        if msg.role == Role::Tool {
+            if let Some(ref content) = msg.content {
+                if content.len() > threshold {
+                    let bytes = content.len();
+                    msg.content = Some(format!(
+                        "[результат опущен при компактизации, {} байт; перезапроси инструмент, если нужно]",
+                        bytes
+                    ));
+                }
+            }
+        }
+        // Reasoning для будущих ходов не нужен — модель его не перечитывает.
+        if msg.role == Role::Assistant && msg.reasoning.is_some() {
+            msg.reasoning = None;
+        }
     }
 }
 

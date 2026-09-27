@@ -15,6 +15,7 @@ use tokio_stream::StreamExt;
 use nano_harness::agent_core::{OutgoingTasks, PendingCalls};
 use nano_harness::config::{build_engine_config, TomlConfig};
 use nano_harness::engine::{ChatEngine, EngineConfig, Message, Role};
+use nano_harness::godfather::GodfatherConfig;
 use nano_harness::local_storage_http_api::LocalStorageServerConfig;
 use nano_harness::message_board::BoardEvent;
 use nano_harness::session_store::{self, ContextBlock, Session};
@@ -78,6 +79,9 @@ struct Args {
         help = "Таймаут синхронного call_agent в секундах"
     )]
     agent_call_timeout_sec: u64,
+
+    #[arg(long, default_value = "300", help = "Таймаут godfather в секундах")]
+    godfather_timeout_sec: u64,
 }
 
 // ==================== Разделяемое состояние чата ====================
@@ -115,6 +119,16 @@ fn write_log(file: &mut std::fs::File, role: &str, content: &str) -> Result<()> 
         content
     )?;
     Ok(())
+}
+
+fn format_bytes(bytes: usize) -> String {
+    if bytes < 1024 {
+        format!("{} B", bytes)
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{:.2} MB", bytes as f64 / (1024.0 * 1024.0))
+    }
 }
 
 fn sanitize_project_name(name: &str) -> String {
@@ -163,6 +177,7 @@ fn open_project(
                         tool_call_id: None,
                         name: None,
                     }],
+                    skill_context: None,
                     prefix_turns: vec![],
                     tail_turns: vec![],
                     pending_turn: None,
@@ -305,9 +320,7 @@ async fn connect_and_listen_chat(
 
 async fn handle_chat_board_event(shared: &SharedChat, event: BoardEvent, reply_ctx: &ReplyContext) {
     match event {
-        BoardEvent::TaskCreated { .. } => {
-            // чат не принимает задачи
-        }
+        BoardEvent::TaskCreated { .. } => {}
         BoardEvent::TaskCompleted {
             task_id,
             result,
@@ -354,7 +367,6 @@ async fn handle_chat_result(
     is_error: bool,
     reply_ctx: &ReplyContext,
 ) {
-    // 1. Синхронный call_agent — снимаем oneshot.
     {
         let rt = shared.lock().await;
         let mut pc = rt.pending_calls.lock().await;
@@ -364,7 +376,6 @@ async fn handle_chat_result(
         }
     }
 
-    // 2. Асинхронный post_task — пишем в контекст текущего проекта.
     let mut rt = shared.lock().await;
     let outgoing = {
         let mut map = rt.outgoing_tasks.lock().await;
@@ -530,10 +541,11 @@ async fn continue_chat_turn(shared: &SharedChat, ctx: &ReplyContext) {
             eprintln!("Ошибка сохранения сессии: {}", e);
         }
         println!(
-            "\n\x1b[90m[Токены: {} prompt + {} completion | 💰 {:.6} RUB]\x1b[0m\n",
+            "\n\x1b[90m[Токены: {} prompt + {} completion | 💰 {:.6} RUB | Контекст: {}]\x1b[0m\n",
             rt.engine.metrics.total_prompt_tokens,
             rt.engine.metrics.total_completion_tokens,
-            rt.engine.metrics.total_cost_rub
+            rt.engine.metrics.total_cost_rub,
+            format_bytes(rt.engine.total_context_bytes())
         );
     }
 }
@@ -590,7 +602,24 @@ async fn main() -> Result<()> {
         format!("http://{}", board_url)
     };
 
-    // Выбор проекта.
+    // Godfather — опциональный. Ключ берётся в порядке:
+    // GODFATHER_API_KEY → POLZA_API_KEY → api_key из [godfather] → api_key чата.
+    let godfather_config: Option<Arc<GodfatherConfig>> = toml_config
+        .godfather
+        .as_ref()
+        .map(|cfg| {
+            let mut c = cfg.clone();
+            if c.api_key.is_empty() {
+                c.api_key = std::env::var("GODFATHER_API_KEY")
+                    .ok()
+                    .or_else(|| std::env::var("POLZA_API_KEY").ok())
+                    .unwrap_or_else(|| engine_config.api_key.clone());
+            }
+            c
+        })
+        .filter(|c| c.is_usable())
+        .map(Arc::new);
+
     let (session, engine, log_file) = match args.project.clone() {
         Some(name) => {
             let candidates = session_store::list_chat_projects()?;
@@ -652,7 +681,6 @@ async fn main() -> Result<()> {
         pending_calls: Arc::new(AsyncMutex::new(std::collections::HashMap::new())),
     }));
 
-    // Заголовок.
     {
         let rt = shared.lock().await;
         println!("📁 Проект: {}", rt.session.display_name);
@@ -677,6 +705,11 @@ async fn main() -> Result<()> {
     if let Some(cost) = engine_config.max_cost_rub {
         println!("   Лимит бюджета: {:.2} RUB", cost);
     }
+    if let Some(ref gf) = godfather_config {
+        println!("   Godfather: модель {}", gf.model);
+    } else {
+        println!("   Godfather: отключён (нет api_key в [godfather])");
+    }
     if let Some(allowed_tools) = &engine_config.allowed_tools {
         println!("   Разрешённые инструменты:");
         for tool in allowed_tools {
@@ -689,6 +722,11 @@ async fn main() -> Result<()> {
     println!("     /fix                   — закрепить последнюю пару в префиксе");
     println!("     /system <промпт>       — сменить системный промпт");
     println!("     /metrics               — метрики сессии");
+    println!("     /godfather             — сжать контекст (механически + семантически)");
+    println!("     /unfreeze              — вернуть всё из архива godfather");
+    println!("     /unfreeze last         — вернуть последний сжатый ход");
+    println!("     /rebuke <агент> <текст> — добавить замечание агенту");
+    println!("     /rebuke_edit <агент>   — редактировать замечания в редакторе");
     println!("     /project               — управление проектами");
     println!("       list                 — список проектов");
     println!("       new <name>           — создать проект");
@@ -696,8 +734,6 @@ async fn main() -> Result<()> {
     println!("       last                 — переключиться на предыдущий");
     println!("       delete <id> [--force]— пометить удалённым");
     println!("       purge <id> [--force] — удалить файлы");
-    println!("     /rebuke <агент> <текст>- добавить замечание агенту");
-    println!("     /rebuke_edit <агент>   — редактировать замечания в редакторе");
     println!();
 
     let mut storage_http_config = toml_config
@@ -716,6 +752,7 @@ async fn main() -> Result<()> {
 
     let rhai_timeout_sec = toml_config.rhai_timeout_sec.unwrap_or(30);
     let agent_call_timeout_sec = args.agent_call_timeout_sec;
+    let godfather_timeout_sec = args.godfather_timeout_sec;
 
     let reply_ctx = Arc::new(ReplyContext {
         engine_config: Arc::new(engine_config.clone()),
@@ -727,7 +764,6 @@ async fn main() -> Result<()> {
         board_token: board_token.clone(),
     });
 
-    // Поднимаем SSE чата.
     {
         let shared_clone = shared.clone();
         let board_url_clone = board_url.clone();
@@ -886,6 +922,134 @@ async fn main() -> Result<()> {
                 }
                 continue;
             }
+            "/unfreeze" => {
+                let mut rt = shared.lock().await;
+                let count = rt.engine.unfreeze_all();
+                if count == 0 {
+                    println!("Архив пуст.");
+                } else {
+                    println!("🔄 Развёрнуто ходов из архива: {}", count);
+                }
+                save_current(&mut *rt)?;
+                continue;
+            }
+            _ if user_input.starts_with("/unfreeze ") => {
+                let rest = user_input[10..].trim();
+                match rest {
+                    "last" => {
+                        let mut rt = shared.lock().await;
+                        let count = rt.engine.unfreeze_last();
+                        if count == 0 {
+                            println!("Архив пуст.");
+                        } else {
+                            println!("🔄 Развёрнут последний сжатый ход ({} turns)", count);
+                        }
+                        save_current(&mut *rt)?;
+                    }
+                    _ => {
+                        println!("Использование: /unfreeze | /unfreeze last");
+                    }
+                }
+                continue;
+            }
+            "/godfather" => {
+                let before_bytes = {
+                    let rt = shared.lock().await;
+                    rt.engine.total_context_bytes()
+                };
+
+                let min_reasonable_bytes = 20 * 1024;
+                if before_bytes < min_reasonable_bytes && godfather_config.is_some() {
+                    println!(
+                        "⚠️ Контекст мал ({}). Семантическая компактизация может стоить дороже, чем выигрыш.",
+                        format_bytes(before_bytes)
+                    );
+                    print!("   Продолжить? (y/n): ");
+                    let _ = io::stdout().flush();
+                    let mut answer = String::new();
+                    tokio::io::AsyncBufReadExt::read_line(&mut stdin, &mut answer).await?;
+                    if !answer.trim().eq_ignore_ascii_case("y") {
+                        println!("Отменено.");
+                        continue;
+                    }
+                }
+
+                println!(
+                    "👑 Godfather запущен. Контекст до: {}",
+                    format_bytes(before_bytes)
+                );
+
+                // 1. Механическая компактизация
+                let (mech_before, mech_after) = {
+                    let mut rt = shared.lock().await;
+                    rt.engine.compact_all_turns()
+                };
+                println!(
+                    "   Механическая: {} → {} (освобождено {})",
+                    format_bytes(mech_before),
+                    format_bytes(mech_after),
+                    format_bytes(mech_before.saturating_sub(mech_after))
+                );
+
+                // 2. Семантическая — только если godfather настроен и есть хвост
+                let tail_count = {
+                    let rt = shared.lock().await;
+                    rt.engine.tail_turn_count()
+                };
+
+                if let Some(ref gf) = godfather_config {
+                    if tail_count == 0 {
+                        println!("   Семантическая: нечего сжимать (хвост пуст)");
+                    } else {
+                        let snapshot = {
+                            let rt = shared.lock().await;
+                            rt.engine.tail_turns_snapshot()
+                        };
+
+                        print!("   Семантическая: сжимаю {} ходов...", snapshot.len());
+                        let _ = io::stdout().flush();
+
+                        match nano_harness::godfather::compact_turns(
+                            gf,
+                            &snapshot,
+                            godfather_timeout_sec,
+                        )
+                        .await
+                        {
+                            Ok(new_messages) => {
+                                let msg_count = new_messages.len();
+                                let mut rt = shared.lock().await;
+                                rt.engine.apply_godfather_result(new_messages);
+                                println!(
+                                    " готово ({} ходов → {} сообщений, архив: {} ходов)",
+                                    snapshot.len(),
+                                    msg_count,
+                                    rt.engine.archive_len()
+                                );
+                            }
+                            Err(e) => {
+                                println!(" откат ({:#})", e);
+                            }
+                        }
+                    }
+                } else {
+                    println!("   Семантическая: godfather не настроен, пропускаю");
+                }
+
+                // 3. Итог
+                let after_bytes = {
+                    let mut rt = shared.lock().await;
+                    save_current(&mut *rt)?;
+                    rt.engine.total_context_bytes()
+                };
+                println!(
+                    "📊 Итог: {} → {} (освобождено {})\n",
+                    format_bytes(before_bytes),
+                    format_bytes(after_bytes),
+                    format_bytes(before_bytes.saturating_sub(after_bytes))
+                );
+                continue;
+            }
             "/metrics" => {
                 let rt = shared.lock().await;
                 println!("\n📊 Метрики сессии:");
@@ -915,6 +1079,12 @@ async fn main() -> Result<()> {
                     "   Хвост: {} пар, {} слов",
                     rt.engine.tail_turn_count(),
                     rt.engine.tail_word_count()
+                );
+                let bytes = rt.engine.total_context_bytes();
+                println!(
+                    "   Контекст: {} (~{} токенов)",
+                    format_bytes(bytes),
+                    bytes / 4
                 );
                 println!();
                 continue;
@@ -1282,7 +1452,6 @@ async fn main() -> Result<()> {
                     continue;
                 }
 
-                // Собираем BoardContext из текущего чата.
                 let (board_ctx, posted_flag_check, project_id) = {
                     let rt = shared.lock().await;
                     let posted_flag = Arc::new(AtomicBool::new(false));
@@ -1376,10 +1545,11 @@ async fn main() -> Result<()> {
             let mut rt = shared.lock().await;
             save_current(&mut *rt)?;
             println!(
-                "\n\x1b[90m[Токены: {} prompt + {} completion | 💰 {:.6} RUB]\x1b[0m\n",
+                "\n\x1b[90m[Токены: {} prompt + {} completion | 💰 {:.6} RUB | Контекст: {}]\x1b[0m\n",
                 rt.engine.metrics.total_prompt_tokens,
                 rt.engine.metrics.total_completion_tokens,
-                rt.engine.metrics.total_cost_rub
+                rt.engine.metrics.total_cost_rub,
+                format_bytes(rt.engine.total_context_bytes())
             );
         }
     }
