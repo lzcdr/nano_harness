@@ -6,6 +6,7 @@ use std::path::PathBuf;
 
 use crate::agent_core::AgentConfig;
 use crate::engine::{EngineConfig, ToolExecutionConfig};
+use crate::godfather::GodfatherConfig;
 use crate::local_storage::VectorDbConfig;
 use crate::local_storage_http_api::LocalStorageServerConfig;
 use crate::message_board::MessageBoardConfig;
@@ -34,9 +35,16 @@ pub struct TomlConfig {
     // Редактор для /rebuke_edit. Если не задан — $EDITOR, иначе notepad (Windows) / vi.
     pub editor: Option<String>,
 
+    // Порог компактизации tool-результатов в байтах.
+    pub compact_threshold_bytes: Option<usize>,
+
+    // Бюджет хвоста в байтах.
+    pub tail_byte_budget: Option<usize>,
+
     pub vector_db: Option<VectorDbConfig>,
     pub local_storage_http_server: Option<LocalStorageServerConfig>,
     pub message_board: Option<MessageBoardConfig>,
+    pub godfather: Option<GodfatherConfig>,
 
     #[serde(default)]
     pub agents: Vec<AgentConfig>,
@@ -116,5 +124,7 @@ pub fn build_engine_config(
         max_cost_rub,
         prefix_message_count,
         tail_message_count,
+        compact_threshold_bytes: toml_config.compact_threshold_bytes.unwrap_or(512),
+        tail_byte_budget: toml_config.tail_byte_budget.unwrap_or(100 * 1024),
     })
 }

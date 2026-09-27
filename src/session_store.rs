@@ -17,6 +17,8 @@ const LOGS_SUBDIR: &str = "logs";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineState {
     pub system_messages: Vec<Message>,
+    #[serde(default)]
+    pub skill_context: Option<Message>,
     pub prefix_turns: Vec<Turn>,
     pub tail_turns: Vec<Turn>,
     pub pending_turn: Option<Turn>,
@@ -201,8 +203,6 @@ pub fn save_session(session: &Session) -> Result<()> {
         ctx.engine_config.api_key = "***".to_string();
     }
 
-    // Защита от race: если в файле уже стоит deleted=true,
-    // не даём перезаписать его в false.
     if !session_clone.deleted {
         if let Some(old_path) = find_session_file(&session.session_id, owner) {
             if let Ok(content) = fs::read_to_string(&old_path) {
@@ -398,7 +398,6 @@ pub fn find_pending_task<'a>(session: &'a Session, task_id: &str) -> Option<&'a 
 
 // ==================== Работа с проектами ====================
 
-/// Помечает все файлы проекта (chat + все агентские сессии) как удалённые.
 pub fn mark_project_deleted(session_id: &str) -> Result<Vec<String>> {
     let mut marked = Vec::new();
     let dir = sessions_dir();
@@ -448,7 +447,6 @@ pub fn mark_project_deleted(session_id: &str) -> Result<Vec<String>> {
     Ok(marked)
 }
 
-/// Физически удаляет все файлы проекта.
 pub fn purge_project(session_id: &str) -> Result<Vec<PathBuf>> {
     let mut deleted = Vec::new();
 
