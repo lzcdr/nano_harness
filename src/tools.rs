@@ -79,6 +79,41 @@ pub fn available_tools() -> Vec<ToolDefinition> {
                 }),
             },
         },
+        ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDefinition {
+                name: "knowledge_load".to_string(),
+                description: "Загружает знание из базы знаний в контекст. \
+                              Загруженное знание остаётся доступным в последующих ходах \
+                              и используется как дополнение к системному промпту. \
+                              Одно активное знание в любой момент: загрузка нового \
+                              вытесняет предыдущее. Каталог знаний доступен в системном промпте."
+                    .to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "Имя знания из каталога"
+                        }
+                    },
+                    "required": ["name"]
+                }),
+            },
+        },
+        ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDefinition {
+                name: "knowledge_unload".to_string(),
+                description: "Снимает активное знание из контекста. \
+                              Вызывай, когда знание больше не релевантно текущей задаче."
+                    .to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {}
+                }),
+            },
+        },
     ]
 }
 

@@ -16,6 +16,7 @@ use nano_harness::agent_core::{OutgoingTasks, PendingCalls};
 use nano_harness::config::{build_engine_config, TomlConfig};
 use nano_harness::engine::{ChatEngine, EngineConfig, Message, Role};
 use nano_harness::godfather::GodfatherConfig;
+use nano_harness::knowledge_manager::KnowledgeEntry;
 use nano_harness::local_storage_http_api::LocalStorageServerConfig;
 use nano_harness::message_board::BoardEvent;
 use nano_harness::session_store::{self, ContextBlock, Session};
@@ -155,6 +156,70 @@ fn make_project_id(name: &str) -> String {
     format!("{}_{}", sanitized, ts)
 }
 
+fn editor_name(toml_config: &TomlConfig) -> String {
+    if let Some(e) = &toml_config.editor {
+        e.clone()
+    } else if let Ok(e) = std::env::var("EDITOR") {
+        e
+    } else if cfg!(target_os = "windows") {
+        "notepad".to_string()
+    } else {
+        "vi".to_string()
+    }
+}
+
+fn run_editor_sync(editor: &str, path: &std::path::Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("не удалось создать каталог {}", parent.display()))?;
+    }
+    let status = std::process::Command::new(editor)
+        .arg(path)
+        .status()
+        .with_context(|| format!("не удалось запустить редактор '{}'", editor))?;
+    if !status.success() {
+        anyhow::bail!("редактор '{}' завершился с ошибкой", editor);
+    }
+    Ok(())
+}
+
+fn edit_buffer_path(kind: &str, name: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from(".sessions")
+        .join(kind)
+        .join(format!("{}.txt", name))
+}
+
+async fn edit_via_buffer(
+    kind: &str,
+    name: &str,
+    initial_content: &str,
+    editor: &str,
+) -> Result<String> {
+    let buffer = edit_buffer_path(kind, name);
+    if let Some(parent) = buffer.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&buffer, initial_content)?;
+
+    if let Err(e) = run_editor_sync(editor, &buffer) {
+        let _ = std::fs::remove_file(&buffer);
+        return Err(e);
+    }
+
+    let edited = std::fs::read_to_string(&buffer)?;
+    let _ = std::fs::remove_file(&buffer);
+    Ok(edited)
+}
+
+async fn refresh_knowledge_catalog(
+    client: &Client,
+    storage_base_url: &str,
+    storage_auth_token: &str,
+) -> Result<Vec<KnowledgeEntry>> {
+    nano_harness::knowledge_manager::list_knowledge(client, storage_base_url, storage_auth_token)
+        .await
+}
+
 fn open_project(
     id: &str,
     display_name: &str,
@@ -178,6 +243,7 @@ fn open_project(
                         name: None,
                     }],
                     skill_context: None,
+                    knowledge_context: None,
                     prefix_turns: vec![],
                     tail_turns: vec![],
                     pending_turn: None,
@@ -725,6 +791,7 @@ async fn main() -> Result<()> {
     println!("     /godfather             — сжать контекст (механически + семантически)");
     println!("     /unfreeze              — вернуть всё из архива godfather");
     println!("     /unfreeze last         — вернуть последний сжатый ход");
+    println!("     /knowledge             — управление базой знаний");
     println!("     /rebuke <агент> <текст> — добавить замечание агенту");
     println!("     /rebuke_edit <агент>   — редактировать замечания в редакторе");
     println!("     /project               — управление проектами");
@@ -885,40 +952,278 @@ async fn main() -> Result<()> {
                     println!("Агент '{}' не найден в конфиге.", agent);
                     continue;
                 }
-                let path = format!(
-                    ".local_storage/{}/.rebukes/{}.txt",
-                    storage_http_config.storage_name, agent
-                );
-                if let Some(parent) = std::path::Path::new(&path).parent() {
-                    if let Err(e) = std::fs::create_dir_all(parent) {
-                        println!("Не удалось создать каталог {}: {}", parent.display(), e);
+
+                let existing = nano_harness::rebuke_manager::load_rebuke(
+                    &client,
+                    &storage_http_config.bind_addr,
+                    &storage_http_config.auth_token,
+                    agent,
+                )
+                .await
+                .unwrap_or_default();
+
+                let editor = editor_name(&toml_config);
+
+                let edited = match edit_via_buffer("rebuke_edit", agent, &existing, &editor).await {
+                    Ok(content) => content,
+                    Err(e) => {
+                        println!("Ошибка редактирования: {:#}", e);
                         continue;
                     }
-                }
-                if !std::path::Path::new(&path).exists() {
-                    if let Err(e) = std::fs::write(&path, "") {
-                        println!("Не удалось создать файл {}: {}", path, e);
-                        continue;
-                    }
-                }
-                let editor: String = if let Some(e) = &toml_config.editor {
-                    e.clone()
-                } else if let Ok(e) = std::env::var("EDITOR") {
-                    e
-                } else if cfg!(target_os = "windows") {
-                    "notepad".to_string()
-                } else {
-                    "vi".to_string()
                 };
-                match std::process::Command::new(&editor).arg(&path).spawn() {
-                    Ok(_) => {
-                        println!(
-                            "Редактор '{}' запущен для {}.\n\
-                             После сохранения перезапусти агента, чтобы он увидел изменения.",
-                            editor, path
-                        );
+
+                match nano_harness::rebuke_manager::save_rebuke(
+                    &client,
+                    &storage_http_config.bind_addr,
+                    &storage_http_config.auth_token,
+                    agent,
+                    &edited,
+                )
+                .await
+                {
+                    Ok(_) => println!(
+                        "Rebuke для '{}' сохранён. Перезапусти агента, чтобы он увидел изменения.",
+                        agent
+                    ),
+                    Err(e) => println!("Ошибка сохранения: {:#}", e),
+                }
+                continue;
+            }
+            "/knowledge" => {
+                println!("Использование:");
+                println!("  /knowledge list              — список знаний");
+                println!("  /knowledge show <name>       — показать содержимое");
+                println!("  /knowledge new <name>        — создать знание");
+                println!("  /knowledge edit <name>       — редактировать знание");
+                println!("  /knowledge delete <name>     — удалить знание");
+                println!("  /knowledge load <name>       — загрузить знание в контекст чата");
+                println!("  /knowledge unload            — снять знание из контекста");
+                continue;
+            }
+            _ if user_input.starts_with("/knowledge ") => {
+                let rest = &user_input[11..];
+                let mut parts = rest.splitn(2, ' ');
+                let sub = parts.next().unwrap_or("").trim();
+                let arg = parts.next().unwrap_or("").trim();
+
+                match sub {
+                    "list" => {
+                        match refresh_knowledge_catalog(
+                            &client,
+                            &storage_http_config.bind_addr,
+                            &storage_http_config.auth_token,
+                        )
+                        .await
+                        {
+                            Ok(entries) if entries.is_empty() => {
+                                println!("База знаний пуста.");
+                            }
+                            Ok(entries) => {
+                                println!("Знания ({}):", entries.len());
+                                for e in entries {
+                                    println!("  {} — {}", e.name, e.description);
+                                }
+                            }
+                            Err(e) => println!("Ошибка: {:#}", e),
+                        }
                     }
-                    Err(e) => println!("Не удалось запустить редактор '{}': {}", editor, e),
+                    "show" => {
+                        if arg.is_empty() {
+                            println!("Использование: /knowledge show <name>");
+                            continue;
+                        }
+                        match nano_harness::knowledge_manager::load_knowledge_raw(
+                            &client,
+                            &storage_http_config.bind_addr,
+                            &storage_http_config.auth_token,
+                            arg,
+                        )
+                        .await
+                        {
+                            Ok(raw) => {
+                                println!("--- {} (полный файл) ---", arg);
+                                println!("{}", raw);
+                                println!("--- конец ---");
+                            }
+                            Err(e) => println!("Ошибка: {:#}", e),
+                        }
+                    }
+                    "new" => {
+                        if arg.is_empty() {
+                            println!("Использование: /knowledge new <name>");
+                            continue;
+                        }
+                        if !nano_harness::knowledge_manager::validate_name(arg) {
+                            println!(
+                                "Недопустимое имя '{}'. Разрешены латиница, цифры, '_', '-'.",
+                                arg
+                            );
+                            continue;
+                        }
+
+                        let existing = nano_harness::knowledge_manager::load_knowledge_raw(
+                            &client,
+                            &storage_http_config.bind_addr,
+                            &storage_http_config.auth_token,
+                            arg,
+                        )
+                        .await;
+                        if existing.is_ok() {
+                            println!(
+                                "Знание '{}' уже существует. Используй /knowledge edit.",
+                                arg
+                            );
+                            continue;
+                        }
+
+                        let template = format!(
+                            "---\nname: {}\ndescription: краткое описание для каталога\n---\n\nТекст знания.\n",
+                            arg
+                        );
+                        let editor = editor_name(&toml_config);
+
+                        let edited = match edit_via_buffer(
+                            "knowledge_edit",
+                            arg,
+                            &template,
+                            &editor,
+                        )
+                        .await
+                        {
+                            Ok(content) => content,
+                            Err(e) => {
+                                println!("Ошибка редактирования: {:#}", e);
+                                continue;
+                            }
+                        };
+
+                        match nano_harness::knowledge_manager::save_knowledge(
+                            &client,
+                            &storage_http_config.bind_addr,
+                            &storage_http_config.auth_token,
+                            arg,
+                            &edited,
+                        )
+                        .await
+                        {
+                            Ok(_) => {
+                                println!("Знание '{}' сохранено и попало в каталог.", arg)
+                            }
+                            Err(e) => println!("Ошибка сохранения: {:#}", e),
+                        }
+                    }
+                    "edit" => {
+                        if arg.is_empty() {
+                            println!("Использование: /knowledge edit <name>");
+                            continue;
+                        }
+                        if !nano_harness::knowledge_manager::validate_name(arg) {
+                            println!("Недопустимое имя '{}'.", arg);
+                            continue;
+                        }
+
+                        let existing = match nano_harness::knowledge_manager::load_knowledge_raw(
+                            &client,
+                            &storage_http_config.bind_addr,
+                            &storage_http_config.auth_token,
+                            arg,
+                        )
+                        .await
+                        {
+                            Ok(c) => c,
+                            Err(_) => {
+                                println!("Знание '{}' не найдено. Используй /knowledge new.", arg);
+                                continue;
+                            }
+                        };
+
+                        let editor = editor_name(&toml_config);
+
+                        let edited = match edit_via_buffer(
+                            "knowledge_edit",
+                            arg,
+                            &existing,
+                            &editor,
+                        )
+                        .await
+                        {
+                            Ok(content) => content,
+                            Err(e) => {
+                                println!("Ошибка редактирования: {:#}", e);
+                                continue;
+                            }
+                        };
+
+                        match nano_harness::knowledge_manager::save_knowledge(
+                            &client,
+                            &storage_http_config.bind_addr,
+                            &storage_http_config.auth_token,
+                            arg,
+                            &edited,
+                        )
+                        .await
+                        {
+                            Ok(_) => {
+                                println!("Знание '{}' сохранено и попало в каталог.", arg)
+                            }
+                            Err(e) => println!("Ошибка сохранения: {:#}", e),
+                        }
+                    }
+                    "delete" => {
+                        if arg.is_empty() {
+                            println!("Использование: /knowledge delete <name>");
+                            continue;
+                        }
+                        match nano_harness::knowledge_manager::delete_knowledge(
+                            &client,
+                            &storage_http_config.bind_addr,
+                            &storage_http_config.auth_token,
+                            arg,
+                        )
+                        .await
+                        {
+                            Ok(_) => println!("Знание '{}' удалено.", arg),
+                            Err(e) => println!("Ошибка: {:#}", e),
+                        }
+                    }
+                    "load" => {
+                        if arg.is_empty() {
+                            println!("Использование: /knowledge load <name>");
+                            continue;
+                        }
+                        match nano_harness::knowledge_manager::load_knowledge(
+                            &client,
+                            &storage_http_config.bind_addr,
+                            &storage_http_config.auth_token,
+                            arg,
+                        )
+                        .await
+                        {
+                            Ok(body) => {
+                                let bytes = body.len();
+                                let mut rt = shared.lock().await;
+                                rt.engine.set_knowledge_context(arg, body);
+                                println!(
+                                    "Знание '{}' загружено в контекст чата ({} байт).",
+                                    arg, bytes
+                                );
+                            }
+                            Err(e) => println!("Ошибка: {:#}", e),
+                        }
+                    }
+                    "unload" => {
+                        let mut rt = shared.lock().await;
+                        if rt.engine.has_knowledge_context() {
+                            rt.engine.clear_knowledge_context();
+                            println!("Знание снято из контекста чата.");
+                        } else {
+                            println!("Активного знания не было.");
+                        }
+                    }
+                    other => {
+                        println!("Неизвестная подкоманда '{}'.", other);
+                        println!("Доступно: list | show | new | edit | delete | load | unload");
+                    }
                 }
                 continue;
             }
@@ -1085,6 +1390,22 @@ async fn main() -> Result<()> {
                     "   Контекст: {} (~{} токенов)",
                     format_bytes(bytes),
                     bytes / 4
+                );
+                println!(
+                    "   Слот скилла: {}",
+                    if rt.engine.has_skill_context() {
+                        "занят"
+                    } else {
+                        "—"
+                    }
+                );
+                println!(
+                    "   Слот знания: {}",
+                    if rt.engine.has_knowledge_context() {
+                        "занят"
+                    } else {
+                        "—"
+                    }
                 );
                 println!();
                 continue;
