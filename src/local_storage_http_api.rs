@@ -11,6 +11,7 @@ use serde::Deserialize;
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 
+use crate::knowledge_manager::KnowledgeEntry;
 use crate::local_storage::{valid_project_id, LocalStorage, VectorDbConfig, SKILLS_PROJECT};
 
 #[derive(Debug, Clone, Deserialize)]
@@ -27,6 +28,7 @@ struct AppState {
     index_tx: mpsc::Sender<IndexTask>,
     skill_index_tx: mpsc::Sender<SkillIndexTask>,
     skill_delete_tx: mpsc::Sender<SkillDeleteTask>,
+    knowledge_catalog: Arc<RwLock<Vec<KnowledgeEntry>>>,
     auth_token: String,
 }
 
@@ -277,6 +279,34 @@ impl FileStorage {
 
     async fn delete_skill_file(&self, path: &str) -> std::io::Result<()> {
         tokio::fs::remove_file(self.resolve_skill(path)?).await
+    }
+
+    fn resolve_knowledge(&self, name: &str) -> std::io::Result<std::path::PathBuf> {
+        if !crate::knowledge_manager::validate_name(name) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid knowledge name",
+            ));
+        }
+        Ok(self.root.join(".knowledge").join(format!("{}.md", name)))
+    }
+
+    async fn read_knowledge_file(&self, name: &str) -> std::io::Result<String> {
+        tokio::fs::read_to_string(self.resolve_knowledge(name)?).await
+    }
+
+    async fn write_knowledge_file(&self, name: &str, content: &str) -> std::io::Result<()> {
+        let full = self.resolve_knowledge(name)?;
+        if let Some(parent) = full.parent() {
+            if !parent.exists() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+        }
+        tokio::fs::write(&full, content).await
+    }
+
+    async fn delete_knowledge_file(&self, name: &str) -> std::io::Result<()> {
+        tokio::fs::remove_file(self.resolve_knowledge(name)?).await
     }
 
     fn resolve_rebuke(&self, agent: &str) -> std::io::Result<std::path::PathBuf> {
@@ -783,6 +813,118 @@ async fn rebuke_put(
     }
 }
 
+#[derive(Deserialize)]
+struct KnowledgeNameQuery {
+    name: String,
+}
+
+async fn scan_knowledge_catalog(root: &std::path::Path) -> Vec<KnowledgeEntry> {
+    let dir = root.join(".knowledge");
+    let mut entries = Vec::new();
+    if let Ok(mut d) = tokio::fs::read_dir(&dir).await {
+        while let Ok(Some(entry)) = d.next_entry().await {
+            let fname = entry.file_name().to_string_lossy().to_string();
+            if !fname.ends_with(".md") {
+                continue;
+            }
+            if let Ok(content) = tokio::fs::read_to_string(entry.path()).await {
+                if let Ok((name, description, _)) =
+                    crate::knowledge_manager::parse_frontmatter(&content)
+                {
+                    entries.push(KnowledgeEntry { name, description });
+                }
+            }
+        }
+    }
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+    entries
+}
+
+async fn knowledge_list(State(state): State<AppState>) -> Response {
+    let catalog = state.knowledge_catalog.read().await;
+    Json(catalog.clone()).into_response()
+}
+
+async fn knowledge_get(
+    State(state): State<AppState>,
+    Query(query): Query<KnowledgeNameQuery>,
+) -> Response {
+    match state
+        .files
+        .read()
+        .await
+        .read_knowledge_file(&query.name)
+        .await
+    {
+        Ok(content) => (StatusCode::OK, content).into_response(),
+        Err(e) => io_error_response(e),
+    }
+}
+
+async fn knowledge_put(
+    State(state): State<AppState>,
+    Query(query): Query<KnowledgeNameQuery>,
+    body: String,
+) -> Response {
+    let (inner_name, _, _) = match crate::knowledge_manager::parse_frontmatter(&body) {
+        Ok(triple) => triple,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("invalid frontmatter: {}", e),
+            )
+                .into_response();
+        }
+    };
+
+    if inner_name != query.name {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!(
+                "name в frontmatter ('{}') не совпадает с именем файла ('{}')",
+                inner_name, query.name
+            ),
+        )
+            .into_response();
+    }
+
+    {
+        let files = state.files.read().await;
+        if let Err(e) = files.write_knowledge_file(&query.name, &body).await {
+            return io_error_response(e);
+        }
+    }
+
+    let new_catalog = {
+        let files = state.files.read().await;
+        scan_knowledge_catalog(&files.root).await
+    };
+    *state.knowledge_catalog.write().await = new_catalog;
+
+    StatusCode::OK.into_response()
+}
+
+async fn knowledge_delete(
+    State(state): State<AppState>,
+    Query(query): Query<KnowledgeNameQuery>,
+) -> Response {
+    {
+        let files = state.files.read().await;
+        match files.delete_knowledge_file(&query.name).await {
+            Ok(_) => {}
+            Err(e) => return io_error_response(e),
+        }
+    }
+
+    let new_catalog = {
+        let files = state.files.read().await;
+        scan_knowledge_catalog(&files.root).await
+    };
+    *state.knowledge_catalog.write().await = new_catalog;
+
+    StatusCode::OK.into_response()
+}
+
 async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
 }
@@ -793,7 +935,9 @@ pub async fn run_server(
 ) -> anyhow::Result<()> {
     let base = std::path::PathBuf::from(".local_storage");
     let root = base.join(&config.storage_name);
+    let knowledge_root = root.clone();
     let files = Arc::new(RwLock::new(FileStorage { root }));
+    let knowledge_catalog = Arc::new(RwLock::new(scan_knowledge_catalog(&knowledge_root).await));
 
     let (search_tx, mut search_rx) = mpsc::channel::<SearchTask>(100);
     let (index_tx, mut index_rx) = mpsc::channel::<IndexTask>(100);
@@ -862,6 +1006,7 @@ pub async fn run_server(
         index_tx,
         skill_index_tx,
         skill_delete_tx,
+        knowledge_catalog,
         auth_token: config.auth_token,
     };
 
@@ -884,6 +1029,10 @@ pub async fn run_server(
         .route("/skills/search", get(skill_search))
         .route("/rebukes/get", get(rebuke_get))
         .route("/rebukes/put", post(rebuke_put))
+        .route("/knowledge/list", get(knowledge_list))
+        .route("/knowledge/get", get(knowledge_get))
+        .route("/knowledge/put", post(knowledge_put))
+        .route("/knowledge/delete", post(knowledge_delete))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,

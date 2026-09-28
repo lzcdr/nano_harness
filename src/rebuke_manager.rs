@@ -34,6 +34,32 @@ pub async fn load_rebuke(
     }
 }
 
+pub async fn save_rebuke(
+    client: &Client,
+    base_url: &str,
+    auth_token: &str,
+    agent_name: &str,
+    content: &str,
+) -> Result<()> {
+    let base = ensure_scheme(base_url);
+    let url = format!("{}/rebukes/put", base.trim_end_matches('/'));
+    let resp = client
+        .post(&url)
+        .query(&[("agent", agent_name)])
+        .header("Authorization", format!("Bearer {}", auth_token))
+        .body(content.to_string())
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        anyhow::bail!(
+            "не удалось сохранить rebuke для '{}': HTTP {}",
+            agent_name,
+            resp.status()
+        );
+    }
+    Ok(())
+}
+
 pub async fn append_rebuke(
     client: &Client,
     base_url: &str,
@@ -50,12 +76,7 @@ pub async fn append_rebuke(
     let new_content = if existing.trim().is_empty() {
         format!("{}\n{}\n", separator, trimmed_text)
     } else {
-        format!(
-            "{}\n{}\n{}\n",
-            existing.trim_end(),
-            separator,
-            trimmed_text
-        )
+        format!("{}\n{}\n{}\n", existing.trim_end(), separator, trimmed_text)
     };
 
     let base = ensure_scheme(base_url);

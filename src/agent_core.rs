@@ -212,7 +212,18 @@ fn write_log(file: &mut fs::File, role: &str, content: &str) -> Result<()> {
 }
 
 pub fn build_engine_config(config: &AgentConfig) -> EngineConfig {
-    let allowed_tools = config.tools.clone();
+    let mut allowed_tools = config.tools.clone();
+
+    // knowledge_load и knowledge_unload разрешены всегда.
+    // Каталог знаний вшивается в системный промпт безусловно, и если
+    // инструменты не будут доступны — модель попробует их вызвать и получит
+    // "unknown tool". Чтобы этого не происходило, добавляем их принудительно.
+    for extra in ["knowledge_load", "knowledge_unload"] {
+        if !allowed_tools.iter().any(|n| n == extra) {
+            allowed_tools.push(extra.to_string());
+        }
+    }
+
     EngineConfig {
         api_key: config.api_key.clone(),
         base_url: config.base_url.clone(),
@@ -412,33 +423,43 @@ pub async fn process_agent_turns(
             }
 
             for tc in &tool_calls {
-                let tool_outcome = execute_agent_tool(
-                    context,
-                    config,
-                    tc,
-                    rhai_timeout,
-                    session_id.clone(),
-                    project_id.clone(),
-                    parent_chain.clone(),
-                )
-                .await;
+                let (result, posted) = if tc.function.name == "knowledge_load" {
+                    let r = handle_knowledge_load(context, engine, tc).await;
+                    eprintln!("✅ Результат '{}': {}", tc.function.name, r);
+                    (r, false)
+                } else if tc.function.name == "knowledge_unload" {
+                    let r = handle_knowledge_unload(engine);
+                    eprintln!("✅ Результат '{}': {}", tc.function.name, r);
+                    (r, false)
+                } else {
+                    let tool_outcome = execute_agent_tool(
+                        context,
+                        config,
+                        tc,
+                        rhai_timeout,
+                        session_id.clone(),
+                        project_id.clone(),
+                        parent_chain.clone(),
+                    )
+                    .await;
 
-                let (result, posted) = match tool_outcome {
-                    Ok(pair) => {
-                        eprintln!("✅ Результат '{}': {}", tc.function.name, pair.0);
-                        pair
-                    }
-                    Err(e) => {
-                        eprintln!("❌ Ошибка '{}': {:#}", tc.function.name, e);
-                        write_log(
-                            log_file,
-                            "tool_error",
-                            &format!(
-                                "{} ({}) -> {:#}",
-                                tc.function.name, tc.function.arguments, e
-                            ),
-                        )?;
-                        return Err(e);
+                    match tool_outcome {
+                        Ok(pair) => {
+                            eprintln!("✅ Результат '{}': {}", tc.function.name, pair.0);
+                            pair
+                        }
+                        Err(e) => {
+                            eprintln!("❌ Ошибка '{}': {:#}", tc.function.name, e);
+                            write_log(
+                                log_file,
+                                "tool_error",
+                                &format!(
+                                    "{} ({}) -> {:#}",
+                                    tc.function.name, tc.function.arguments, e
+                                ),
+                            )?;
+                            return Err(e);
+                        }
                     }
                 };
 
@@ -758,6 +779,47 @@ async fn execute_agent_tool(
             Ok((result, false))
         }
         _ => Err(anyhow::anyhow!("Unknown tool: {}", tool_call.function.name)),
+    }
+}
+
+async fn handle_knowledge_load(
+    context: &AgentContext,
+    engine: &mut ChatEngine,
+    tool_call: &ToolCall,
+) -> String {
+    let parsed: serde_json::Value =
+        serde_json::from_str(&tool_call.function.arguments).unwrap_or(serde_json::json!({}));
+    let name = match parsed.get("name").and_then(|v| v.as_str()) {
+        Some(n) if !n.trim().is_empty() => n.trim().to_string(),
+        _ => return "Ошибка: не указано имя знания".to_string(),
+    };
+
+    match crate::knowledge_manager::load_knowledge(
+        &context.http_client,
+        &context.storage_base_url,
+        &context.storage_auth_token,
+        &name,
+    )
+    .await
+    {
+        Ok(content) => {
+            let bytes = content.len();
+            engine.set_knowledge_context(&name, content);
+            format!(
+                "Знание '{}' загружено в контекст ({} байт). Оно будет доступно в последующих ходах.",
+                name, bytes
+            )
+        }
+        Err(e) => format!("Ошибка загрузки знания '{}': {:#}", name, e),
+    }
+}
+
+fn handle_knowledge_unload(engine: &mut ChatEngine) -> String {
+    if engine.has_knowledge_context() {
+        engine.clear_knowledge_context();
+        "Знание снято из контекста".to_string()
+    } else {
+        "Активного знания не было".to_string()
     }
 }
 

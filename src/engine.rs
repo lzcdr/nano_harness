@@ -196,6 +196,8 @@ pub struct ChatEngine {
     system_messages: Vec<Message>,
     /// Отдельный слот под инжектнутый скилл. Не копится, перезаписывается.
     skill_context: Option<Message>,
+    /// Отдельный слот под загруженное знание. Не копится, перезаписывается.
+    knowledge_context: Option<Message>,
     prefix_turns: Vec<Turn>,
     tail_turns: Vec<Turn>,
     pending_turn: Option<Turn>,
@@ -211,6 +213,7 @@ impl ChatEngine {
             config,
             system_messages: Vec::new(),
             skill_context: None,
+            knowledge_context: None,
             prefix_turns: Vec::new(),
             tail_turns: Vec::new(),
             pending_turn: None,
@@ -263,12 +266,33 @@ impl ChatEngine {
         self.skill_context.is_some()
     }
 
+    /// Установить контекст знания. Перезаписывает предыдущий.
+    pub fn set_knowledge_context(&mut self, name: &str, content: String) {
+        self.knowledge_context = Some(Message {
+            role: Role::System,
+            content: Some(format!("[Загруженное знание: {}]\n\n{}", name, content)),
+            reasoning: None,
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        });
+    }
+
+    pub fn clear_knowledge_context(&mut self) {
+        self.knowledge_context = None;
+    }
+
+    pub fn has_knowledge_context(&self) -> bool {
+        self.knowledge_context.is_some()
+    }
+
     pub fn clear_context(&mut self) {
         self.finalize_pending_turn();
         self.prefix_turns.clear();
         self.tail_turns.clear();
         self.pending_turn = None;
         self.skill_context = None;
+        self.knowledge_context = None;
     }
 
     pub fn set_system_prompt(&mut self, prompt: String) {
@@ -464,6 +488,9 @@ impl ChatEngine {
         if let Some(m) = &self.skill_context {
             total += message_bytes(m);
         }
+        if let Some(m) = &self.knowledge_context {
+            total += message_bytes(m);
+        }
         for t in &self.prefix_turns {
             for m in &t.messages {
                 total += message_bytes(m);
@@ -488,6 +515,9 @@ impl ChatEngine {
         result.extend(self.system_messages.iter().cloned());
         if let Some(skill) = &self.skill_context {
             result.push(skill.clone());
+        }
+        if let Some(knowledge) = &self.knowledge_context {
+            result.push(knowledge.clone());
         }
         for turn in &self.prefix_turns {
             result.extend(turn.messages.iter().cloned());
@@ -838,6 +868,7 @@ impl ChatEngine {
         crate::session_store::EngineState {
             system_messages: self.system_messages.clone(),
             skill_context: self.skill_context.clone(),
+            knowledge_context: self.knowledge_context.clone(),
             prefix_turns: self.prefix_turns.clone(),
             tail_turns: self.tail_turns.clone(),
             pending_turn: self.pending_turn.clone(),
@@ -848,6 +879,7 @@ impl ChatEngine {
     pub fn set_state(&mut self, state: crate::session_store::EngineState) {
         self.system_messages = state.system_messages;
         self.skill_context = state.skill_context;
+        self.knowledge_context = state.knowledge_context;
         self.prefix_turns = state.prefix_turns;
         self.tail_turns = state.tail_turns;
         self.pending_turn = state.pending_turn;
