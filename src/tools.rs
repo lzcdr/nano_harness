@@ -33,7 +33,7 @@ pub struct BoardContext {
 
 pub fn available_tools() -> Vec<ToolDefinition> {
     vec![
-        ToolDefinition {
+                ToolDefinition {
             tool_type: "function".to_string(),
             function: FunctionDefinition {
                 name: "run_code".to_string(),
@@ -125,6 +125,19 @@ pub fn register_basic_functions(engine: &mut Engine) {
         format!("Погода в городе {}: солнечно, +22°C (заглушка)", city)
     });
     engine.register_fn("slice", |s: String, start: i64, len: i64| -> String {
+        let chars: Vec<char> = s.chars().collect();
+        let start_idx = if start < 0 {
+            (chars.len() as i64 + start).max(0) as usize
+        } else {
+            start as usize
+        };
+        chars
+            .into_iter()
+            .skip(start_idx)
+            .take(len.max(0) as usize)
+            .collect()
+    });
+    engine.register_fn("substring", |s: String, start: i64, len: i64| -> String {
         let chars: Vec<char> = s.chars().collect();
         let start_idx = if start < 0 {
             (chars.len() as i64 + start).max(0) as usize
@@ -593,7 +606,8 @@ fn run_rhai_code(
         );
     }
 
-    match engine.eval::<Dynamic>(code) {
+    let normalized = normalize_multiline_strings(code);
+    match engine.eval::<Dynamic>(&normalized) {
         Ok(result) => {
             let printed = output.borrow().clone();
             if !printed.is_empty() {
@@ -876,4 +890,112 @@ fn endpoint_for_action(action: &str) -> &'static str {
         "read_summary" | "write_summary" => "/summary",
         _ => "/",
     }
+}
+
+/// Прогоняет код Rhai через простой нормализатор строк.
+/// Заменяет реальные переносы строк внутри двойных кавычек на `\n`,
+/// чтобы Rhai не падал с «Open string is not terminated».
+/// Бэктик-литералы и комментарии не трогает.
+pub fn normalize_multiline_strings(code: &str) -> String {
+    let mut out = String::with_capacity(code.len());
+    let chars: Vec<char> = code.chars().collect();
+    let mut i = 0;
+
+    #[derive(PartialEq)]
+    enum State {
+        Normal,
+        InString,
+        InBacktick,
+        InLineComment,
+        InBlockComment,
+    }
+
+    let mut state = State::Normal;
+
+    while i < chars.len() {
+        let c = chars[i];
+
+        match state {
+            State::Normal => {
+                if c == '/' && i + 1 < chars.len() && chars[i + 1] == '/' {
+                    out.push(c);
+                    out.push(chars[i + 1]);
+                    i += 2;
+                    state = State::InLineComment;
+                    continue;
+                }
+                if c == '/' && i + 1 < chars.len() && chars[i + 1] == '*' {
+                    out.push(c);
+                    out.push(chars[i + 1]);
+                    i += 2;
+                    state = State::InBlockComment;
+                    continue;
+                }
+                if c == '"' {
+                    out.push(c);
+                    state = State::InString;
+                } else if c == '`' {
+                    out.push(c);
+                    state = State::InBacktick;
+                } else {
+                    out.push(c);
+                }
+            }
+            State::InString => {
+                if c == '\\' && i + 1 < chars.len() {
+                    out.push(c);
+                    out.push(chars[i + 1]);
+                    i += 2;
+                    continue;
+                }
+                if c == '"' {
+                    out.push(c);
+                    state = State::Normal;
+                } else if c == '\n' {
+                    out.push('\\');
+                    out.push('n');
+                } else if c == '\r' {
+                    // пропускаем, если за ним идёт \n — иначе получим двойной перевод
+                    if i + 1 < chars.len() && chars[i + 1] == '\n' {
+                        // ничего не делаем, следующий символ обработает \n
+                    } else {
+                        out.push('\\');
+                        out.push('n');
+                    }
+                } else {
+                    out.push(c);
+                }
+            }
+            State::InBacktick => {
+                if c == '\\' && i + 1 < chars.len() {
+                    out.push(c);
+                    out.push(chars[i + 1]);
+                    i += 2;
+                    continue;
+                }
+                if c == '`' {
+                    state = State::Normal;
+                }
+                out.push(c);
+            }
+            State::InLineComment => {
+                out.push(c);
+                if c == '\n' {
+                    state = State::Normal;
+                }
+            }
+            State::InBlockComment => {
+                out.push(c);
+                if c == '*' && i + 1 < chars.len() && chars[i + 1] == '/' {
+                    out.push(chars[i + 1]);
+                    i += 2;
+                    state = State::Normal;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+
+    out
 }

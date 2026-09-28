@@ -879,7 +879,8 @@ fn run_code_with_storage(
         );
     }
 
-    match engine.eval::<rhai::Dynamic>(code) {
+    let normalized = crate::tools::normalize_multiline_strings(code);
+    match engine.eval::<rhai::Dynamic>(&normalized) {
         Ok(result) => {
             let printed = output.borrow().clone();
             if !printed.is_empty() {
