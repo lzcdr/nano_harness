@@ -3,12 +3,9 @@
 use anyhow::{Context, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
-use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::timeout;
@@ -68,8 +65,6 @@ pub struct AgentConfig {
     #[serde(default)]
     pub reasoning_effort: Option<String>,
     #[serde(default)]
-    pub rhai_timeout_sec: Option<u64>,
-    #[serde(default)]
     pub agent_type: AgentType,
     #[serde(default)]
     pub session_ttl_secs: Option<u64>,
@@ -77,12 +72,10 @@ pub struct AgentConfig {
     pub skill_mode: String,
     #[serde(default = "default_skill_semantic_threshold")]
     pub skill_semantic_threshold: f32,
-    #[serde(default = "default_skill_min_code_length")]
-    pub skill_min_code_length: usize,
+    #[serde(default = "default_skill_min_tool_calls")]
+    pub skill_min_tool_calls: usize,
     #[serde(default)]
     pub agent_call_timeout_sec: Option<u64>,
-    #[serde(default = "default_skill_auto_execute_threshold")]
-    pub skill_auto_execute_threshold: f32,
     #[serde(default)]
     pub max_cost_rub: Option<f64>,
     #[serde(default)]
@@ -97,11 +90,8 @@ fn default_skill_mode() -> String {
 fn default_skill_semantic_threshold() -> f32 {
     0.5
 }
-fn default_skill_min_code_length() -> usize {
-    100
-}
-fn default_skill_auto_execute_threshold() -> f32 {
-    0.15
+fn default_skill_min_tool_calls() -> usize {
+    2
 }
 
 #[derive(Debug, Deserialize)]
@@ -214,10 +204,6 @@ fn write_log(file: &mut fs::File, role: &str, content: &str) -> Result<()> {
 pub fn build_engine_config(config: &AgentConfig) -> EngineConfig {
     let mut allowed_tools = config.tools.clone();
 
-    // knowledge_load и knowledge_unload разрешены всегда.
-    // Каталог знаний вшивается в системный промпт безусловно, и если
-    // инструменты не будут доступны — модель попробует их вызвать и получит
-    // "unknown tool". Чтобы этого не происходило, добавляем их принудительно.
     for extra in ["knowledge_load", "knowledge_unload"] {
         if !allowed_tools.iter().any(|n| n == extra) {
             allowed_tools.push(extra.to_string());
@@ -261,6 +247,69 @@ pub fn create_agent_engine(config: &AgentConfig) -> Result<ChatEngine> {
     Ok(ChatEngine::new(engine_config, client))
 }
 
+fn tool_context_for_agent(
+    context: &AgentContext,
+    project_id: &str,
+    session_id: Option<String>,
+    parent_chain: Vec<String>,
+) -> crate::tool_runtime::ToolContext {
+    crate::tool_runtime::ToolContext {
+        http_client: context.http_client.clone(),
+        storage_base_url: context.storage_base_url.clone(),
+        storage_auth_token: context.storage_auth_token.clone(),
+        board_base_url: context.board_base_url.clone(),
+        board_auth_token: context.board_auth_token.clone(),
+        project_id: project_id.to_string(),
+        session_id,
+        parent_chain,
+        self_agent_name: context.self_name.clone().unwrap_or_default(),
+        pending_calls: context.pending_calls.clone(),
+        outgoing_tasks: context.outgoing_tasks.clone(),
+        agent_call_timeout_sec: context.agent_call_timeout_sec,
+    }
+}
+
+async fn handle_knowledge_load(
+    context: &AgentContext,
+    engine: &mut ChatEngine,
+    tool_call: &ToolCall,
+) -> String {
+    let parsed: serde_json::Value =
+        serde_json::from_str(&tool_call.function.arguments).unwrap_or(serde_json::json!({}));
+    let name = match parsed.get("name").and_then(|v| v.as_str()) {
+        Some(n) if !n.trim().is_empty() => n.trim().to_string(),
+        _ => return "Ошибка: не указано имя знания".to_string(),
+    };
+
+    match crate::knowledge_manager::load_knowledge(
+        &context.http_client,
+        &context.storage_base_url,
+        &context.storage_auth_token,
+        &name,
+    )
+    .await
+    {
+        Ok(content) => {
+            let bytes = content.len();
+            engine.set_knowledge_context(&name, content);
+            format!(
+                "Знание '{}' загружено в контекст ({} байт). Оно будет доступно в последующих ходах.",
+                name, bytes
+            )
+        }
+        Err(e) => format!("Ошибка загрузки знания '{}': {:#}", name, e),
+    }
+}
+
+fn handle_knowledge_unload(engine: &mut ChatEngine) -> String {
+    if engine.has_knowledge_context() {
+        engine.clear_knowledge_context();
+        "Знание снято из контекста".to_string()
+    } else {
+        "Активного знания не было".to_string()
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn process_agent_turns(
     engine: &mut ChatEngine,
@@ -275,14 +324,13 @@ pub async fn process_agent_turns(
     let max_iterations = request.max_iterations.unwrap_or(config.max_iterations);
     let mut tool_calls_log = Vec::new();
     let mut final_response = None;
-    let rhai_timeout = config.rhai_timeout_sec.unwrap_or(30);
     let mut posted_any = false;
 
-    let mut skill_found = false;
+    let mut injected_skill: Option<crate::skill_manager::SkillRecord> = None;
 
-    // Скилл-контекст живёт только текущий ход. Сбрасываем перед новым поиском.
     engine.clear_skill_context();
 
+    // ==================== Поиск и инжект скилла ====================
     if config.skill_mode == "auto" && !request.prompt.trim().is_empty() {
         let storage_base_url = context.storage_base_url.clone();
         let storage_auth_token = context.storage_auth_token.clone();
@@ -325,84 +373,24 @@ pub async fn process_agent_turns(
             .map_err(|e| anyhow::anyhow!("Join error: {}", e))??;
 
             write_log(log_file, "skill_found", &skill_record.skill_file)?;
-            eprintln!("🔍 Найден скилл: {}", skill_record.skill_file);
+            eprintln!(
+                "🔍 Найден скилл: {} (distance: {:.4})",
+                skill_record.skill_file, distance
+            );
 
-            if distance <= config.skill_auto_execute_threshold {
-                let code = extract_rhai_code(&content)
-                    .ok_or_else(|| anyhow::anyhow!("RHAI_CODE not found in skill"))?;
-
-                write_log(
-                    log_file,
-                    "skill_auto_execute",
-                    &format!("{} (distance: {:.4})", skill_record.skill_file, distance),
-                )?;
-
-                let result = execute_skill_code_directly(
-                    context,
-                    config,
-                    code.clone(),
-                    session_id.clone(),
-                    project_id.clone(),
-                    parent_chain.clone(),
-                )
-                .await;
-
-                let success = result.is_ok();
-                let storage_base_url = context.storage_base_url.clone();
-                let storage_auth_token = context.storage_auth_token.clone();
-                let skill_file = skill_record.skill_file.clone();
-                tokio::task::spawn_blocking(move || {
-                    let client = reqwest::blocking::Client::new();
-                    if let Err(e) = crate::skill_manager::record_usage(
-                        &client,
-                        &storage_base_url,
-                        &storage_auth_token,
-                        &skill_file,
-                        success,
-                    ) {
-                        eprintln!("⚠️ Не удалось обновить счётчик скилла: {}", e);
-                    }
-                });
-
-                let result = result?;
-
-                write_log(
-                    log_file,
-                    "tool_result",
-                    &format!("run_code (auto from skill) -> {}", result),
-                )?;
-
-                engine.add_message(Role::Assistant, result.clone());
-                write_log(log_file, "assistant", &result)?;
-
-                let tool_log = ToolCallLogEntry {
-                    name: "run_code".to_string(),
-                    arguments: serde_json::json!({ "code": code }).to_string(),
-                    result: result.clone(),
-                };
-
-                return Ok(AgentResponse {
-                    status: "completed".to_string(),
-                    result,
-                    reasoning: None,
-                    tool_calls_log: vec![tool_log],
-                    metrics: AgentMetrics {
-                        prompt_tokens: 0,
-                        completion_tokens: 0,
-                        cost_rub: 0.0,
-                        api_calls_count: 0,
-                    },
-                    error: None,
-                    session_id: None,
-                });
-            } else {
-                engine.set_skill_context(format!("Найден подходящий скилл:\n{}", content));
+            if let Some(calls) = crate::skill_manager::parse_tool_calls(&content) {
+                let injection =
+                    crate::skill_manager::format_skill_for_injection(&skill_record, &calls);
+                engine.set_skill_context(injection);
                 write_log(log_file, "skill_injected", &skill_record.skill_file)?;
-                skill_found = true;
+                injected_skill = Some(skill_record);
+            } else {
+                write_log(log_file, "skill_parse_failed", &skill_record.skill_file)?;
             }
         }
     }
 
+    // ==================== Цикл LLM ====================
     for _ in 0..=max_iterations {
         let response = timeout(Duration::from_secs(config.timeout_sec), engine.send())
             .await
@@ -431,36 +419,26 @@ pub async fn process_agent_turns(
                     let r = handle_knowledge_unload(engine);
                     eprintln!("✅ Результат '{}': {}", tc.function.name, r);
                     (r, false)
-                } else {
-                    let tool_outcome = execute_agent_tool(
+                } else if crate::tool_runtime::find(&tc.function.name).is_some() {
+                    let tool_ctx = tool_context_for_agent(
                         context,
-                        config,
-                        tc,
-                        rhai_timeout,
+                        &project_id,
                         session_id.clone(),
-                        project_id.clone(),
                         parent_chain.clone(),
+                    );
+                    let r = crate::tool_runtime::execute(
+                        &tc.function.name,
+                        &tc.function.arguments,
+                        &tool_ctx,
                     )
                     .await;
-
-                    match tool_outcome {
-                        Ok(pair) => {
-                            eprintln!("✅ Результат '{}': {}", tc.function.name, pair.0);
-                            pair
-                        }
-                        Err(e) => {
-                            eprintln!("❌ Ошибка '{}': {:#}", tc.function.name, e);
-                            write_log(
-                                log_file,
-                                "tool_error",
-                                &format!(
-                                    "{} ({}) -> {:#}",
-                                    tc.function.name, tc.function.arguments, e
-                                ),
-                            )?;
-                            return Err(e);
-                        }
-                    }
+                    let posted = r.contains("\"content\":\"posted:");
+                    eprintln!("✅ Результат '{}': {}", tc.function.name, r);
+                    (r, posted)
+                } else {
+                    let r = format!("Ошибка: неизвестный инструмент '{}'", tc.function.name);
+                    eprintln!("❌ {}", r);
+                    (r, false)
                 };
 
                 write_log(
@@ -480,7 +458,7 @@ pub async fn process_agent_turns(
 
                 engine.add_tool_result(tc.id.clone(), result.clone());
 
-                if posted || result.starts_with("posted:") {
+                if posted {
                     posted_any = true;
                 }
             }
@@ -515,115 +493,145 @@ pub async fn process_agent_turns(
 
     let final_response = final_response.ok_or_else(|| anyhow::anyhow!("No response from agent"))?;
 
-    let final_content =
-        if final_response.content.trim().is_empty() && final_response.tool_calls.is_some() {
-            tool_calls_log
-                .last()
-                .map(|t| t.result.clone())
-                .unwrap_or_else(|| "(пустой результат: исчерпан max_iterations)".to_string())
-        } else {
-            final_response.content.clone()
-        };
+    let final_content = if !final_response.content.trim().is_empty() {
+        final_response.content.clone()
+    } else if final_response.tool_calls.is_some() {
+        tool_calls_log
+            .last()
+            .map(|t| t.result.clone())
+            .unwrap_or_else(|| "(пустой результат: исчерпан max_iterations)".to_string())
+    } else if !final_response.reasoning.trim().is_empty() {
+        final_response.reasoning.clone()
+    } else {
+        "(пустой ответ модели)".to_string()
+    };
 
-    if config.skill_mode == "auto" && !skill_found {
-        let rhai_calls: Vec<&ToolCallLogEntry> = tool_calls_log
+    // ==================== Auto-save скилла ====================
+    if config.skill_mode == "auto" {
+        let successful: Vec<&ToolCallLogEntry> = tool_calls_log
             .iter()
-            .filter(|t| t.name == "run_code" && !t.result.starts_with("Ошибка"))
+            .filter(|t| !t.result.contains("\"ok\":false") && !t.result.starts_with("Ошибка"))
             .collect();
-        for call in rhai_calls {
-            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&call.arguments) {
-                if let Some(code_ref) = parsed.get("code").and_then(|v| v.as_str()) {
-                    let code = code_ref.to_string();
 
-                    let min_len = config.skill_min_code_length;
-                    let trimmed_len = code.trim().len();
-                    if trimmed_len < min_len {
+        let min_calls = config.skill_min_tool_calls;
+
+        if successful.len() < min_calls {
+            write_log(
+                log_file,
+                "skill_skipped",
+                &format!("(too few calls) ({} < {})", successful.len(), min_calls),
+            )?;
+            eprintln!(
+                "⏭️ Скилл не сохранён: успешных вызовов {} < {}",
+                successful.len(),
+                min_calls
+            );
+        } else {
+            let engine_config = build_engine_config(config);
+            let (skill_name, skill_description) =
+                match crate::skill_manager::generate_skill_metadata(&engine_config, &request.prompt)
+                    .await
+                {
+                    Ok(meta) => meta,
+                    Err(e) => {
+                        write_log(log_file, "skill_metadata_failed", &format!("{}", e))?;
+                        (String::new(), String::new())
+                    }
+                };
+
+            if !skill_name.is_empty() || !skill_description.is_empty() {
+                let tool_records: Vec<crate::skill_manager::ToolCallRecord> = successful
+                    .iter()
+                    .filter_map(|t| {
+                        let args: serde_json::Value =
+                            serde_json::from_str(&t.arguments).unwrap_or(serde_json::json!({}));
+                        Some(crate::skill_manager::ToolCallRecord {
+                            name: t.name.clone(),
+                            arguments: args,
+                        })
+                    })
+                    .collect();
+
+                let storage_base_url = context.storage_base_url.clone();
+                let storage_auth_token = context.storage_auth_token.clone();
+                let agent_name = config.name.clone();
+                let prompt = request.prompt.clone();
+                let skill_name_for_log = skill_name.clone();
+
+                let outcome = match tokio::task::spawn_blocking(move || {
+                    let client = reqwest::blocking::Client::new();
+                    crate::skill_manager::save_skill(
+                        &client,
+                        &storage_base_url,
+                        &storage_auth_token,
+                        &skill_name,
+                        &agent_name,
+                        &skill_description,
+                        &prompt,
+                        &tool_records,
+                        min_calls,
+                    )
+                })
+                .await
+                {
+                    Ok(Ok(o)) => o,
+                    Ok(Err(e)) => {
+                        write_log(log_file, "skill_save_error", &format!("{}", e))?;
+                        eprintln!("⚠️ Ошибка сохранения скилла: {}", e);
+                        crate::skill_manager::SaveSkillOutcome::SkippedTooFewCalls {
+                            actual: 0,
+                            min: 0,
+                        }
+                    }
+                    Err(e) => {
+                        write_log(log_file, "skill_save_error", &format!("Join error: {}", e))?;
+                        eprintln!("⚠️ Join error при сохранении скилла: {}", e);
+                        crate::skill_manager::SaveSkillOutcome::SkippedTooFewCalls {
+                            actual: 0,
+                            min: 0,
+                        }
+                    }
+                };
+
+                match outcome {
+                    crate::skill_manager::SaveSkillOutcome::Saved => {
+                        write_log(log_file, "skill_saved", &skill_name_for_log)?;
+                        eprintln!("💾 Скилл сохранён: {}", skill_name_for_log);
+                    }
+                    crate::skill_manager::SaveSkillOutcome::SkippedTooFewCalls { actual, min } => {
                         write_log(
                             log_file,
                             "skill_skipped",
-                            &format!("(too short) ({} < {})", trimmed_len, min_len),
+                            &format!("{} ({} < {})", skill_name_for_log, actual, min),
                         )?;
-                        eprintln!(
-                            "⏭️ Скилл не сохранён: код {} символов < {}",
-                            trimmed_len, min_len
-                        );
-                        continue;
                     }
-
-                    let engine_config = build_engine_config(config);
-                    let (skill_name, skill_description) =
-                        match crate::skill_manager::generate_skill_metadata(
-                            &engine_config,
-                            &request.prompt,
-                        )
-                        .await
-                        {
-                            Ok(meta) => meta,
-                            Err(e) => {
-                                write_log(log_file, "skill_metadata_failed", &format!("{}", e))?;
-                                continue;
-                            }
-                        };
-
-                    let storage_base_url = context.storage_base_url.clone();
-                    let storage_auth_token = context.storage_auth_token.clone();
-                    let agent_name = config.name.clone();
-                    let prompt = request.prompt.clone();
-                    let skill_name_for_log = skill_name.clone();
-
-                    let outcome = match tokio::task::spawn_blocking(move || {
-                        let client = reqwest::blocking::Client::new();
-                        crate::skill_manager::save_skill(
-                            &client,
-                            &storage_base_url,
-                            &storage_auth_token,
-                            &skill_name,
-                            &agent_name,
-                            &skill_description,
-                            &prompt,
-                            &code,
-                            min_len,
-                        )
-                    })
-                    .await
-                    {
-                        Ok(Ok(o)) => o,
-                        Ok(Err(e)) => {
-                            write_log(log_file, "skill_save_error", &format!("{}", e))?;
-                            eprintln!("⚠️ Ошибка сохранения скилла: {}", e);
-                            continue;
-                        }
-                        Err(e) => {
-                            write_log(log_file, "skill_save_error", &format!("Join error: {}", e))?;
-                            eprintln!("⚠️ Join error при сохранении скилла: {}", e);
-                            continue;
-                        }
-                    };
-
-                    match outcome {
-                        crate::skill_manager::SaveSkillOutcome::Saved => {
-                            write_log(log_file, "skill_saved", &skill_name_for_log)?;
-                            eprintln!("💾 Скилл сохранён: {}", skill_name_for_log);
-                        }
-                        crate::skill_manager::SaveSkillOutcome::SkippedTooShort { actual, min } => {
-                            write_log(
-                                log_file,
-                                "skill_skipped",
-                                &format!("{} ({} < {})", skill_name_for_log, actual, min),
-                            )?;
-                            eprintln!(
-                                "⏭️ Скилл не сохранён: {} ({} < {})",
-                                skill_name_for_log, actual, min
-                            );
-                        }
-                        crate::skill_manager::SaveSkillOutcome::SkippedDuplicate => {
-                            write_log(log_file, "skill_skipped_duplicate", &skill_name_for_log)?;
-                            eprintln!("♻️ Скилл пропущен (дубликат): {}", skill_name_for_log);
-                        }
+                    crate::skill_manager::SaveSkillOutcome::SkippedDuplicate => {
+                        write_log(log_file, "skill_skipped_duplicate", &skill_name_for_log)?;
+                        eprintln!("♻️ Скилл пропущен (дубликат): {}", skill_name_for_log);
                     }
                 }
             }
         }
+    }
+
+    // ==================== Запись об использовании скилла ====================
+    if let Some(rec) = injected_skill {
+        let storage_base_url = context.storage_base_url.clone();
+        let storage_auth_token = context.storage_auth_token.clone();
+        let skill_file = rec.skill_file.clone();
+        let success = !final_content.starts_with("(пустой");
+        tokio::task::spawn_blocking(move || {
+            let client = reqwest::blocking::Client::new();
+            if let Err(e) = crate::skill_manager::record_usage(
+                &client,
+                &storage_base_url,
+                &storage_auth_token,
+                &skill_file,
+                success,
+            ) {
+                eprintln!("⚠️ Не удалось обновить счётчик скилла: {}", e);
+            }
+        });
     }
 
     let metrics = AgentMetrics {
@@ -697,252 +705,4 @@ pub async fn run_agent(
     .await?;
     response.session_id = request.session_id;
     Ok(response)
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn execute_agent_tool(
-    context: &AgentContext,
-    config: &AgentConfig,
-    tool_call: &ToolCall,
-    rhai_timeout_sec: u64,
-    session_id: Option<String>,
-    project_id: String,
-    parent_chain: Vec<String>,
-) -> Result<(String, bool)> {
-    match tool_call.function.name.as_str() {
-        "run_code" => {
-            let parsed: serde_json::Value = serde_json::from_str(&tool_call.function.arguments)
-                .unwrap_or(serde_json::json!({"code": ""}));
-            let code = parsed
-                .get("code")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-
-            let storage_base_url = context.storage_base_url.clone();
-            let storage_auth_token = context.storage_auth_token.clone();
-            let self_name = context.self_name.clone();
-            let agent_call_timeout = context.agent_call_timeout_sec;
-            let board_url = context.board_base_url.clone();
-            let board_token = context.board_auth_token.clone();
-            let pending_calls = context.pending_calls.clone();
-            let outgoing_tasks = context.outgoing_tasks.clone();
-            let timeout_duration = Duration::from_secs(rhai_timeout_sec);
-            let config_owned = config.clone();
-            let pid = project_id.clone();
-
-            let posted_flag = Arc::new(AtomicBool::new(false));
-            let posted_flag_clone = posted_flag.clone();
-
-            let result = tokio::time::timeout(
-                timeout_duration,
-                tokio::task::spawn_blocking(move || {
-                    run_code_with_storage(
-                        storage_base_url,
-                        storage_auth_token,
-                        self_name,
-                        agent_call_timeout,
-                        board_url,
-                        board_token,
-                        session_id,
-                        pid,
-                        parent_chain,
-                        pending_calls,
-                        outgoing_tasks,
-                        posted_flag_clone,
-                        &config_owned,
-                        &code,
-                    )
-                }),
-            )
-            .await
-            .map_err(|_| anyhow::anyhow!("Rhai execution timed out"))?;
-
-            let result = result.map_err(|e| anyhow::anyhow!("JoinError: {}", e))?;
-            let result = result.map_err(|e| anyhow::anyhow!("Rhai execution error: {}", e))?;
-
-            let posted = posted_flag.load(Ordering::Relaxed);
-            Ok((result, posted))
-        }
-        "local_storage" => {
-            let result = crate::tools::execute_tool(
-                "local_storage",
-                &tool_call.function.arguments,
-                Some(&context.http_client),
-                &context.storage_base_url,
-                &context.storage_auth_token,
-                &project_id,
-                rhai_timeout_sec,
-                None,
-            )
-            .await;
-            Ok((result, false))
-        }
-        _ => Err(anyhow::anyhow!("Unknown tool: {}", tool_call.function.name)),
-    }
-}
-
-async fn handle_knowledge_load(
-    context: &AgentContext,
-    engine: &mut ChatEngine,
-    tool_call: &ToolCall,
-) -> String {
-    let parsed: serde_json::Value =
-        serde_json::from_str(&tool_call.function.arguments).unwrap_or(serde_json::json!({}));
-    let name = match parsed.get("name").and_then(|v| v.as_str()) {
-        Some(n) if !n.trim().is_empty() => n.trim().to_string(),
-        _ => return "Ошибка: не указано имя знания".to_string(),
-    };
-
-    match crate::knowledge_manager::load_knowledge(
-        &context.http_client,
-        &context.storage_base_url,
-        &context.storage_auth_token,
-        &name,
-    )
-    .await
-    {
-        Ok(content) => {
-            let bytes = content.len();
-            engine.set_knowledge_context(&name, content);
-            format!(
-                "Знание '{}' загружено в контекст ({} байт). Оно будет доступно в последующих ходах.",
-                name, bytes
-            )
-        }
-        Err(e) => format!("Ошибка загрузки знания '{}': {:#}", name, e),
-    }
-}
-
-fn handle_knowledge_unload(engine: &mut ChatEngine) -> String {
-    if engine.has_knowledge_context() {
-        engine.clear_knowledge_context();
-        "Знание снято из контекста".to_string()
-    } else {
-        "Активного знания не было".to_string()
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn run_code_with_storage(
-    storage_base_url: String,
-    storage_auth_token: String,
-    self_name: Option<String>,
-    agent_call_timeout_sec: u64,
-    board_url: String,
-    board_token: String,
-    self_session_id: Option<String>,
-    project_id: String,
-    parent_chain: Vec<String>,
-    pending_calls: PendingCalls,
-    outgoing_tasks: OutgoingTasks,
-    posted_flag: Arc<AtomicBool>,
-    config: &AgentConfig,
-    code: &str,
-) -> Result<String> {
-    let mut engine = rhai::Engine::new();
-    engine.set_max_operations(crate::tools::RHAI_MAX_OPERATIONS);
-    engine.set_max_call_levels(crate::tools::RHAI_MAX_CALL_LEVELS);
-    engine.set_max_string_size(crate::tools::RHAI_MAX_STRING_SIZE);
-
-    let output = Rc::new(RefCell::new(String::new()));
-    let output_clone = output.clone();
-    engine.on_print(move |s| output_clone.borrow_mut().push_str(s));
-
-    crate::tools::register_basic_functions(&mut engine);
-    crate::tools::register_storage_functions(
-        &mut engine,
-        &storage_base_url,
-        &storage_auth_token,
-        &project_id,
-    );
-    crate::tools::register_board_functions(
-        &mut engine,
-        board_url,
-        board_token,
-        self_name.unwrap_or_default(),
-        self_session_id,
-        project_id,
-        parent_chain,
-        pending_calls,
-        agent_call_timeout_sec,
-        posted_flag,
-        outgoing_tasks,
-    );
-
-    if config.skill_mode == "manual" {
-        crate::tools::register_skill_functions(
-            &mut engine,
-            &storage_base_url,
-            &storage_auth_token,
-            config,
-        );
-    }
-
-    let normalized = crate::tools::normalize_multiline_strings(code);
-    match engine.eval::<rhai::Dynamic>(&normalized) {
-        Ok(result) => {
-            let printed = output.borrow().clone();
-            if !printed.is_empty() {
-                Ok(printed)
-            } else {
-                Ok(result.to_string())
-            }
-        }
-        Err(e) => Err(anyhow::anyhow!("Rhai execution error: {}", e)),
-    }
-}
-
-fn extract_rhai_code(skill_content: &str) -> Option<String> {
-    let marker = "RHAI_CODE:";
-    let pos = skill_content.find(marker)?;
-    Some(skill_content[pos + marker.len()..].trim().to_string())
-}
-
-async fn execute_skill_code_directly(
-    context: &AgentContext,
-    config: &AgentConfig,
-    code: String,
-    session_id: Option<String>,
-    project_id: String,
-    parent_chain: Vec<String>,
-) -> Result<String> {
-    let storage_base_url = context.storage_base_url.clone();
-    let storage_auth_token = context.storage_auth_token.clone();
-    let self_name = context.self_name.clone();
-    let agent_call_timeout = context.agent_call_timeout_sec;
-    let board_url = context.board_base_url.clone();
-    let board_token = context.board_auth_token.clone();
-    let pending_calls = context.pending_calls.clone();
-    let outgoing_tasks = context.outgoing_tasks.clone();
-    let config_owned = config.clone();
-    let rhai_timeout = config.rhai_timeout_sec.unwrap_or(30);
-
-    let posted_flag = Arc::new(AtomicBool::new(false));
-
-    let result = tokio::time::timeout(
-        Duration::from_secs(rhai_timeout),
-        tokio::task::spawn_blocking(move || {
-            run_code_with_storage(
-                storage_base_url,
-                storage_auth_token,
-                self_name,
-                agent_call_timeout,
-                board_url,
-                board_token,
-                session_id,
-                project_id,
-                parent_chain,
-                pending_calls,
-                outgoing_tasks,
-                posted_flag,
-                &config_owned,
-                &code,
-            )
-        }),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("Rhai execution timed out"))??;
-
-    result.map_err(|e| anyhow::anyhow!("Rhai execution error: {}", e))
 }

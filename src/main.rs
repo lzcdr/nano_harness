@@ -6,7 +6,6 @@ use dotenvy;
 use reqwest::Client;
 use std::io::{self, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex as AsyncMutex;
@@ -20,7 +19,6 @@ use nano_harness::knowledge_manager::KnowledgeEntry;
 use nano_harness::local_storage_http_api::LocalStorageServerConfig;
 use nano_harness::message_board::BoardEvent;
 use nano_harness::session_store::{self, ContextBlock, Session};
-use nano_harness::tools::{execute_tool, BoardContext};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "CLI чат с Polza AI")]
@@ -103,7 +101,6 @@ struct ReplyContext {
     engine_config: Arc<EngineConfig>,
     client: Client,
     storage_http_config: Arc<LocalStorageServerConfig>,
-    rhai_timeout_sec: u64,
     agent_call_timeout_sec: u64,
     board_url: String,
     board_token: String,
@@ -218,6 +215,40 @@ async fn refresh_knowledge_catalog(
 ) -> Result<Vec<KnowledgeEntry>> {
     nano_harness::knowledge_manager::list_knowledge(client, storage_base_url, storage_auth_token)
         .await
+}
+
+fn build_tool_context(
+    ctx: &ReplyContext,
+    project_id: String,
+    session_id: Option<String>,
+    self_agent_name: String,
+    pending_calls: PendingCalls,
+    outgoing_tasks: OutgoingTasks,
+) -> nano_harness::tool_runtime::ToolContext {
+    let storage_url = if ctx.storage_http_config.bind_addr.starts_with("http") {
+        ctx.storage_http_config.bind_addr.clone()
+    } else {
+        format!("http://{}", ctx.storage_http_config.bind_addr)
+    };
+    let board_url = if ctx.board_url.starts_with("http") {
+        ctx.board_url.clone()
+    } else {
+        format!("http://{}", ctx.board_url)
+    };
+    nano_harness::tool_runtime::ToolContext {
+        http_client: ctx.client.clone(),
+        storage_base_url: storage_url,
+        storage_auth_token: ctx.storage_http_config.auth_token.clone(),
+        board_base_url: board_url,
+        board_auth_token: ctx.board_token.clone(),
+        project_id,
+        session_id,
+        parent_chain: vec![],
+        self_agent_name,
+        pending_calls,
+        outgoing_tasks,
+        agent_call_timeout_sec: ctx.agent_call_timeout_sec,
+    }
 }
 
 fn open_project(
@@ -503,16 +534,22 @@ async fn continue_chat_turn(shared: &SharedChat, ctx: &ReplyContext) {
         };
 
         println!();
+        let has_content = !response.content.trim().is_empty();
         {
             let mut rt = shared.lock().await;
-            if !response.content.is_empty() {
-                let _ = write_log(&mut rt.log_file, "assistant", &response.content);
+            let answer = if has_content {
+                response.content.clone()
+            } else {
+                response.reasoning.clone()
+            };
+            if !answer.is_empty() {
+                let _ = write_log(&mut rt.log_file, "assistant", &answer);
             }
-            if !response.reasoning.is_empty() {
+            if !response.reasoning.is_empty() && has_content {
                 let _ = write_log(&mut rt.log_file, "reasoning", &response.reasoning);
             }
         }
-        if !response.reasoning.is_empty() {
+        if !response.reasoning.is_empty() && has_content {
             println!("\n\x1b[90m🧠 Reasoning:\n{}\x1b[0m\n", response.reasoning);
         }
 
@@ -548,38 +585,23 @@ async fn continue_chat_turn(shared: &SharedChat, ctx: &ReplyContext) {
                 continue;
             }
 
-            let (board_ctx, posted_flag, project_id) = {
+            let tool_ctx = {
                 let rt = shared.lock().await;
-                let pf = Arc::new(AtomicBool::new(false));
                 let pid = rt.project_id.clone();
-                let bctx = BoardContext {
-                    board_url: ctx.board_url.clone(),
-                    board_token: ctx.board_token.clone(),
-                    self_agent_name: "chat".to_string(),
-                    self_session_id: Some(pid.clone()),
-                    project_id: pid.clone(),
-                    parent_chain: vec![],
-                    pending_calls: rt.pending_calls.clone(),
-                    agent_call_timeout_sec: ctx.agent_call_timeout_sec,
-                    posted_flag: pf.clone(),
-                    outgoing_tasks: rt.outgoing_tasks.clone(),
-                };
-                (bctx, pf, pid)
+                build_tool_context(
+                    ctx,
+                    pid.clone(),
+                    Some(pid),
+                    "chat".to_string(),
+                    rt.pending_calls.clone(),
+                    rt.outgoing_tasks.clone(),
+                )
             };
 
-            let result = execute_tool(
-                name,
-                &tc.function.arguments,
-                Some(&ctx.client),
-                &ctx.storage_http_config.bind_addr,
-                &ctx.storage_http_config.auth_token,
-                &project_id,
-                ctx.rhai_timeout_sec,
-                Some(board_ctx),
-            )
-            .await;
+            let result =
+                nano_harness::tool_runtime::execute(name, &tc.function.arguments, &tool_ctx).await;
 
-            let posted = posted_flag.load(Ordering::Relaxed);
+            let posted = result.contains("\"content\":\"posted:");
 
             {
                 let mut rt = shared.lock().await;
@@ -621,6 +643,7 @@ async fn continue_chat_turn(shared: &SharedChat, ctx: &ReplyContext) {
 #[tokio::main]
 async fn main() -> Result<()> {
     let _ = dotenvy::dotenv();
+    let _ = nano_harness::lexicon::init_lexicon(std::path::Path::new(".dict"));
     let args = Args::parse();
 
     let toml_config = TomlConfig::load(&args.config_path)?;
@@ -668,8 +691,6 @@ async fn main() -> Result<()> {
         format!("http://{}", board_url)
     };
 
-    // Godfather — опциональный. Ключ берётся в порядке:
-    // GODFATHER_API_KEY → POLZA_API_KEY → api_key из [godfather] → api_key чата.
     let godfather_config: Option<Arc<GodfatherConfig>> = toml_config
         .godfather
         .as_ref()
@@ -817,7 +838,6 @@ async fn main() -> Result<()> {
             std::env::var("LOCAL_STORAGE_AUTH_TOKEN").unwrap_or_default();
     }
 
-    let rhai_timeout_sec = toml_config.rhai_timeout_sec.unwrap_or(30);
     let agent_call_timeout_sec = args.agent_call_timeout_sec;
     let godfather_timeout_sec = args.godfather_timeout_sec;
 
@@ -825,7 +845,6 @@ async fn main() -> Result<()> {
         engine_config: Arc::new(engine_config.clone()),
         client: client.clone(),
         storage_http_config: Arc::new(storage_http_config.clone()),
-        rhai_timeout_sec,
         agent_call_timeout_sec,
         board_url: board_url.clone(),
         board_token: board_token.clone(),
@@ -1284,7 +1303,6 @@ async fn main() -> Result<()> {
                     format_bytes(before_bytes)
                 );
 
-                // 1. Механическая компактизация
                 let (mech_before, mech_after) = {
                     let mut rt = shared.lock().await;
                     rt.engine.compact_all_turns()
@@ -1296,7 +1314,6 @@ async fn main() -> Result<()> {
                     format_bytes(mech_before.saturating_sub(mech_after))
                 );
 
-                // 2. Семантическая — только если godfather настроен и есть хвост
                 let tail_count = {
                     let rt = shared.lock().await;
                     rt.engine.tail_turn_count()
@@ -1341,7 +1358,6 @@ async fn main() -> Result<()> {
                     println!("   Семантическая: godfather не настроен, пропускаю");
                 }
 
-                // 3. Итог
                 let after_bytes = {
                     let mut rt = shared.lock().await;
                     save_current(&mut *rt)?;
@@ -1413,7 +1429,6 @@ async fn main() -> Result<()> {
             _ => {}
         }
 
-        // Команды /project ...
         if user_input == "/project" || user_input.starts_with("/project ") {
             let parts: Vec<&str> = user_input.splitn(3, ' ').collect();
             match parts.get(1).copied() {
@@ -1695,17 +1710,23 @@ async fn main() -> Result<()> {
 
         println!();
 
+        let has_content = !response.content.trim().is_empty();
         {
             let mut rt = shared.lock().await;
-            if !response.content.is_empty() {
-                write_log(&mut rt.log_file, "assistant", &response.content)?;
+            let answer = if has_content {
+                response.content.clone()
+            } else {
+                response.reasoning.clone()
+            };
+            if !answer.is_empty() {
+                write_log(&mut rt.log_file, "assistant", &answer)?;
             }
-            if !response.reasoning.is_empty() {
+            if !response.reasoning.is_empty() && has_content {
                 write_log(&mut rt.log_file, "reasoning", &response.reasoning)?;
             }
         }
 
-        if !response.reasoning.is_empty() {
+        if !response.reasoning.is_empty() && has_content {
             println!("\n\x1b[90m🧠 Reasoning:\n{}\x1b[0m\n", response.reasoning);
         }
 
@@ -1773,38 +1794,24 @@ async fn main() -> Result<()> {
                     continue;
                 }
 
-                let (board_ctx, posted_flag_check, project_id) = {
+                let tool_ctx = {
                     let rt = shared.lock().await;
-                    let posted_flag = Arc::new(AtomicBool::new(false));
                     let pid = rt.project_id.clone();
-                    let bctx = BoardContext {
-                        board_url: board_url.clone(),
-                        board_token: board_token.clone(),
-                        self_agent_name: "chat".to_string(),
-                        self_session_id: Some(pid.clone()),
-                        project_id: pid.clone(),
-                        parent_chain: vec![],
-                        pending_calls: rt.pending_calls.clone(),
-                        agent_call_timeout_sec,
-                        posted_flag: posted_flag.clone(),
-                        outgoing_tasks: rt.outgoing_tasks.clone(),
-                    };
-                    (bctx, posted_flag, pid)
+                    build_tool_context(
+                        &reply_ctx,
+                        pid.clone(),
+                        Some(pid),
+                        "chat".to_string(),
+                        rt.pending_calls.clone(),
+                        rt.outgoing_tasks.clone(),
+                    )
                 };
 
-                let result = execute_tool(
-                    name,
-                    &tc.function.arguments,
-                    Some(&client),
-                    &storage_http_config.bind_addr,
-                    &storage_http_config.auth_token,
-                    &project_id,
-                    rhai_timeout_sec,
-                    Some(board_ctx),
-                )
-                .await;
+                let result =
+                    nano_harness::tool_runtime::execute(name, &tc.function.arguments, &tool_ctx)
+                        .await;
 
-                let posted = posted_flag_check.load(Ordering::Relaxed);
+                let posted = result.contains("\"content\":\"posted:");
 
                 {
                     let mut rt = shared.lock().await;
@@ -1845,16 +1852,22 @@ async fn main() -> Result<()> {
                 }
             };
             println!();
+            let has_content = !final_response.content.trim().is_empty();
             {
                 let mut rt = shared.lock().await;
-                if !final_response.content.is_empty() {
-                    write_log(&mut rt.log_file, "assistant", &final_response.content)?;
+                let answer = if has_content {
+                    final_response.content.clone()
+                } else {
+                    final_response.reasoning.clone()
+                };
+                if !answer.is_empty() {
+                    write_log(&mut rt.log_file, "assistant", &answer)?;
                 }
-                if !final_response.reasoning.is_empty() {
+                if !final_response.reasoning.is_empty() && has_content {
                     write_log(&mut rt.log_file, "reasoning", &final_response.reasoning)?;
                 }
             }
-            if !final_response.reasoning.is_empty() {
+            if !final_response.reasoning.is_empty() && has_content {
                 println!(
                     "\n\x1b[90m🧠 Reasoning:\n{}\x1b[0m\n",
                     final_response.reasoning

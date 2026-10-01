@@ -23,6 +23,7 @@ struct Args {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let _ = dotenvy::dotenv();
+    let _ = nano_harness::lexicon::init_lexicon(std::path::Path::new(".dict"));
     let args = Args::parse();
     let config = TomlConfig::load(&args.config)?;
 

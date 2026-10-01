@@ -98,16 +98,60 @@ pub async fn append_rebuke(
     Ok(())
 }
 
-pub fn build_system_with_rebuke(base_prompt: &str, rebuke: &str) -> String {
-    if rebuke.trim().is_empty() {
-        base_prompt.to_string()
-    } else {
-        format!(
-            "{}\n\n[Замечания пользователя, учитывай в работе:]\n\n{}",
-            base_prompt.trim_end(),
-            rebuke.trim_end()
-        )
+/// Разбирает файл ребуков на отдельные блоки и возвращает только тексты
+/// замечаний, без служебных заголовков `---[дата]---`.
+fn extract_rebuke_texts(content: &str) -> Vec<String> {
+    let mut texts = Vec::new();
+    let mut current = String::new();
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("---[") && trimmed.ends_with("--------") {
+            let text = current.trim();
+            if !text.is_empty() {
+                texts.push(text.to_string());
+            }
+            current.clear();
+            continue;
+        }
+        if !current.is_empty() {
+            current.push('\n');
+        }
+        current.push_str(line);
     }
+
+    let text = current.trim();
+    if !text.is_empty() {
+        texts.push(text.to_string());
+    }
+
+    texts
+}
+
+pub fn build_system_with_rebuke(base_prompt: &str, rebuke: &str) -> String {
+    let texts = extract_rebuke_texts(rebuke);
+    if texts.is_empty() {
+        return base_prompt.to_string();
+    }
+
+    let joined = texts
+        .iter()
+        .map(|t| {
+            let t = t.trim();
+            if t.ends_with('.') || t.ends_with('!') || t.ends_with('?') {
+                t.to_string()
+            } else {
+                format!("{}.", t)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    format!(
+        "{}\n\n[Замечания пользователя, учитывай в работе:]\n\n{}",
+        base_prompt.trim_end(),
+        joined
+    )
 }
 
 #[allow(dead_code)]
