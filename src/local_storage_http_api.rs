@@ -13,6 +13,7 @@ use tokio::sync::{mpsc, RwLock};
 
 use crate::knowledge_manager::KnowledgeEntry;
 use crate::local_storage::{valid_project_id, LocalStorage, VectorDbConfig, SKILLS_PROJECT};
+use crate::skill_manager::SkillRecord;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct LocalStorageServerConfig {
@@ -29,6 +30,7 @@ struct AppState {
     skill_index_tx: mpsc::Sender<SkillIndexTask>,
     skill_delete_tx: mpsc::Sender<SkillDeleteTask>,
     knowledge_catalog: Arc<RwLock<Vec<KnowledgeEntry>>>,
+    skills_catalog: Arc<RwLock<Vec<SkillRecord>>>,
     auth_token: String,
 }
 
@@ -335,37 +337,6 @@ impl FileStorage {
             }
         }
         tokio::fs::write(&full, content).await
-    }
-
-    async fn list_skill_dir(
-        &self,
-        path: &str,
-    ) -> std::io::Result<Vec<crate::local_storage::Entry>> {
-        let full = self.resolve_skill(path)?;
-        let skills_root = self.root.join(".skills");
-        let mut entries = Vec::new();
-        let mut dir = tokio::fs::read_dir(full).await?;
-        while let Some(entry) = dir.next_entry().await? {
-            let name = entry.file_name().to_string_lossy().to_string();
-            let rel_path = entry
-                .path()
-                .strip_prefix(&skills_root)
-                .unwrap_or(&entry.path())
-                .to_path_buf();
-            if entry.file_type().await?.is_dir() {
-                entries.push(crate::local_storage::Entry::Dir {
-                    name,
-                    path: rel_path,
-                });
-            } else {
-                entries.push(crate::local_storage::Entry::File {
-                    name,
-                    path: rel_path,
-                    size: entry.metadata().await?.len(),
-                });
-            }
-        }
-        Ok(entries)
     }
 }
 
@@ -705,32 +676,41 @@ async fn skill_get(State(state): State<AppState>, Query(query): Query<PathQuery>
     }
 }
 
-async fn skill_put(
-    State(state): State<AppState>,
-    Query(query): Query<PathQuery>,
-    body: String,
-) -> Response {
-    let path = query.path.clone();
-    let content = body.clone();
-    match state
-        .files
-        .read()
-        .await
-        .write_skill_file(&path, &content)
-        .await
+#[derive(Deserialize)]
+struct SkillPutRequest {
+    content: String,
+    index: String,
+    record: SkillRecord,
+    skill_file: String,
+    index_file: String,
+}
+
+async fn skill_put(State(state): State<AppState>, Json(req): Json<SkillPutRequest>) -> Response {
     {
-        Ok(_) => {
-            let _ = state
-                .skill_index_tx
-                .send(SkillIndexTask {
-                    path: std::path::PathBuf::from(path),
-                    content,
-                })
-                .await;
-            StatusCode::OK.into_response()
+        let files = state.files.read().await;
+        if let Err(e) = files.write_skill_file(&req.skill_file, &req.content).await {
+            return io_error_response(e);
         }
-        Err(e) => io_error_response(e),
+        if let Err(e) = files.write_skill_file(&req.index_file, &req.index).await {
+            return io_error_response(e);
+        }
     }
+
+    let _ = state
+        .skill_index_tx
+        .send(SkillIndexTask {
+            path: std::path::PathBuf::from(&req.index_file),
+            content: req.index,
+        })
+        .await;
+
+    {
+        let mut catalog = state.skills_catalog.write().await;
+        catalog.retain(|r| r.skill_file != req.record.skill_file);
+        catalog.push(req.record);
+    }
+
+    StatusCode::OK.into_response()
 }
 
 async fn skill_delete(State(state): State<AppState>, Query(query): Query<PathQuery>) -> Response {
@@ -740,20 +720,20 @@ async fn skill_delete(State(state): State<AppState>, Query(query): Query<PathQue
             let _ = state
                 .skill_delete_tx
                 .send(SkillDeleteTask {
-                    path: std::path::PathBuf::from(path),
+                    path: std::path::PathBuf::from(&path),
                 })
                 .await;
+            let mut catalog = state.skills_catalog.write().await;
+            catalog.retain(|r| r.skill_file != path);
             StatusCode::OK.into_response()
         }
         Err(e) => io_error_response(e),
     }
 }
 
-async fn skill_list(State(state): State<AppState>, Query(query): Query<PathQuery>) -> Response {
-    match state.files.read().await.list_skill_dir(&query.path).await {
-        Ok(entries) => Json(entries).into_response(),
-        Err(e) => io_error_response(e),
-    }
+async fn skill_list(State(state): State<AppState>) -> Response {
+    let catalog = state.skills_catalog.read().await;
+    Json(catalog.clone()).into_response()
 }
 
 async fn skill_search(State(state): State<AppState>, Query(query): Query<SearchQuery>) -> Response {
@@ -776,6 +756,39 @@ async fn skill_search(State(state): State<AppState>, Query(query): Query<SearchQ
         Ok(Err(e)) => io_error_response(e),
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Search task cancelled").into_response(),
     }
+}
+
+#[derive(Deserialize)]
+struct RecordUsageQuery {
+    file: String,
+    success: bool,
+}
+
+async fn skill_record_usage(
+    State(state): State<AppState>,
+    Query(query): Query<RecordUsageQuery>,
+) -> Response {
+    let (success, fail) = {
+        let mut catalog = state.skills_catalog.write().await;
+        let Some(rec) = catalog.iter_mut().find(|r| r.skill_file == query.file) else {
+            return (StatusCode::NOT_FOUND, "skill not found").into_response();
+        };
+        if query.success {
+            rec.success_count += 1;
+        } else {
+            rec.fail_count += 1;
+        }
+        (rec.success_count, rec.fail_count)
+    };
+
+    {
+        let files = state.files.read().await;
+        if let Err(e) = update_skill_stats_in_file(&files, &query.file, success, fail).await {
+            eprintln!("⚠️ Не удалось обновить STATS в файле {}: {}", query.file, e);
+        }
+    }
+
+    StatusCode::OK.into_response()
 }
 
 #[derive(Deserialize)]
@@ -816,6 +829,138 @@ async fn rebuke_put(
 #[derive(Deserialize)]
 struct KnowledgeNameQuery {
     name: String,
+}
+
+fn parse_skill_file(file_name: &str, content: &str) -> Option<SkillRecord> {
+    let mut agent_name = String::new();
+    let mut description = String::new();
+    let mut entities: Vec<String> = Vec::new();
+    let mut success_count = 0u32;
+    let mut fail_count = 0u32;
+    let mut fingerprint = String::new();
+    let mut created_at = 0u64;
+    let mut instruction_lines: Vec<String> = Vec::new();
+
+    let mut in_instruction = false;
+    let mut in_tool_calls = false;
+
+    for line in content.lines() {
+        if in_tool_calls {
+            continue;
+        }
+        if line.starts_with("TOOL_CALLS:") {
+            in_tool_calls = true;
+            in_instruction = false;
+            continue;
+        }
+        if in_instruction {
+            instruction_lines.push(line.to_string());
+            continue;
+        }
+        if line.trim() == "INSTRUCTION:" {
+            in_instruction = true;
+            continue;
+        }
+        if line.starts_with("SKILL:") {
+            continue;
+        }
+        if let Some(v) = line.strip_prefix("FOR:") {
+            agent_name = v.trim().to_string();
+            continue;
+        }
+        if let Some(v) = line.strip_prefix("DESCRIPTION:") {
+            description = v.trim().to_string();
+            continue;
+        }
+        if let Some(v) = line.strip_prefix("ENTITIES:") {
+            entities = v
+                .split(',')
+                .map(|s| s.trim().to_lowercase())
+                .filter(|s| !s.is_empty())
+                .collect();
+            continue;
+        }
+        if let Some(v) = line.strip_prefix("STATS:") {
+            let parts: Vec<&str> = v.trim().split('/').collect();
+            if parts.len() == 2 {
+                success_count = parts[0].trim().parse().unwrap_or(0);
+                fail_count = parts[1].trim().parse().unwrap_or(0);
+            }
+            continue;
+        }
+        if let Some(v) = line.strip_prefix("FINGERPRINT:") {
+            fingerprint = v.trim().to_string();
+            continue;
+        }
+        if let Some(v) = line.strip_prefix("CREATED_AT:") {
+            created_at = v.trim().parse().unwrap_or(0);
+            continue;
+        }
+    }
+
+    let prompt = instruction_lines.join("\n").trim().to_string();
+
+    Some(SkillRecord {
+        skill_file: file_name.to_string(),
+        agent_name,
+        description,
+        prompt,
+        entities,
+        success_count,
+        fail_count,
+        fingerprint,
+        created_at,
+    })
+}
+
+async fn scan_skills_catalog(skills_root: &std::path::Path) -> Vec<SkillRecord> {
+    let mut records = Vec::new();
+    let mut dir = match tokio::fs::read_dir(skills_root).await {
+        Ok(d) => d,
+        Err(_) => return records,
+    };
+    while let Ok(Some(entry)) = dir.next_entry().await {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.ends_with(".txt") || name.ends_with("_index.txt") {
+            continue;
+        }
+        let content = match tokio::fs::read_to_string(entry.path()).await {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        if let Some(rec) = parse_skill_file(&name, &content) {
+            records.push(rec);
+        }
+    }
+    records
+}
+
+async fn update_skill_stats_in_file(
+    files: &FileStorage,
+    skill_file: &str,
+    success: u32,
+    fail: u32,
+) -> std::io::Result<()> {
+    let content = files.read_skill_file(skill_file).await?;
+    let mut new_content = String::with_capacity(content.len());
+    let mut replaced = false;
+    for line in content.lines() {
+        if line.starts_with("STATS:") {
+            new_content.push_str(&format!("STATS: {}/{}", success, fail));
+            new_content.push('\n');
+            replaced = true;
+        } else {
+            new_content.push_str(line);
+            new_content.push('\n');
+        }
+    }
+    if !replaced {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "STATS line not found in skill file",
+        ));
+    }
+    files.write_skill_file(skill_file, &new_content).await
 }
 
 async fn scan_knowledge_catalog(root: &std::path::Path) -> Vec<KnowledgeEntry> {
@@ -936,8 +1081,10 @@ pub async fn run_server(
     let base = std::path::PathBuf::from(".local_storage");
     let root = base.join(&config.storage_name);
     let knowledge_root = root.clone();
+    let skills_root = root.join(".skills");
     let files = Arc::new(RwLock::new(FileStorage { root }));
     let knowledge_catalog = Arc::new(RwLock::new(scan_knowledge_catalog(&knowledge_root).await));
+    let skills_catalog = Arc::new(RwLock::new(scan_skills_catalog(&skills_root).await));
 
     let (search_tx, mut search_rx) = mpsc::channel::<SearchTask>(100);
     let (index_tx, mut index_rx) = mpsc::channel::<IndexTask>(100);
@@ -1007,6 +1154,7 @@ pub async fn run_server(
         skill_index_tx,
         skill_delete_tx,
         knowledge_catalog,
+        skills_catalog,
         auth_token: config.auth_token,
     };
 
@@ -1027,6 +1175,7 @@ pub async fn run_server(
         .route("/skills/delete", post(skill_delete))
         .route("/skills/list", get(skill_list))
         .route("/skills/search", get(skill_search))
+        .route("/skills/record_usage", post(skill_record_usage))
         .route("/rebukes/get", get(rebuke_get))
         .route("/rebukes/put", post(rebuke_put))
         .route("/knowledge/list", get(knowledge_list))

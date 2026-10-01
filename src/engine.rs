@@ -625,10 +625,8 @@ impl ChatEngine {
         }
 
         if let Some(allowed) = &self.config.allowed_tools {
-            let filtered: Vec<ToolDefinition> = crate::tools::available_tools()
-                .into_iter()
-                .filter(|t| allowed.iter().any(|a| a.name == t.function.name))
-                .collect();
+            let names: Vec<String> = allowed.iter().map(|a| a.name.clone()).collect();
+            let filtered: Vec<ToolDefinition> = crate::tool_runtime::available_tools(Some(&names));
             if !filtered.is_empty() {
                 req["tools"] = serde_json::to_value(filtered).unwrap();
                 if let Some(choice) = &self.config.tool_choice {
