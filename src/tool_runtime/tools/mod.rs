@@ -1,5 +1,9 @@
 mod call_agent;
+mod code_index;
+mod ctags;
 mod post_task;
+mod ripgrep;
+mod scc;
 mod storage_create_dir;
 mod storage_delete_file;
 mod storage_list_dir;
@@ -14,7 +18,11 @@ mod storage_write_file;
 mod storage_write_summary;
 
 pub use call_agent::CallAgent;
+pub use code_index::CodeIndex;
+pub use ctags::Ctags;
 pub use post_task::PostTask;
+pub use ripgrep::Ripgrep;
+pub use scc::Scc;
 pub use storage_create_dir::StorageCreateDir;
 pub use storage_delete_file::StorageDeleteFile;
 pub use storage_list_dir::StorageListDir;

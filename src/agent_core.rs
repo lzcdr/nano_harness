@@ -135,6 +135,7 @@ pub struct AgentContext {
     pub http_client: Client,
     pub storage_base_url: String,
     pub storage_auth_token: String,
+    pub storage_root_path: std::path::PathBuf,
     pub self_name: Option<String>,
     pub agent_call_timeout_sec: u64,
     pub board_base_url: String,
@@ -148,6 +149,7 @@ impl AgentContext {
     pub fn new(
         storage_base_url: String,
         storage_auth_token: String,
+        storage_root_path: std::path::PathBuf,
         timeout_sec: u64,
         self_name: Option<String>,
         agent_call_timeout_sec: u64,
@@ -180,6 +182,7 @@ impl AgentContext {
             http_client,
             storage_base_url,
             storage_auth_token,
+            storage_root_path,
             self_name,
             agent_call_timeout_sec,
             board_base_url,
@@ -255,6 +258,7 @@ fn tool_context_for_agent(
 ) -> crate::tool_runtime::ToolContext {
     crate::tool_runtime::ToolContext {
         http_client: context.http_client.clone(),
+        storage_root_path: context.storage_root_path.clone(),
         storage_base_url: context.storage_base_url.clone(),
         storage_auth_token: context.storage_auth_token.clone(),
         board_base_url: context.board_base_url.clone(),
