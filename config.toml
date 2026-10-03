@@ -102,6 +102,22 @@ mode = "auto"
 name = "post_task"
 mode = "auto"
 
+[[tools]]
+name = "ripgrep"
+mode = "auto"
+
+[[tools]]
+name = "scc"
+mode = "auto"
+
+[[tools]]
+name = "ctags"
+mode = "auto"
+
+[[tools]]
+name = "code_index"
+mode = "auto"
+
 # ---------------------------------------------------------------------------
 # Векторная база (эмбеддинги для семантического поиска по хранилищу)
 # ---------------------------------------------------------------------------
@@ -212,6 +228,10 @@ tools = [
   "storage_write_summary",
   "call_agent",
   "post_task",
+  "ripgrep",
+  "scc",
+  "ctags",
+  "code_index",
 ]
 
 # Системный промпт агента (переопределяет глобальный)

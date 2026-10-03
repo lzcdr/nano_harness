@@ -235,8 +235,11 @@ fn build_tool_context(
     } else {
         format!("http://{}", ctx.board_url)
     };
+    let storage_root_path =
+        std::path::PathBuf::from(".local_storage").join(&ctx.storage_http_config.storage_name);
     nano_harness::tool_runtime::ToolContext {
         http_client: ctx.client.clone(),
+        storage_root_path,
         storage_base_url: storage_url,
         storage_auth_token: ctx.storage_http_config.auth_token.clone(),
         board_base_url: board_url,

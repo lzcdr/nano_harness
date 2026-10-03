@@ -10,6 +10,10 @@ pub struct ToolContext {
     /// HTTP-клиент для обращения к хранилищу и доске.
     pub http_client: Client,
 
+    /// Локальный путь к корню хранилища. Нужен инструментам, которые
+    /// работают с файлами напрямую (не через HTTP), например ripgrep.
+    pub storage_root_path: std::path::PathBuf,
+
     /// Адрес хранилища. С гарантией http://.
     pub storage_base_url: String,
 

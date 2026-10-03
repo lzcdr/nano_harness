@@ -98,9 +98,13 @@ async fn main() -> anyhow::Result<()> {
     let outgoing_tasks: OutgoingTasks = Arc::new(Mutex::new(HashMap::new()));
 
     let agent_call_timeout = agent_config.agent_call_timeout_sec.unwrap_or(120);
+    let storage_root_path =
+        std::path::PathBuf::from(".local_storage").join(&storage_config.storage_name);
+
     let context = AgentContext::new(
         storage_config.bind_addr.clone(),
         storage_config.auth_token.clone(),
+        storage_root_path,
         agent_config.timeout_sec,
         Some(agent_config.name.clone()),
         agent_call_timeout,
