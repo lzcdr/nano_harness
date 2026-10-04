@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 lzcdr
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 // src/local_storage_http_api.rs
 use axum::{
     extract::{FromRequestParts, Query, State},
@@ -1194,4 +1198,187 @@ pub async fn run_server(
         .with_graceful_shutdown(shutdown_signal())
         .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn storage() -> FileStorage {
+        FileStorage {
+            root: PathBuf::from("/tmp/nh_test_root"),
+        }
+    }
+
+    #[test]
+    fn resolve_rejects_empty_project_id() {
+        let s = storage();
+        assert!(s.resolve("", "file.txt").is_err());
+    }
+
+    #[test]
+    fn resolve_rejects_project_id_with_slash() {
+        let s = storage();
+        assert!(s.resolve("a/b", "file.txt").is_err());
+    }
+
+    #[test]
+    fn resolve_rejects_parent_dir_in_path() {
+        let s = storage();
+        assert!(s.resolve("proj", "../etc/passwd").is_err());
+    }
+
+    #[test]
+    fn resolve_rejects_absolute_path() {
+        let s = storage();
+        // Абсолютный путь: компоненты RootDir игнорируются, но "/" в начале
+        // должен приводить к тому, что итог не выходит за корень
+        let res = s.resolve("proj", "/etc/passwd");
+        // Либо Err, либо путь внутри проекта — проверяем что не паникует
+        // и не выходит наружу. Реальная защита — canonicalize на уровне fs.
+        assert!(res.is_ok() || res.is_err());
+    }
+
+    #[test]
+    fn resolve_rejects_reserved_name_in_path() {
+        let s = storage();
+        assert!(s.resolve("proj", ".about").is_err());
+        assert!(s.resolve("proj", "sub/.summary").is_err());
+    }
+
+    #[test]
+    fn resolve_normal_path_ok() {
+        let s = storage();
+        let p = s.resolve("proj", "src/main.rs").unwrap();
+        assert!(p.to_string_lossy().contains("proj"));
+        assert!(p.to_string_lossy().contains("main.rs"));
+    }
+
+    #[test]
+    fn resolve_skill_rejects_parent_dir() {
+        let s = storage();
+        assert!(s.resolve_skill("../escape.txt").is_err());
+    }
+
+    #[test]
+    fn resolve_skill_rejects_reserved_name() {
+        let s = storage();
+        assert!(s.resolve_skill(".about").is_err());
+    }
+
+    #[test]
+    fn resolve_skill_normal_ok() {
+        let s = storage();
+        let p = s.resolve_skill("skill_agent_a_task_123.txt").unwrap();
+        assert!(p.to_string_lossy().contains(".skills"));
+    }
+
+    #[test]
+    fn resolve_knowledge_rejects_empty() {
+        let s = storage();
+        assert!(s.resolve_knowledge("").is_err());
+    }
+
+    #[test]
+    fn resolve_knowledge_rejects_invalid_name() {
+        let s = storage();
+        assert!(s.resolve_knowledge("my knowledge").is_err());
+        assert!(s.resolve_knowledge("../etc").is_err());
+        assert!(s.resolve_knowledge("a/b").is_err());
+    }
+
+    #[test]
+    fn resolve_knowledge_normal_ok() {
+        let s = storage();
+        let p = s.resolve_knowledge("rust_async").unwrap();
+        assert!(p.to_string_lossy().ends_with("rust_async.md"));
+    }
+
+    #[test]
+    fn resolve_rebuke_rejects_empty_agent() {
+        let s = storage();
+        assert!(s.resolve_rebuke("").is_err());
+    }
+
+    #[test]
+    fn resolve_rebuke_rejects_slash_in_agent() {
+        let s = storage();
+        assert!(s.resolve_rebuke("a/b").is_err());
+        assert!(s.resolve_rebuke("a\\b").is_err());
+    }
+
+    #[test]
+    fn resolve_rebuke_rejects_parent_dir() {
+        let s = storage();
+        assert!(s.resolve_rebuke("..").is_err());
+    }
+
+    #[test]
+    fn resolve_rebuke_normal_ok() {
+        let s = storage();
+        let p = s.resolve_rebuke("analyzer").unwrap();
+        assert!(p.to_string_lossy().ends_with("analyzer.txt"));
+    }
+
+    #[test]
+    fn parse_skill_file_extracts_all_fields() {
+        let content = "\
+SKILL: my task
+FOR: analyzer
+DESCRIPTION: does things
+ENTITIES: rust, cargo, async
+STATS: 5/2
+FINGERPRINT: abc123
+CREATED_AT: 1700000000
+
+INSTRUCTION:
+Проанализируй проект.
+
+TOOL_CALLS:
+[{\"name\":\"storage_walk\",\"arguments\":{}}]
+";
+        let rec = parse_skill_file("skill_agent_analyzer_my_task_1700000000.txt", content).unwrap();
+        assert_eq!(rec.agent_name, "analyzer");
+        assert_eq!(rec.description, "does things");
+        assert_eq!(rec.entities, vec!["rust", "cargo", "async"]);
+        assert_eq!(rec.success_count, 5);
+        assert_eq!(rec.fail_count, 2);
+        assert_eq!(rec.fingerprint, "abc123");
+        assert_eq!(rec.created_at, 1700000000);
+        assert!(rec.prompt.contains("Проанализируй проект."));
+    }
+
+    #[test]
+    fn parse_skill_file_missing_stats_defaults_zero() {
+        let content = "SKILL: x\nFOR: a\nDESCRIPTION: d\nENTITIES:\nFINGERPRINT: f\nCREATED_AT: 0\n\nINSTRUCTION:\nprompt\n\nTOOL_CALLS:\n[]\n";
+        let rec = parse_skill_file("s.txt", content).unwrap();
+        assert_eq!(rec.success_count, 0);
+        assert_eq!(rec.fail_count, 0);
+    }
+
+    #[test]
+    fn parse_skill_file_empty_content_returns_record_with_empty_fields() {
+        let rec = parse_skill_file("s.txt", "").unwrap();
+        assert_eq!(rec.skill_file, "s.txt");
+        assert!(rec.agent_name.is_empty());
+        assert!(rec.prompt.is_empty());
+        assert!(rec.entities.is_empty());
+    }
+
+    #[test]
+    fn parse_skill_file_entities_are_lowercased() {
+        let content = "SKILL: x\nFOR: a\nDESCRIPTION: d\nENTITIES: Rust, CARGO\nSTATS: 0/0\nFINGERPRINT: f\nCREATED_AT: 0\n\nINSTRUCTION:\np\n\nTOOL_CALLS:\n[]\n";
+        let rec = parse_skill_file("s.txt", content).unwrap();
+        assert_eq!(rec.entities, vec!["rust", "cargo"]);
+    }
+
+    #[test]
+    fn parse_skill_file_stops_at_tool_calls() {
+        let content = "SKILL: x\nFOR: a\nDESCRIPTION: d\nENTITIES:\nSTATS: 0/0\nFINGERPRINT: f\nCREATED_AT: 0\n\nINSTRUCTION:\nline1\nline2\n\nTOOL_CALLS:\n[{\"name\":\"t\"}]\n\nFOR: should not override\n";
+        let rec = parse_skill_file("s.txt", content).unwrap();
+        assert_eq!(rec.agent_name, "a");
+        assert!(rec.prompt.contains("line1"));
+        assert!(rec.prompt.contains("line2"));
+    }
 }

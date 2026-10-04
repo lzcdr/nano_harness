@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 lzcdr
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 // src/tool_runtime/tools/ripgrep.rs
 
 use crate::tool_runtime::context::ToolContext;
@@ -409,3 +413,154 @@ impl ToolImpl for Ripgrep {
 }
 
 inventory::submit! { &Ripgrep as &'static dyn crate::tool_runtime::ToolImpl }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn validate_relative_rejects_empty() {
+        assert!(validate_relative("").is_err());
+    }
+
+    #[test]
+    fn validate_relative_rejects_absolute() {
+        assert!(validate_relative("/etc").is_err());
+    }
+
+    #[test]
+    fn validate_relative_rejects_parent_dir() {
+        assert!(validate_relative("../x").is_err());
+        assert!(validate_relative("a/../b").is_err());
+    }
+
+    #[test]
+    fn validate_relative_normal_ok() {
+        let p = validate_relative("src/main.rs").unwrap();
+        assert!(p.to_string_lossy().contains("main.rs"));
+    }
+
+    #[test]
+    fn validate_glob_rejects_empty() {
+        assert!(validate_glob("").is_err());
+    }
+
+    #[test]
+    fn validate_glob_rejects_special_chars() {
+        assert!(validate_glob("a;b").is_err());
+        assert!(validate_glob("a|b").is_err());
+        assert!(validate_glob("a$b").is_err());
+        assert!(validate_glob("a b").is_err());
+    }
+
+    #[test]
+    fn validate_glob_rejects_parent_dir() {
+        assert!(validate_glob("../x").is_err());
+    }
+
+    #[test]
+    fn validate_glob_rejects_leading_slash() {
+        assert!(validate_glob("/src/*.rs").is_err());
+    }
+
+    #[test]
+    fn validate_glob_accepts_typical() {
+        assert!(validate_glob("*.rs").is_ok());
+        assert!(validate_glob("src/**/*.rs").is_ok());
+        assert!(validate_glob("a_b-c.txt").is_ok());
+    }
+
+    #[test]
+    fn parse_query_ok() {
+        let v = json!({"path": "src", "pattern": "fn main"});
+        let q = parse_query(&v).unwrap();
+        assert_eq!(q.path, "src");
+        assert_eq!(q.pattern, "fn main");
+        assert!(q.glob.is_none());
+    }
+
+    #[test]
+    fn parse_query_with_glob() {
+        let v = json!({"path": "src", "pattern": "fn", "glob": "*.rs"});
+        let q = parse_query(&v).unwrap();
+        assert_eq!(q.glob.as_deref(), Some("*.rs"));
+    }
+
+    #[test]
+    fn parse_query_rejects_non_object() {
+        assert!(parse_query(&json!("string")).is_err());
+    }
+
+    #[test]
+    fn parse_query_rejects_missing_path() {
+        let v = json!({"pattern": "x"});
+        assert!(parse_query(&v).is_err());
+    }
+
+    #[test]
+    fn parse_query_rejects_empty_path() {
+        let v = json!({"path": "", "pattern": "x"});
+        assert!(parse_query(&v).is_err());
+    }
+
+    #[test]
+    fn parse_query_rejects_missing_pattern() {
+        let v = json!({"path": "src"});
+        assert!(parse_query(&v).is_err());
+    }
+
+    #[test]
+    fn parse_query_rejects_empty_pattern() {
+        let v = json!({"path": "src", "pattern": ""});
+        assert!(parse_query(&v).is_err());
+    }
+
+    #[test]
+    fn parse_query_treats_null_glob_as_none() {
+        let v = json!({"path": "src", "pattern": "x", "glob": null});
+        assert!(parse_query(&v).unwrap().glob.is_none());
+    }
+
+    #[test]
+    fn parse_query_treats_empty_glob_as_none() {
+        let v = json!({"path": "src", "pattern": "x", "glob": ""});
+        assert!(parse_query(&v).unwrap().glob.is_none());
+    }
+
+    #[test]
+    fn parse_query_rejects_non_string_glob() {
+        let v = json!({"path": "src", "pattern": "x", "glob": 42});
+        assert!(parse_query(&v).is_err());
+    }
+
+    #[test]
+    fn result_object_shape() {
+        let matches = vec![json!({"file": "a.rs", "line": 1, "text": "fn"})];
+        let v = result_object("src", "fn", Some("*.rs"), matches, 1, None, false);
+        assert_eq!(v["path"], "src");
+        assert_eq!(v["pattern"], "fn");
+        assert_eq!(v["glob"], "*.rs");
+        assert_eq!(v["total"], 1);
+        assert_eq!(v["shown"], 1);
+        assert_eq!(v["truncated"], false);
+        assert!(v["error"].is_null());
+    }
+
+    #[test]
+    fn result_object_truncated_flag() {
+        let v = result_object("p", "x", None, vec![], 0, None, true);
+        assert_eq!(v["truncated"], true);
+    }
+
+    #[test]
+    fn result_error_shape() {
+        let v = result_error("p", "x", None, "boom".to_string());
+        assert_eq!(v["path"], "p");
+        assert_eq!(v["pattern"], "x");
+        assert_eq!(v["error"], "boom");
+        assert_eq!(v["total"], 0);
+        assert_eq!(v["shown"], 0);
+        assert_eq!(v["truncated"], false);
+    }
+}

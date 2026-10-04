@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 lzcdr
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 // src/godfather.rs
 
 use anyhow::{Context, Result};
@@ -286,4 +290,141 @@ struct GodfatherUsage {
 struct RawMessage {
     role: String,
     content: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::{FunctionCall, Message, Role, ToolCall, Turn};
+
+    #[test]
+    fn strip_fences_plain_json_passthrough() {
+        let s = r#"[{"role":"user","content":"hi"}]"#;
+        assert_eq!(strip_markdown_fences(s), s);
+    }
+
+    #[test]
+    fn strip_fences_json_block() {
+        let s = "```json\n[{\"role\":\"user\"}]\n```";
+        assert_eq!(strip_markdown_fences(s), r#"[{"role":"user"}]"#);
+    }
+
+    #[test]
+    fn strip_fences_bare_block() {
+        let s = "```\n[1,2,3]\n```";
+        assert_eq!(strip_markdown_fences(s), "[1,2,3]");
+    }
+
+    #[test]
+    fn strip_fences_uppercase_json() {
+        let s = "```JSON\n[1]\n```";
+        assert_eq!(strip_markdown_fences(s), "[1]");
+    }
+
+    #[test]
+    fn strip_fences_unclosed_block() {
+        let s = "```json\n[1,2,3]";
+        assert_eq!(strip_markdown_fences(s), "[1,2,3]");
+    }
+
+    #[test]
+    fn truncate_for_log_short_unchanged() {
+        assert_eq!(truncate_for_log("hello", 10), "hello");
+    }
+
+    #[test]
+    fn truncate_for_log_long_adds_ellipsis() {
+        let out = truncate_for_log("abcdefghij", 4);
+        assert_eq!(out, "abcd...");
+        assert_eq!(out.chars().filter(|c| *c == '.').count(), 3);
+    }
+
+    #[test]
+    fn serialize_turns_user_assistant() {
+        let turn = Turn {
+            messages: vec![
+                Message {
+                    role: Role::User,
+                    content: Some("привет".into()),
+                    reasoning: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: None,
+                },
+                Message {
+                    role: Role::Assistant,
+                    content: Some("здравствуй".into()),
+                    reasoning: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: None,
+                },
+            ],
+            archived_origin: None,
+        };
+        let s = serialize_turns(&[turn]);
+        assert!(s.contains("Пользователь: привет"));
+        assert!(s.contains("Ассистент: здравствуй"));
+    }
+
+    #[test]
+    fn serialize_turns_tool_call_and_result() {
+        let turn = Turn {
+            messages: vec![
+                Message {
+                    role: Role::Assistant,
+                    content: None,
+                    reasoning: None,
+                    tool_calls: Some(vec![ToolCall {
+                        id: "1".into(),
+                        call_type: "function".into(),
+                        function: FunctionCall {
+                            name: "storage_read_file".into(),
+                            arguments: r#"{"path":"a.txt"}"#.into(),
+                        },
+                    }]),
+                    tool_call_id: None,
+                    name: None,
+                },
+                Message {
+                    role: Role::Tool,
+                    content: Some("содержимое".into()),
+                    reasoning: None,
+                    tool_calls: None,
+                    tool_call_id: Some("1".into()),
+                    name: None,
+                },
+            ],
+            archived_origin: None,
+        };
+        let s = serialize_turns(&[turn]);
+        assert!(s.contains("[инструмент: storage_read_file"));
+        assert!(s.contains("[результат инструмента: содержимое]"));
+    }
+
+    #[test]
+    fn is_usable_false_when_api_key_empty() {
+        let cfg = GodfatherConfig {
+            model: "m".into(),
+            api_key: String::new(),
+            base_url: "u".into(),
+            temperature: None,
+            max_tokens: None,
+            prompt: "p".into(),
+        };
+        assert!(!cfg.is_usable());
+    }
+
+    #[test]
+    fn is_usable_true_when_all_set() {
+        let cfg = GodfatherConfig {
+            model: "m".into(),
+            api_key: "k".into(),
+            base_url: "u".into(),
+            temperature: None,
+            max_tokens: None,
+            prompt: "p".into(),
+        };
+        assert!(cfg.is_usable());
+    }
 }

@@ -96,7 +96,7 @@ export POLZA_API_KEY="..."
 (или положить в .env-файл)
 
 # 5a. Запустить всё через GUI
-cargo run --bin control_center
+cargo run -p control_center
 # нажать "Start all"
 
 # 5b. Или вручную, в отдельных терминалах
@@ -599,4 +599,15 @@ cargo build --release
 
 ## Лицензия
 
-Не указана.
+Лицензировано на условиях двойной лицензии:
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT license ([LICENSE-MIT](LICENSE-MIT))
+
+на ваш выбор.
+
+### Вклад
+
+Если вы явно не укажете иное, любой вклад, отправленный вами
+для включения в эту работу, будет лицензирован под указанной
+двойной лицензией без каких-либо дополнительных условий.

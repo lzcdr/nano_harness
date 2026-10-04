@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 lzcdr
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 // src/tool_runtime/tools/ctags.rs
 
 use crate::tool_runtime::context::ToolContext;
@@ -266,3 +270,79 @@ impl ToolImpl for Ctags {
 }
 
 inventory::submit! { &Ctags as &'static dyn crate::tool_runtime::ToolImpl }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn validate_relative_rejects_empty() {
+        assert!(validate_relative("").is_err());
+    }
+
+    #[test]
+    fn validate_relative_rejects_absolute() {
+        assert!(validate_relative("/etc").is_err());
+    }
+
+    #[test]
+    fn validate_relative_rejects_parent_dir() {
+        assert!(validate_relative("../x").is_err());
+        assert!(validate_relative("a/../b").is_err());
+    }
+
+    #[test]
+    fn validate_relative_normal_ok() {
+        let p = validate_relative("src/main.rs").unwrap();
+        assert!(p.to_string_lossy().contains("main.rs"));
+    }
+
+    #[test]
+    fn validate_relative_dot_ok() {
+        let p = validate_relative(".").unwrap();
+        assert_eq!(p.to_string_lossy(), ".");
+    }
+
+    #[test]
+    fn read_gitignore_missing_returns_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(read_gitignore_patterns(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn read_gitignore_skips_comments_and_blanks() {
+        let dir = tempfile::tempdir().unwrap();
+        let gi = dir.path().join(".gitignore");
+        fs::write(&gi, "# comment\n\n  \ntarget\nnode_modules\n").unwrap();
+        let pats = read_gitignore_patterns(dir.path());
+        assert_eq!(pats, vec!["target", "node_modules"]);
+    }
+
+    #[test]
+    fn read_gitignore_skips_negations() {
+        let dir = tempfile::tempdir().unwrap();
+        let gi = dir.path().join(".gitignore");
+        fs::write(&gi, "target\n!keep_me\nbuild\n").unwrap();
+        let pats = read_gitignore_patterns(dir.path());
+        assert_eq!(pats, vec!["target", "build"]);
+    }
+
+    #[test]
+    fn read_gitignore_strips_leading_and_trailing_slashes() {
+        let dir = tempfile::tempdir().unwrap();
+        let gi = dir.path().join(".gitignore");
+        fs::write(&gi, "/target/\n/dist\n").unwrap();
+        let pats = read_gitignore_patterns(dir.path());
+        assert_eq!(pats, vec!["target", "dist"]);
+    }
+
+    #[test]
+    fn read_gitignore_deduplicates() {
+        let dir = tempfile::tempdir().unwrap();
+        let gi = dir.path().join(".gitignore");
+        fs::write(&gi, "target\ntarget\nnode_modules\n").unwrap();
+        let pats = read_gitignore_patterns(dir.path());
+        assert_eq!(pats, vec!["target", "node_modules"]);
+    }
+}

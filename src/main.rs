@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 lzcdr
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 // src/main.rs
 
 use anyhow::{Context, Result};

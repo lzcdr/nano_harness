@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 lzcdr
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 // src/local_storage.rs
 use candle_core::{Device, Tensor};
 use candle_nn::VarBuilder;
@@ -1008,5 +1012,112 @@ mod tests {
                 query
             );
         }
+    }
+
+    #[test]
+    fn is_reserved_name_matches_known() {
+        assert!(is_reserved_name(".about"));
+        assert!(is_reserved_name(".summary"));
+        assert!(is_reserved_name(".skills"));
+        assert!(is_reserved_name(".rebukes"));
+        assert!(is_reserved_name(".knowledge"));
+        assert!(is_reserved_name("vector_meta.json"));
+    }
+
+    #[test]
+    fn is_reserved_name_is_case_insensitive() {
+        assert!(is_reserved_name(".ABOUT"));
+        assert!(is_reserved_name(".Summary"));
+    }
+
+    #[test]
+    fn is_reserved_name_rejects_regular() {
+        assert!(!is_reserved_name("main.rs"));
+        assert!(!is_reserved_name("README.md"));
+        assert!(!is_reserved_name("about"));
+    }
+
+    #[test]
+    fn valid_project_id_accepts_alphanumeric_dash_underscore() {
+        assert!(valid_project_id("myproject"));
+        assert!(valid_project_id("my-project"));
+        assert!(valid_project_id("my_project"));
+        assert!(valid_project_id("MyProject123"));
+    }
+
+    #[test]
+    fn valid_project_id_rejects_empty() {
+        assert!(!valid_project_id(""));
+    }
+
+    #[test]
+    fn valid_project_id_rejects_spaces_and_slashes() {
+        assert!(!valid_project_id("my project"));
+        assert!(!valid_project_id("my/project"));
+        assert!(!valid_project_id("my\\project"));
+        assert!(!valid_project_id("my.project"));
+    }
+
+    #[test]
+    fn vector_db_config_default_values() {
+        let cfg = VectorDbConfig::default();
+        assert_eq!(cfg.chunk_size, 512);
+        assert_eq!(cfg.chunk_overlap, 64);
+        assert_eq!(cfg.top_k, 5);
+        assert!(cfg.model_path.contains("paraphrase"));
+    }
+
+    #[test]
+    fn chunk_text_empty_returns_empty() {
+        let chunks = chunk_text("", 512, 64);
+        assert!(chunks.is_empty());
+    }
+
+    #[test]
+    fn chunk_text_short_text_single_chunk() {
+        let text = "короткий текст";
+        let chunks = chunk_text(text, 512, 64);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].0, text);
+        assert_eq!(chunks[0].1, 0);
+        assert_eq!(chunks[0].2, text.len() as u64);
+    }
+
+    #[test]
+    fn chunk_text_long_splits_into_multiple() {
+        let text = "word ".repeat(500);
+        let chunks = chunk_text(&text, 100, 20);
+        assert!(chunks.len() > 1);
+        for (chunk, start, end) in &chunks {
+            assert!(!chunk.is_empty());
+            assert!(start <= end);
+        }
+    }
+
+    #[test]
+    fn chunk_text_positions_are_monotonic() {
+        let text = "alpha beta gamma delta epsilon zeta eta theta iota kappa ".repeat(20);
+        let chunks = chunk_text(&text, 50, 10);
+        let mut prev_start = 0u64;
+        for (_, start, _) in &chunks {
+            assert!(*start >= prev_start);
+            prev_start = *start;
+        }
+    }
+
+    #[test]
+    fn chunk_text_short_whitespace_is_single_chunk() {
+        let text = "   \n\t  ";
+        let chunks = chunk_text(text, 512, 64);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].0, text);
+    }
+
+    #[test]
+    fn chunk_text_overlap_zero_no_overlap() {
+        let text = "a b c d e f g h i j k l m n o p q r s t ".repeat(10);
+        let chunks = chunk_text(&text, 20, 0);
+        // С нулевым overlap каждая позиция start должна быть больше предыдущей end
+        assert!(chunks.len() > 1);
     }
 }

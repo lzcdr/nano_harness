@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 lzcdr
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 // src/config.rs
 
 use anyhow::{Context, Result};
@@ -127,4 +131,162 @@ pub fn build_engine_config(
         compact_threshold_bytes: toml_config.compact_threshold_bytes.unwrap_or(512),
         tail_byte_budget: toml_config.tail_byte_budget.unwrap_or(100 * 1024),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn toml_config_load_parses_minimal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.toml");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, "api_key = \"k\"").unwrap();
+        writeln!(f, "model = \"m\"").unwrap();
+        drop(f);
+        let cfg = TomlConfig::load(&path).unwrap();
+        assert_eq!(cfg.api_key.as_deref(), Some("k"));
+        assert_eq!(cfg.model.as_deref(), Some("m"));
+    }
+
+    #[test]
+    fn toml_config_load_parses_agents() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.toml");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(
+            f,
+            r#"
+api_key = "k"
+[[agents]]
+name = "analyzer"
+bind_addr = "127.0.0.1:8081"
+auth_token = ""
+timeout_sec = 60
+max_iterations = 3
+tools = ["storage_read_file"]
+api_key = ""
+base_url = "http://x"
+model = "m"
+stream = true
+"#
+        )
+        .unwrap();
+        drop(f);
+        let cfg = TomlConfig::load(&path).unwrap();
+        assert_eq!(cfg.agents.len(), 1);
+        assert_eq!(cfg.agents[0].name, "analyzer");
+    }
+
+    #[test]
+    fn build_engine_config_uses_cli_api_key_first() {
+        let toml = TomlConfig::default();
+        let cfg = build_engine_config(
+            Some("cli-key".into()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &toml,
+        )
+        .unwrap();
+        assert_eq!(cfg.api_key, "cli-key");
+    }
+
+    #[test]
+    fn build_engine_config_falls_back_to_toml_api_key() {
+        let mut toml = TomlConfig::default();
+        toml.api_key = Some("toml-key".into());
+        let cfg = build_engine_config(
+            None, None, None, None, None, None, None, None, None, None, &toml,
+        )
+        .unwrap();
+        assert_eq!(cfg.api_key, "toml-key");
+    }
+
+    #[test]
+    fn build_engine_config_default_base_url() {
+        let toml = TomlConfig {
+            api_key: Some("k".into()),
+            ..Default::default()
+        };
+        let cfg = build_engine_config(
+            None, None, None, None, None, None, None, None, None, None, &toml,
+        )
+        .unwrap();
+        assert_eq!(cfg.base_url, "https://polza.ai/api/v1");
+    }
+
+    #[test]
+    fn build_engine_config_default_model() {
+        let toml = TomlConfig {
+            api_key: Some("k".into()),
+            ..Default::default()
+        };
+        let cfg = build_engine_config(
+            None, None, None, None, None, None, None, None, None, None, &toml,
+        )
+        .unwrap();
+        assert_eq!(cfg.model, "openai/gpt-4o");
+    }
+
+    #[test]
+    fn build_engine_config_default_stream_true() {
+        let toml = TomlConfig {
+            api_key: Some("k".into()),
+            ..Default::default()
+        };
+        let cfg = build_engine_config(
+            None, None, None, None, None, None, None, None, None, None, &toml,
+        )
+        .unwrap();
+        assert!(cfg.stream);
+    }
+
+    #[test]
+    fn build_engine_config_cli_overrides_toml() {
+        let toml = TomlConfig {
+            api_key: Some("toml-key".into()),
+            model: Some("toml-model".into()),
+            temperature: Some(0.1),
+            ..Default::default()
+        };
+        let cfg = build_engine_config(
+            None,
+            None,
+            Some("cli-model".into()),
+            Some(0.9),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &toml,
+        )
+        .unwrap();
+        assert_eq!(cfg.model, "cli-model");
+        assert_eq!(cfg.temperature, Some(0.9));
+    }
+
+    #[test]
+    fn build_engine_config_default_compact_thresholds() {
+        let toml = TomlConfig {
+            api_key: Some("k".into()),
+            ..Default::default()
+        };
+        let cfg = build_engine_config(
+            None, None, None, None, None, None, None, None, None, None, &toml,
+        )
+        .unwrap();
+        assert_eq!(cfg.compact_threshold_bytes, 512);
+        assert_eq!(cfg.tail_byte_budget, 100 * 1024);
+    }
 }
