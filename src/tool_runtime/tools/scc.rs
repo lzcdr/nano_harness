@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 lzcdr
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 // src/tool_runtime/tools/scc.rs
 
 use crate::tool_runtime::context::ToolContext;
@@ -218,3 +222,85 @@ impl ToolImpl for Scc {
 }
 
 inventory::submit! { &Scc as &'static dyn crate::tool_runtime::ToolImpl }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn validate_relative_rejects_empty() {
+        assert!(validate_relative("").is_err());
+    }
+
+    #[test]
+    fn validate_relative_rejects_absolute() {
+        assert!(validate_relative("/etc").is_err());
+    }
+
+    #[test]
+    fn validate_relative_rejects_parent_dir() {
+        assert!(validate_relative("../x").is_err());
+        assert!(validate_relative("a/../b").is_err());
+    }
+
+    #[test]
+    fn validate_relative_normal_ok() {
+        let p = validate_relative("src").unwrap();
+        assert!(p.to_string_lossy().contains("src"));
+    }
+
+    #[test]
+    fn validate_relative_dot_ok() {
+        let p = validate_relative(".").unwrap();
+        assert_eq!(p.to_string_lossy(), ".");
+    }
+
+    #[test]
+    fn get_u64_returns_first_matching_key() {
+        let v = json!({"Count": 5, "count": 7});
+        assert_eq!(get_u64(&v, &["Count", "count"]), 5);
+    }
+
+    #[test]
+    fn get_u64_falls_back_to_second_key() {
+        let v = json!({"count": 7});
+        assert_eq!(get_u64(&v, &["Count", "count"]), 7);
+    }
+
+    #[test]
+    fn get_u64_returns_zero_when_missing() {
+        let v = json!({});
+        assert_eq!(get_u64(&v, &["Count", "count"]), 0);
+    }
+
+    #[test]
+    fn get_u64_returns_zero_on_wrong_type() {
+        let v = json!({"Count": "5"});
+        assert_eq!(get_u64(&v, &["Count"]), 0);
+    }
+
+    #[test]
+    fn get_str_returns_first_matching_key() {
+        let v = json!({"Name": "Rust", "name": "C"});
+        assert_eq!(get_str(&v, &["Name", "name"]), "Rust");
+    }
+
+    #[test]
+    fn get_str_falls_back_to_second_key() {
+        let v = json!({"name": "C"});
+        assert_eq!(get_str(&v, &["Name", "name"]), "C");
+    }
+
+    #[test]
+    fn get_str_returns_empty_when_missing() {
+        let v = json!({});
+        assert_eq!(get_str(&v, &["Name", "name"]), "");
+    }
+
+    #[test]
+    fn get_str_returns_empty_on_wrong_type() {
+        let v = json!({"Name": 42});
+        assert_eq!(get_str(&v, &["Name"]), "");
+    }
+}

@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 lzcdr
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 // src/engine.rs
 
 use anyhow::{Context, Result};
@@ -985,4 +989,260 @@ struct StreamingToolCall {
     id: String,
     name: String,
     arguments: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dummy_config() -> EngineConfig {
+        EngineConfig {
+            api_key: "test".into(),
+            base_url: "http://127.0.0.1:1".into(), // недостижимый, но не зовётся
+            model: "test".into(),
+            temperature: None,
+            max_tokens: None,
+            top_p: None,
+            stop: None,
+            stream: false,
+            allowed_tools: None,
+            tool_choice: None,
+            reasoning_effort: None,
+            max_cost_rub: None,
+            prefix_message_count: Some(1),
+            tail_message_count: Some(2),
+            compact_threshold_bytes: 512,
+            tail_byte_budget: 100 * 1024,
+        }
+    }
+
+    fn new_engine() -> ChatEngine {
+        ChatEngine::new(dummy_config(), Client::new())
+    }
+
+    fn long_string(n: usize) -> String {
+        "x".repeat(n)
+    }
+
+    #[test]
+    fn add_user_message_creates_pending_turn() {
+        let mut e = new_engine();
+        e.add_message(Role::User, "hi".into());
+        assert_eq!(e.tail_turn_count(), 0);
+        assert_eq!(e.total_context_bytes(), 2);
+    }
+
+    #[test]
+    fn user_then_assistant_finalizes_turn_into_prefix() {
+        let mut e = new_engine();
+        e.add_message(Role::User, "hi".into());
+        e.add_message(Role::Assistant, "hello".into());
+        e.add_message(Role::User, "next".into()); // триггерит finalize
+        assert_eq!(e.prefix_turn_count(), 1);
+        assert_eq!(e.prefix_word_count(), 2); // "hi" + "hello"
+    }
+
+    #[test]
+    fn excess_turns_go_to_tail() {
+        let mut e = new_engine();
+        // prefix_message_count = 1
+        e.add_message(Role::User, "u1".into());
+        e.add_message(Role::Assistant, "a1".into());
+        e.add_message(Role::User, "u2".into());
+        e.add_message(Role::Assistant, "a2".into());
+        e.add_message(Role::User, "u3".into()); // finalize u2a2
+        assert_eq!(e.prefix_turn_count(), 1);
+        assert_eq!(e.tail_turn_count(), 1);
+    }
+
+    #[test]
+    fn tail_trims_by_count() {
+        let mut e = new_engine();
+        e.add_message(Role::User, "u1".into());
+        e.add_message(Role::Assistant, "a1".into());
+        for i in 2..=5 {
+            e.add_message(Role::User, format!("u{}", i));
+            e.add_message(Role::Assistant, format!("a{}", i));
+        }
+        // tail_message_count = 2
+        assert!(e.tail_turn_count() <= 2);
+    }
+
+    #[test]
+    fn compact_turn_replaces_long_tool_result() {
+        let mut turn = Turn {
+            messages: vec![Message {
+                role: Role::Tool,
+                content: Some(long_string(1000)),
+                reasoning: None,
+                tool_calls: None,
+                tool_call_id: Some("1".into()),
+                name: None,
+            }],
+            archived_origin: None,
+        };
+        compact_turn(512, &mut turn);
+        let content = turn.messages[0].content.as_ref().unwrap();
+        assert!(content.contains("результат опущен"));
+        assert!(content.len() < 200);
+    }
+
+    #[test]
+    fn compact_turn_keeps_short_tool_result() {
+        let mut turn = Turn {
+            messages: vec![Message {
+                role: Role::Tool,
+                content: Some("short".into()),
+                reasoning: None,
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            }],
+            archived_origin: None,
+        };
+        compact_turn(512, &mut turn);
+        assert_eq!(turn.messages[0].content.as_deref(), Some("short"));
+    }
+
+    #[test]
+    fn compact_turn_strips_assistant_reasoning() {
+        let mut turn = Turn {
+            messages: vec![Message {
+                role: Role::Assistant,
+                content: Some("answer".into()),
+                reasoning: Some("thinking...".into()),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            }],
+            archived_origin: None,
+        };
+        compact_turn(512, &mut turn);
+        assert!(turn.messages[0].reasoning.is_none());
+        assert_eq!(turn.messages[0].content.as_deref(), Some("answer"));
+    }
+
+    #[test]
+    fn message_bytes_sums_content_and_reasoning() {
+        let m = Message {
+            role: Role::Assistant,
+            content: Some("abc".into()),
+            reasoning: Some("de".into()),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        };
+        assert_eq!(message_bytes(&m), 5);
+    }
+
+    #[test]
+    fn message_bytes_counts_tool_calls() {
+        let m = Message {
+            role: Role::Assistant,
+            content: None,
+            reasoning: None,
+            tool_calls: Some(vec![ToolCall {
+                id: "1".into(),
+                call_type: "function".into(),
+                function: FunctionCall {
+                    name: "fn".into(),
+                    arguments: "{}".into(),
+                },
+            }]),
+            tool_call_id: None,
+            name: None,
+        };
+        assert_eq!(message_bytes(&m), 4); // "fn" + "{}"
+    }
+
+    #[test]
+    fn skill_context_set_and_clear() {
+        let mut e = new_engine();
+        assert!(!e.has_skill_context());
+        e.set_skill_context("skill body".into());
+        assert!(e.has_skill_context());
+        e.clear_skill_context();
+        assert!(!e.has_skill_context());
+    }
+
+    #[test]
+    fn knowledge_context_set_and_clear() {
+        let mut e = new_engine();
+        assert!(!e.has_knowledge_context());
+        e.set_knowledge_context("rust", "async".into());
+        assert!(e.has_knowledge_context());
+        e.clear_knowledge_context();
+        assert!(!e.has_knowledge_context());
+    }
+
+    #[test]
+    fn clear_context_removes_everything() {
+        let mut e = new_engine();
+        e.add_message(Role::System, "sys".into());
+        e.add_message(Role::User, "u".into());
+        e.add_message(Role::Assistant, "a".into());
+        e.set_skill_context("s".into());
+        e.set_knowledge_context("k", "body".into());
+        e.clear_context();
+        assert_eq!(e.tail_turn_count(), 0);
+        assert_eq!(e.prefix_turn_count(), 0);
+        assert!(!e.has_skill_context());
+        assert!(!e.has_knowledge_context());
+    }
+
+    #[test]
+    fn unfreeze_last_restores_archived_turn() {
+        let mut e = new_engine();
+        e.add_message(Role::User, "u1".into());
+        e.add_message(Role::Assistant, "a1".into());
+        e.add_message(Role::User, "u2".into());
+        e.add_message(Role::Assistant, "a2".into());
+        e.add_message(Role::User, "u3".into());
+        // tail_turns = [u2a2] (prefix занят u1a1)
+        let snapshot = e.tail_turns_snapshot();
+        assert!(!snapshot.is_empty());
+
+        e.apply_godfather_result(vec![Message {
+            role: Role::User,
+            content: Some("сжато".into()),
+            reasoning: None,
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }]);
+        assert_eq!(e.archive_len(), 1);
+
+        let restored = e.unfreeze_last();
+        assert!(restored > 0);
+        assert_eq!(e.archive_len(), 0);
+    }
+
+    #[test]
+    fn unfreeze_all_on_empty_returns_zero() {
+        let mut e = new_engine();
+        assert_eq!(e.unfreeze_all(), 0);
+    }
+
+    #[test]
+    fn unfreeze_last_on_empty_returns_zero() {
+        let mut e = new_engine();
+        assert_eq!(e.unfreeze_last(), 0);
+    }
+
+    #[test]
+    fn set_system_prompt_replaces_first() {
+        let mut e = new_engine();
+        e.add_message(Role::System, "first".into());
+        e.set_system_prompt("second".into());
+        let msgs = e.get_messages();
+        assert_eq!(msgs[0].content.as_deref(), Some("second"));
+    }
+
+    #[test]
+    fn set_system_prompt_creates_if_absent() {
+        let mut e = new_engine();
+        e.set_system_prompt("only".into());
+        let msgs = e.get_messages();
+        assert_eq!(msgs[0].content.as_deref(), Some("only"));
+    }
 }

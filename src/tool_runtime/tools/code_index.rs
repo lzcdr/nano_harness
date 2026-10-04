@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 lzcdr
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 // src/tool_runtime/tools/code_index.rs
 
 use crate::tool_runtime::context::ToolContext;
@@ -1240,3 +1244,389 @@ impl ToolImpl for CodeIndex {
 }
 
 inventory::submit! { &CodeIndex as &'static dyn crate::tool_runtime::ToolImpl }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---------- validate_relative ----------
+
+    #[test]
+    fn validate_relative_rejects_empty() {
+        assert!(validate_relative("").is_err());
+    }
+
+    #[test]
+    fn validate_relative_rejects_absolute() {
+        assert!(validate_relative("/etc/passwd").is_err());
+    }
+
+    #[test]
+    fn validate_relative_rejects_parent_dir() {
+        assert!(validate_relative("../etc").is_err());
+        assert!(validate_relative("src/../etc").is_err());
+    }
+
+    #[test]
+    fn validate_relative_normal() {
+        let p = validate_relative("src/main.rs").unwrap();
+        assert_eq!(to_forward_slashes(&p.to_string_lossy()), "src/main.rs");
+    }
+
+    #[test]
+    fn validate_relative_cur_dir_skipped() {
+        let p = validate_relative("./src").unwrap();
+        assert_eq!(p.to_string_lossy(), "src");
+    }
+
+    #[test]
+    fn validate_relative_empty_components_becomes_dot() {
+        let p = validate_relative(".").unwrap();
+        assert_eq!(p.to_string_lossy(), ".");
+    }
+
+    // ---------- to_forward_slashes ----------
+
+    #[test]
+    fn to_forward_slashes_converts_backslashes() {
+        assert_eq!(to_forward_slashes("a\\b\\c"), "a/b/c");
+        assert_eq!(to_forward_slashes("a/b/c"), "a/b/c");
+    }
+
+    // ---------- is_source_file ----------
+
+    #[test]
+    fn is_source_file_known_extensions() {
+        assert!(is_source_file(Path::new("main.rs")));
+        assert!(is_source_file(Path::new("app.py")));
+        assert!(is_source_file(Path::new("x.go")));
+        assert!(is_source_file(Path::new("y.tsx")));
+        assert!(is_source_file(Path::new("z.JS"))); // регистронезависимо
+    }
+
+    #[test]
+    fn is_source_file_rejects_others() {
+        assert!(!is_source_file(Path::new("README.md")));
+        assert!(!is_source_file(Path::new("data.json")));
+        assert!(!is_source_file(Path::new("no_extension")));
+    }
+
+    // ---------- is_config_file ----------
+
+    #[test]
+    fn is_config_file_known_names() {
+        assert!(is_config_file("Cargo.toml"));
+        assert!(is_config_file("package.json"));
+        assert!(is_config_file("Dockerfile"));
+        assert!(is_config_file("Makefile"));
+    }
+
+    #[test]
+    fn is_config_file_known_extensions() {
+        assert!(is_config_file("proj.csproj"));
+        assert!(is_config_file("app.sln"));
+    }
+
+    #[test]
+    fn is_config_file_rejects_regular() {
+        assert!(!is_config_file("main.rs"));
+        assert!(!is_config_file("foo.txt"));
+    }
+
+    // ---------- is_export_kind / is_function_kind ----------
+
+    #[test]
+    fn is_export_kind_recognizes() {
+        assert!(is_export_kind("function"));
+        assert!(is_export_kind("fn"));
+        assert!(is_export_kind("struct"));
+        assert!(is_export_kind("CLASS"));
+    }
+
+    #[test]
+    fn is_export_kind_rejects_unknown() {
+        assert!(!is_export_kind("variable"));
+        assert!(!is_export_kind(""));
+    }
+
+    #[test]
+    fn is_function_kind_recognizes() {
+        assert!(is_function_kind("function"));
+        assert!(is_function_kind("fn"));
+        assert!(is_function_kind("method"));
+        assert!(is_function_kind("func"));
+    }
+
+    #[test]
+    fn is_function_kind_rejects_struct() {
+        assert!(!is_function_kind("struct"));
+    }
+
+    // ---------- is_comment_line ----------
+
+    #[test]
+    fn is_comment_line_recognizes_styles() {
+        assert!(is_comment_line("// rust"));
+        assert!(is_comment_line("  // indented"));
+        assert!(is_comment_line("/* c */"));
+        assert!(is_comment_line("* inside block"));
+        assert!(is_comment_line("# python"));
+        assert!(is_comment_line("-- sql"));
+        assert!(is_comment_line(";; lisp"));
+        assert!(is_comment_line("%% latex"));
+    }
+
+    #[test]
+    fn is_comment_line_rejects_code() {
+        assert!(!is_comment_line("let x = 1;"));
+        assert!(!is_comment_line(""));
+    }
+
+    // ---------- clean_comment ----------
+
+    #[test]
+    fn clean_comment_strips_line_prefixes() {
+        assert_eq!(clean_comment("// hello"), "hello");
+        assert_eq!(clean_comment("/// doc"), "doc");
+        assert_eq!(clean_comment("//! inner"), "inner");
+        assert_eq!(clean_comment("# python"), "python");
+        assert_eq!(clean_comment("-- sql"), "sql");
+    }
+
+    #[test]
+    fn clean_comment_strips_block_wrappers() {
+        assert_eq!(clean_comment("/* block */"), "block");
+        assert_eq!(clean_comment("/** doc */"), "doc");
+    }
+
+    #[test]
+    fn clean_comment_joins_multiline() {
+        let raw = "// line one\n// line two";
+        assert_eq!(clean_comment(raw), "line one line two");
+    }
+
+    #[test]
+    fn clean_comment_skips_empty_lines() {
+        let raw = "// a\n//\n// b";
+        assert_eq!(clean_comment(raw), "a b");
+    }
+
+    #[test]
+    fn clean_comment_handles_star_prefixed() {
+        let raw = "/*\n * line one\n * line two\n */";
+        assert_eq!(clean_comment(raw), "line one line two");
+    }
+
+    #[test]
+    fn clean_comment_empty_returns_empty() {
+        assert_eq!(clean_comment(""), "");
+    }
+
+    // ---------- lang_name_for_ext ----------
+
+    #[test]
+    fn lang_name_for_common_exts() {
+        assert_eq!(lang_name_for_ext("rs"), "Rust");
+        assert_eq!(lang_name_for_ext("py"), "Python");
+        assert_eq!(lang_name_for_ext("go"), "Go");
+        assert_eq!(lang_name_for_ext("ts"), "TypeScript");
+        assert_eq!(lang_name_for_ext("tsx"), "TypeScript");
+        assert_eq!(lang_name_for_ext("cpp"), "C++");
+    }
+
+    #[test]
+    fn lang_name_for_unknown() {
+        assert_eq!(lang_name_for_ext("xyz"), "Other");
+        assert_eq!(lang_name_for_ext(""), "Other");
+    }
+
+    // ---------- extract_above ----------
+
+    #[test]
+    fn extract_above_simple() {
+        let lines: Vec<&str> = vec!["// comment", "fn foo() {}"];
+        let c = extract_above(&lines, 2);
+        assert_eq!(c.as_deref(), Some("comment"));
+    }
+
+    #[test]
+    fn extract_above_multiline() {
+        let lines: Vec<&str> = vec!["// line one", "// line two", "fn foo() {}"];
+        let c = extract_above(&lines, 3);
+        assert_eq!(c.as_deref(), Some("line one line two"));
+    }
+
+    #[test]
+    fn extract_above_skips_attributes() {
+        let lines: Vec<&str> = vec!["// doc", "#[derive(Debug)]", "fn foo() {}"];
+        let c = extract_above(&lines, 3);
+        assert_eq!(c.as_deref(), Some("doc"));
+    }
+
+    #[test]
+    fn extract_above_stops_on_code() {
+        let lines: Vec<&str> = vec!["// doc", "let x = 1;", "fn foo() {}"];
+        assert!(extract_above(&lines, 3).is_none());
+    }
+
+    #[test]
+    fn extract_above_blank_line_breaks() {
+        let lines: Vec<&str> = vec!["// doc", "", "fn foo() {}"];
+        assert!(extract_above(&lines, 3).is_none());
+    }
+
+    #[test]
+    fn extract_above_none_when_first_line() {
+        let lines: Vec<&str> = vec!["fn foo() {}"];
+        assert!(extract_above(&lines, 1).is_none());
+    }
+
+    // ---------- extract_file_doc ----------
+
+    #[test]
+    fn extract_file_doc_simple() {
+        let lines: Vec<&str> = vec!["// file description", "// second line", "", "fn main() {}"];
+        let doc = extract_file_doc(&lines);
+        assert_eq!(doc.as_deref(), Some("file description second line"));
+    }
+
+    #[test]
+    fn extract_file_doc_empty_when_starts_with_code() {
+        let lines: Vec<&str> = vec!["fn main() {}", "// comment"];
+        assert!(extract_file_doc(&lines).is_none());
+    }
+
+    // ---------- extract_imports ----------
+
+    #[test]
+    fn extract_imports_rust_internal_vs_external() {
+        let content = "use std::io;\nuse serde::Serialize;\nuse crate::foo;\nuse super::bar;";
+        let (internal, external) = extract_imports(Path::new("x.rs"), content);
+        assert!(internal.contains(&"crate::foo".to_string()));
+        assert!(internal.contains(&"super::bar".to_string()));
+        assert!(external.contains(&"std::io".to_string()));
+        assert!(external.contains(&"serde::Serialize".to_string()));
+    }
+
+    #[test]
+    fn extract_imports_python() {
+        let content = "import os\nfrom .foo import bar\nfrom sys import path";
+        let (internal, external) = extract_imports(Path::new("x.py"), content);
+        assert!(internal.contains(&".foo".to_string()));
+        assert!(external.contains(&"os".to_string()));
+        assert!(external.contains(&"sys".to_string()));
+    }
+
+    #[test]
+    fn extract_imports_js() {
+        let content = "import x from './local';\nimport y from 'lodash';";
+        let (internal, external) = extract_imports(Path::new("x.js"), content);
+        assert!(internal.contains(&"./local".to_string()));
+        assert!(external.contains(&"lodash".to_string()));
+    }
+
+    #[test]
+    fn extract_imports_c_include() {
+        let content = "#include <stdio.h>\n#include \"myheader.h\"";
+        let (internal, external) = extract_imports(Path::new("x.c"), content);
+        assert!(internal.contains(&"myheader.h".to_string()));
+        assert!(external.contains(&"stdio.h".to_string()));
+    }
+
+    #[test]
+    fn extract_imports_skips_line_comments() {
+        let content = "// use foo::bar;\nuse real::thing;";
+        let (_, external) = extract_imports(Path::new("x.rs"), content);
+        assert!(!external.contains(&"foo::bar".to_string()));
+        assert!(external.contains(&"real::thing".to_string()));
+    }
+
+    #[test]
+    fn extract_imports_deduplicates() {
+        let content = "use std::io;\nuse std::io;";
+        let (_, external) = extract_imports(Path::new("x.rs"), content);
+        assert_eq!(external.iter().filter(|s| *s == "std::io").count(), 1);
+    }
+
+    // ---------- is_public_export ----------
+
+    #[test]
+    fn is_public_export_rust_pub() {
+        assert!(is_public_export("foo", "fn", "rs", Some("pub fn foo() {}")));
+        assert!(is_public_export(
+            "foo",
+            "fn",
+            "rs",
+            Some("pub(crate) fn foo() {}")
+        ));
+    }
+
+    #[test]
+    fn is_public_export_rust_private() {
+        assert!(!is_public_export("foo", "fn", "rs", Some("fn foo() {}")));
+    }
+
+    #[test]
+    fn is_public_export_go_capitalized() {
+        assert!(is_public_export("Foo", "func", "go", None));
+        assert!(!is_public_export("foo", "func", "go", None));
+    }
+
+    #[test]
+    fn is_public_export_python_underscore() {
+        assert!(is_public_export("foo", "function", "py", None));
+        assert!(!is_public_export("_foo", "function", "py", None));
+    }
+
+    #[test]
+    fn is_public_export_js_export() {
+        assert!(is_public_export(
+            "foo",
+            "function",
+            "js",
+            Some("export function foo()")
+        ));
+        assert!(!is_public_export(
+            "foo",
+            "function",
+            "js",
+            Some("function foo()")
+        ));
+    }
+
+    // ---------- extract_python_docstring ----------
+
+    #[test]
+    fn extract_python_docstring_single_line() {
+        let lines: Vec<&str> = vec!["def foo():", "    \"\"\"Short doc.\"\"\"", "    pass"];
+        let doc = extract_python_docstring(&lines, 1);
+        assert_eq!(doc.as_deref(), Some("Short doc."));
+    }
+
+    #[test]
+    fn extract_python_docstring_multiline() {
+        let lines: Vec<&str> = vec![
+            "def foo():",
+            "    \"\"\"",
+            "    Line one.",
+            "    Line two.",
+            "    \"\"\"",
+            "    pass",
+        ];
+        let doc = extract_python_docstring(&lines, 1);
+        assert_eq!(doc.as_deref(), Some("Line one. Line two."));
+    }
+
+    #[test]
+    fn extract_python_docstring_none_when_no_docstring() {
+        let lines: Vec<&str> = vec!["def foo():", "    pass"];
+        assert!(extract_python_docstring(&lines, 1).is_none());
+    }
+
+    #[test]
+    fn extract_python_docstring_triple_single() {
+        let lines: Vec<&str> = vec!["def foo():", "    '''Single quotes.'''", "    pass"];
+        let doc = extract_python_docstring(&lines, 1);
+        assert_eq!(doc.as_deref(), Some("Single quotes."));
+    }
+}

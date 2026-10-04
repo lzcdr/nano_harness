@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 lzcdr
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use crate::agent_core::PendingCall;
 use crate::tool_runtime::context::ToolContext;
 use crate::tool_runtime::primitives::{err, ok_text, parse_input, require_string};
@@ -9,7 +13,9 @@ pub struct CallAgent;
 
 #[async_trait::async_trait]
 impl ToolImpl for CallAgent {
-    fn name(&self) -> &'static str { "call_agent" }
+    fn name(&self) -> &'static str {
+        "call_agent"
+    }
 
     fn description(&self) -> &'static str {
         "Синхронно вызывает другого агента и ждёт его ответа. Возвращает текст \
@@ -28,9 +34,18 @@ impl ToolImpl for CallAgent {
     }
 
     async fn run(&self, input: &str, ctx: &ToolContext) -> String {
-        let args = match parse_input(input) { Ok(v) => v, Err(e) => return err(e) };
-        let to_agent = match require_string(&args, "to_agent") { Ok(a) => a, Err(e) => return err(e) };
-        let prompt = match require_string(&args, "prompt") { Ok(p) => p, Err(e) => return err(e) };
+        let args = match parse_input(input) {
+            Ok(v) => v,
+            Err(e) => return err(e),
+        };
+        let to_agent = match require_string(&args, "to_agent") {
+            Ok(a) => a,
+            Err(e) => return err(e),
+        };
+        let prompt = match require_string(&args, "prompt") {
+            Ok(p) => p,
+            Err(e) => return err(e),
+        };
 
         if to_agent == ctx.self_agent_name {
             return err(format!("агент '{}' не может вызывать сам себя", to_agent));
@@ -55,7 +70,10 @@ impl ToolImpl for CallAgent {
             let mut pc = ctx.pending_calls.lock().await;
             pc.insert(
                 task_id.clone(),
-                PendingCall { tx, created_at: std::time::Instant::now() },
+                PendingCall {
+                    tx,
+                    created_at: std::time::Instant::now(),
+                },
             );
         }
 
@@ -73,7 +91,8 @@ impl ToolImpl for CallAgent {
                     pc.remove(&task_id);
                 }
                 let fail_url = format!("{}/tasks/{}/fail", ctx.board_base(), task_id);
-                let _ = ctx.http_client
+                let _ = ctx
+                    .http_client
                     .post(&fail_url)
                     .header("Authorization", format!("Bearer {}", ctx.board_auth_token))
                     .json(&serde_json::json!({
@@ -104,7 +123,8 @@ async fn post_task_internal(
         "parent_task_id": null,
         "chain": chain
     });
-    let resp = ctx.http_client
+    let resp = ctx
+        .http_client
         .post(&url)
         .header("Authorization", format!("Bearer {}", ctx.board_auth_token))
         .json(&body)
@@ -118,11 +138,95 @@ async fn post_task_internal(
         return Err(format!("HTTP {} — {}", status, text));
     }
 
-    let v: serde_json::Value = resp.json().await
+    let v: serde_json::Value = resp
+        .json()
+        .await
         .map_err(|e| format!("ошибка парсинга ответа: {:#}", e))?;
-    v.get("task_id").and_then(|x| x.as_str())
+    v.get("task_id")
+        .and_then(|x| x.as_str())
         .map(|s| s.to_string())
         .ok_or_else(|| "в ответе нет task_id".to_string())
 }
 
 inventory::submit! { &CallAgent as &'static dyn crate::tool_runtime::ToolImpl }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tool_runtime::context::ToolContext;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    fn ctx_with(self_name: &str, chain: Vec<String>) -> ToolContext {
+        ToolContext {
+            http_client: reqwest::Client::new(),
+            storage_root_path: std::path::PathBuf::from("/tmp/nh_test"),
+            storage_base_url: "http://127.0.0.1:1".to_string(),
+            storage_auth_token: String::new(),
+            board_base_url: "http://127.0.0.1:1".to_string(),
+            board_auth_token: String::new(),
+            project_id: "test".to_string(),
+            session_id: Some("s1".to_string()),
+            parent_chain: chain,
+            self_agent_name: self_name.to_string(),
+            pending_calls: Arc::new(Mutex::new(HashMap::new())),
+            outgoing_tasks: Arc::new(Mutex::new(HashMap::new())),
+            agent_call_timeout_sec: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_invalid_json() {
+        let tool = CallAgent;
+        let ctx = ctx_with("a", vec![]);
+        let result = tool.run("{not json", &ctx).await;
+        assert!(result.contains("\"ok\":false"));
+        assert!(result.contains("некорректный JSON"));
+    }
+
+    #[tokio::test]
+    async fn rejects_missing_to_agent() {
+        let tool = CallAgent;
+        let ctx = ctx_with("a", vec![]);
+        let result = tool.run(r#"{"prompt":"hi"}"#, &ctx).await;
+        assert!(result.contains("\"ok\":false"));
+        assert!(result.contains("to_agent"));
+    }
+
+    #[tokio::test]
+    async fn rejects_missing_prompt() {
+        let tool = CallAgent;
+        let ctx = ctx_with("a", vec![]);
+        let result = tool.run(r#"{"to_agent":"b"}"#, &ctx).await;
+        assert!(result.contains("\"ok\":false"));
+        assert!(result.contains("prompt"));
+    }
+
+    #[tokio::test]
+    async fn rejects_self_call() {
+        let tool = CallAgent;
+        let ctx = ctx_with("a", vec![]);
+        let result = tool.run(r#"{"to_agent":"a","prompt":"hi"}"#, &ctx).await;
+        assert!(result.contains("\"ok\":false"));
+        assert!(result.contains("не может вызывать сам себя"));
+    }
+
+    #[tokio::test]
+    async fn rejects_cyclic_call() {
+        let tool = CallAgent;
+        let ctx = ctx_with("a", vec!["b".to_string(), "c".to_string()]);
+        let result = tool.run(r#"{"to_agent":"c","prompt":"hi"}"#, &ctx).await;
+        assert!(result.contains("\"ok\":false"));
+        assert!(result.contains("циклический вызов"));
+    }
+
+    #[tokio::test]
+    async fn board_unreachable_returns_error() {
+        let tool = CallAgent;
+        let ctx = ctx_with("a", vec![]);
+        let result = tool.run(r#"{"to_agent":"b","prompt":"hi"}"#, &ctx).await;
+        // Порт 1 недостижим — ожидаем ошибку запроса
+        assert!(result.contains("\"ok\":false"));
+    }
+}

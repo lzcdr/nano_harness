@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 lzcdr
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 // src/session_store.rs
 
 use anyhow::{Context, Result};
@@ -506,4 +510,343 @@ pub fn purge_project(session_id: &str) -> Result<Vec<PathBuf>> {
     }
 
     Ok(deleted)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::{EngineConfig, Message, Role};
+
+    fn unique_id(prefix: &str) -> String {
+        format!("_test_{}_{}", prefix, uuid::Uuid::new_v4())
+    }
+
+    fn cleanup(id: &str) {
+        let _ = purge_project(id);
+    }
+
+    #[test]
+    fn create_session_with_id_persists() {
+        let id = unique_id("create");
+        let s = create_session_with_id(&id, "Test Project", None).unwrap();
+        assert_eq!(s.session_id, id);
+        assert_eq!(s.display_name, "Test Project");
+        assert!(!s.deleted);
+        assert!(s.owner_agent.is_none());
+
+        let loaded = load_session(&id, None).unwrap();
+        assert_eq!(loaded.session_id, id);
+        cleanup(&id);
+    }
+
+    #[test]
+    fn load_nonexistent_errors() {
+        let res = load_session("_definitely_does_not_exist_xyz", None);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn save_and_load_roundtrip_preserves_fields() {
+        let id = unique_id("roundtrip");
+        let mut s = create_session_with_id(&id, "Roundtrip", None).unwrap();
+        s.display_name = "Changed".into();
+        s.pending_tasks.push(PendingTask {
+            task_id: "t1".into(),
+            to_agent_name: "analyzer".into(),
+            to_session_id: "s2".into(),
+            project_id: "proj".into(),
+            chain: vec!["analyzer".into()],
+        });
+        save_session(&s).unwrap();
+
+        let loaded = load_session(&id, None).unwrap();
+        assert_eq!(loaded.display_name, "Changed");
+        assert_eq!(loaded.pending_tasks.len(), 1);
+        assert_eq!(loaded.pending_tasks[0].to_agent_name, "analyzer");
+        cleanup(&id);
+    }
+
+    #[test]
+    fn save_masks_api_key_in_context() {
+        let id = unique_id("mask");
+        let mut s = create_session_with_id(&id, "Mask", None).unwrap();
+        s.context = Some(ContextBlock {
+            engine_config: EngineConfig {
+                api_key: "supersecret".into(),
+                ..Default::default()
+            },
+            engine_state: EngineState {
+                system_messages: vec![],
+                skill_context: None,
+                knowledge_context: None,
+                prefix_turns: vec![],
+                tail_turns: vec![],
+                pending_turn: None,
+                metrics: Default::default(),
+            },
+        });
+        save_session(&s).unwrap();
+
+        // Читаем сырой JSON, чтобы убедиться, что ключ замаскирован
+        let path = find_session_file(&id, None).unwrap();
+        let raw = fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("supersecret"));
+        assert!(raw.contains("***"));
+
+        // load_session_with_key восстанавливает
+        let loaded = load_session_with_key(&id, "realkey", None).unwrap();
+        let ctx = loaded.context.unwrap();
+        assert_eq!(ctx.engine_config.api_key, "realkey");
+        cleanup(&id);
+    }
+
+    #[test]
+    fn soft_delete_survives_resave() {
+        let id = unique_id("softdel");
+        let s = create_session_with_id(&id, "SoftDel", None).unwrap();
+
+        // Помечаем удалённым
+        mark_project_deleted(&id).unwrap();
+
+        // Пытаемся перезаписать (эмулируем «забыли про deleted»)
+        let mut s2 = s.clone();
+        s2.display_name = "Trying to resurrect".into();
+        save_session(&s2).unwrap();
+
+        // deleted должен остаться true (защита в save_session)
+        let loaded = load_session(&id, None).unwrap();
+        assert!(loaded.deleted);
+        cleanup(&id);
+    }
+
+    #[test]
+    fn list_sessions_excludes_deleted() {
+        let id_live = unique_id("live");
+        let id_dead = unique_id("dead");
+        create_session_with_id(&id_live, "Live", None).unwrap();
+        create_session_with_id(&id_dead, "Dead", None).unwrap();
+        mark_project_deleted(&id_dead).unwrap();
+
+        let all = list_sessions().unwrap();
+        let ids: Vec<&str> = all.iter().map(|s| s.session_id.as_str()).collect();
+        assert!(ids.contains(&id_live.as_str()));
+        assert!(!ids.contains(&id_dead.as_str()));
+        cleanup(&id_live);
+        cleanup(&id_dead);
+    }
+
+    #[test]
+    fn list_chat_projects_excludes_agent_sessions() {
+        let chat_id = unique_id("chat");
+        let agent_id = unique_id("agent");
+        create_session_with_id(&chat_id, "Chat", None).unwrap();
+        create_session_with_id(&agent_id, "Agent", Some("analyzer")).unwrap();
+
+        let chat_projects = list_chat_projects().unwrap();
+        let ids: Vec<&str> = chat_projects
+            .iter()
+            .map(|s| s.session_id.as_str())
+            .collect();
+        assert!(ids.contains(&chat_id.as_str()));
+        assert!(!ids.contains(&agent_id.as_str()));
+        cleanup(&chat_id);
+        cleanup(&agent_id);
+    }
+
+    #[test]
+    fn list_sessions_for_agent_returns_only_that_agent() {
+        let a1 = unique_id("a1");
+        let a2 = unique_id("a2");
+        let b = unique_id("b");
+        create_session_with_id(&a1, "A1", Some("analyzer")).unwrap();
+        create_session_with_id(&a2, "A2", Some("analyzer")).unwrap();
+        create_session_with_id(&b, "B", Some("coder")).unwrap();
+
+        let analyzer_sessions = list_sessions_for_agent("analyzer").unwrap();
+        let ids: Vec<&str> = analyzer_sessions
+            .iter()
+            .map(|s| s.session_id.as_str())
+            .collect();
+        assert!(ids.contains(&a1.as_str()));
+        assert!(ids.contains(&a2.as_str()));
+        assert!(!ids.contains(&b.as_str()));
+        cleanup(&a1);
+        cleanup(&a2);
+        cleanup(&b);
+    }
+
+    #[test]
+    fn purge_project_removes_session_file() {
+        let id = unique_id("purge");
+        create_session_with_id(&id, "Purge", None).unwrap();
+        assert!(find_session_file(&id, None).is_some());
+
+        purge_project(&id).unwrap();
+        assert!(find_session_file(&id, None).is_none());
+    }
+
+    #[test]
+    fn is_session_deleted_or_missing_true_for_missing() {
+        assert!(is_session_deleted_or_missing("_no_such_session_zzz", None));
+    }
+
+    #[test]
+    fn is_session_deleted_or_missing_true_after_mark() {
+        let id = unique_id("isdel");
+        create_session_with_id(&id, "IsDel", None).unwrap();
+        mark_project_deleted(&id).unwrap();
+        assert!(is_session_deleted_or_missing(&id, None));
+        cleanup(&id);
+    }
+
+    #[test]
+    fn is_session_deleted_or_missing_false_for_live() {
+        let id = unique_id("islive");
+        create_session_with_id(&id, "IsLive", None).unwrap();
+        assert!(!is_session_deleted_or_missing(&id, None));
+        cleanup(&id);
+    }
+
+    #[test]
+    fn pending_task_add_remove_find() {
+        let mut s = create_session_with_id(&unique_id("pend"), "P", None).unwrap();
+        let task = PendingTask {
+            task_id: "t1".into(),
+            to_agent_name: "a".into(),
+            to_session_id: "s".into(),
+            project_id: "p".into(),
+            chain: vec![],
+        };
+        add_pending_task(&mut s, task);
+        assert_eq!(s.pending_tasks.len(), 1);
+        assert!(find_pending_task(&s, "t1").is_some());
+
+        remove_pending_task(&mut s, "t1");
+        assert!(s.pending_tasks.is_empty());
+        assert!(find_pending_task(&s, "t1").is_none());
+        cleanup(&s.session_id);
+    }
+
+    #[test]
+    fn init_log_creates_file_and_returns_rel_path() {
+        let id = unique_id("log");
+        let rel = init_log(&id, "chat", None).unwrap();
+        assert!(rel.contains("chat_"));
+        assert!(rel.ends_with(".txt"));
+
+        let full = sessions_dir().join(&rel);
+        assert!(full.exists());
+        cleanup(&id);
+    }
+
+    #[test]
+    fn add_or_update_log_populates_session() {
+        let id = unique_id("logup");
+        let mut s = create_session_with_id(&id, "LogUp", None).unwrap();
+        add_or_update_log(&mut s, "chat", None).unwrap();
+        assert_eq!(s.logs.len(), 1);
+        assert_eq!(s.logs[0].entity, "chat");
+
+        // Повторный вызов не должен добавить вторую запись
+        add_or_update_log(&mut s, "chat", None).unwrap();
+        assert_eq!(s.logs.len(), 1);
+        cleanup(&id);
+    }
+
+    #[test]
+    fn now_ts_is_monotonic_nonzero() {
+        let a = now_ts();
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let b = now_ts();
+        assert!(a > 0);
+        assert!(b >= a);
+    }
+
+    #[test]
+    fn restore_api_key_replaces_placeholder() {
+        let mut s = Session {
+            session_id: "x".into(),
+            display_name: "x".into(),
+            created_at: 0,
+            updated_at: 0,
+            owner_agent: None,
+            context: Some(ContextBlock {
+                engine_config: EngineConfig {
+                    api_key: "***".into(),
+                    ..Default::default()
+                },
+                engine_state: EngineState {
+                    system_messages: vec![],
+                    skill_context: None,
+                    knowledge_context: None,
+                    prefix_turns: vec![],
+                    tail_turns: vec![],
+                    pending_turn: None,
+                    metrics: Default::default(),
+                },
+            }),
+            logs: vec![],
+            pending_tasks: vec![],
+            incoming_stack: vec![],
+            deleted: false,
+        };
+        restore_api_key(&mut s, "realkey");
+        let ctx = s.context.unwrap();
+        assert_eq!(ctx.engine_config.api_key, "realkey");
+    }
+
+    #[test]
+    fn restore_api_key_does_not_overwrite_real_key() {
+        let mut s = Session {
+            session_id: "x".into(),
+            display_name: "x".into(),
+            created_at: 0,
+            updated_at: 0,
+            owner_agent: None,
+            context: Some(ContextBlock {
+                engine_config: EngineConfig {
+                    api_key: "real".into(),
+                    ..Default::default()
+                },
+                engine_state: EngineState {
+                    system_messages: vec![],
+                    skill_context: None,
+                    knowledge_context: None,
+                    prefix_turns: vec![],
+                    tail_turns: vec![],
+                    pending_turn: None,
+                    metrics: Default::default(),
+                },
+            }),
+            logs: vec![],
+            pending_tasks: vec![],
+            incoming_stack: vec![],
+            deleted: false,
+        };
+        restore_api_key(&mut s, "newkey");
+        let ctx = s.context.unwrap();
+        assert_eq!(ctx.engine_config.api_key, "real");
+    }
+
+    #[test]
+    fn load_session_with_key_missing_errors() {
+        assert!(load_session_with_key("_no_such_zzz", "k", None).is_err());
+    }
+
+    #[test]
+    fn delete_session_removes_file() {
+        let id = unique_id("del");
+        create_session_with_id(&id, "Del", None).unwrap();
+        assert!(find_session_file(&id, None).is_some());
+        delete_session(&id, None).unwrap();
+        assert!(find_session_file(&id, None).is_none());
+    }
+
+    // Suppress unused-import warnings for Role/Message in case
+    // tests are later refactored.
+    #[allow(dead_code)]
+    fn _touch_types() {
+        let _ = Role::User;
+        let _: Option<Message> = None;
+    }
 }

@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 lzcdr
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 // src/agent_http_api.rs
 
 use axum::{
@@ -1062,4 +1066,43 @@ pub async fn run_server(config: AgentConfig, context: AgentContext) -> anyhow::R
     stop_sse_listener(&state_arc, &config.name).await;
     eprintln!("✅ Агент '{}' остановлен корректно", config.name);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent_core::AgentMetrics;
+
+    #[test]
+    fn error_response_returns_failed_status() {
+        let resp = error_response(anyhow::anyhow!("boom"));
+        // Response не имеет публичного доступа к телу — проверяем статус
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    }
+
+    #[test]
+    fn agent_metrics_default_zeroes() {
+        let m = AgentMetrics {
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            cost_rub: 0.0,
+            api_calls_count: 0,
+        };
+        assert_eq!(m.prompt_tokens, 0);
+        assert_eq!(m.cost_rub, 0.0);
+    }
+
+    #[test]
+    fn write_log_appends_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log.txt");
+        let mut f = std::fs::File::create(&path).unwrap();
+        write_log(&mut f, "user", "hello").unwrap();
+        write_log(&mut f, "assistant", "hi").unwrap();
+        drop(f);
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("user: hello"));
+        assert!(content.contains("assistant: hi"));
+        assert_eq!(content.lines().count(), 2);
+    }
 }

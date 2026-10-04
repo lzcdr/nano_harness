@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 lzcdr
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 // src/agent_core.rs
 
 use anyhow::{Context, Result};
@@ -709,4 +713,121 @@ pub async fn run_agent(
     .await?;
     response.session_id = request.session_id;
     Ok(response)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dummy_agent_config() -> AgentConfig {
+        AgentConfig {
+            name: "test".into(),
+            bind_addr: "127.0.0.1:0".into(),
+            auth_token: String::new(),
+            timeout_sec: 60,
+            max_iterations: 3,
+            tools: vec!["storage_read_file".into()],
+            system_prompt: None,
+            api_key: "k".into(),
+            base_url: "http://localhost".into(),
+            model: "m".into(),
+            temperature: Some(0.5),
+            max_tokens: Some(1000),
+            top_p: Some(1.0),
+            stream: false,
+            prefix_message_count: Some(2),
+            tail_message_count: Some(3),
+            reasoning_effort: None,
+            agent_type: AgentType::default(),
+            session_ttl_secs: None,
+            skill_mode: default_skill_mode(),
+            skill_semantic_threshold: default_skill_semantic_threshold(),
+            skill_min_tool_calls: default_skill_min_tool_calls(),
+            agent_call_timeout_sec: None,
+            max_cost_rub: None,
+            compact_threshold_bytes: None,
+            tail_byte_budget: None,
+        }
+    }
+
+    #[test]
+    fn agent_type_default_is_stateless() {
+        assert_eq!(AgentType::default(), AgentType::Stateless);
+    }
+
+    #[test]
+    fn skill_mode_default_is_auto() {
+        assert_eq!(default_skill_mode(), "auto");
+    }
+
+    #[test]
+    fn skill_semantic_threshold_default() {
+        assert_eq!(default_skill_semantic_threshold(), 0.5);
+    }
+
+    #[test]
+    fn skill_min_tool_calls_default() {
+        assert_eq!(default_skill_min_tool_calls(), 2);
+    }
+
+    #[test]
+    fn build_engine_config_propagates_fields() {
+        let cfg = dummy_agent_config();
+        let engine = build_engine_config(&cfg);
+        assert_eq!(engine.api_key, "k");
+        assert_eq!(engine.model, "m");
+        assert_eq!(engine.temperature, Some(0.5));
+        assert_eq!(engine.max_tokens, Some(1000));
+        assert!(!engine.stream);
+        assert_eq!(engine.prefix_message_count, Some(2));
+        assert_eq!(engine.tail_message_count, Some(3));
+    }
+
+    #[test]
+    fn build_engine_config_adds_knowledge_tools() {
+        let cfg = dummy_agent_config();
+        let engine = build_engine_config(&cfg);
+        let allowed = engine.allowed_tools.unwrap();
+        let names: Vec<&str> = allowed.iter().map(|t| t.name.as_str()).collect();
+        assert!(names.contains(&"storage_read_file"));
+        assert!(names.contains(&"knowledge_load"));
+        assert!(names.contains(&"knowledge_unload"));
+    }
+
+    #[test]
+    fn build_engine_config_does_not_duplicate_knowledge_tools() {
+        let mut cfg = dummy_agent_config();
+        cfg.tools.push("knowledge_load".into());
+        cfg.tools.push("knowledge_unload".into());
+        let engine = build_engine_config(&cfg);
+        let allowed = engine.allowed_tools.unwrap();
+        let load_count = allowed
+            .iter()
+            .filter(|t| t.name == "knowledge_load")
+            .count();
+        let unload_count = allowed
+            .iter()
+            .filter(|t| t.name == "knowledge_unload")
+            .count();
+        assert_eq!(load_count, 1);
+        assert_eq!(unload_count, 1);
+    }
+
+    #[test]
+    fn build_engine_config_default_compact_threshold() {
+        let cfg = dummy_agent_config();
+        let engine = build_engine_config(&cfg);
+        assert_eq!(engine.compact_threshold_bytes, 512);
+        assert_eq!(engine.tail_byte_budget, 100 * 1024);
+    }
+
+    #[test]
+    fn build_engine_config_custom_compact_threshold() {
+        let mut cfg = dummy_agent_config();
+        cfg.compact_threshold_bytes = Some(1024);
+        cfg.tail_byte_budget = Some(4096);
+        let engine = build_engine_config(&cfg);
+        assert_eq!(engine.compact_threshold_bytes, 1024);
+        assert_eq!(engine.tail_byte_budget, 4096);
+    }
 }

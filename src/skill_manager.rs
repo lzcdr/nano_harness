@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 lzcdr
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 // src/skill_manager.rs
 
 use anyhow::Result;
@@ -400,3 +404,167 @@ pub async fn generate_skill_metadata(
     Ok((name, description))
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_replaces_non_alnum_with_underscore() {
+        assert_eq!(normalize_skill_name("My Task!"), "my_task_");
+        assert_eq!(normalize_skill_name("hello-world"), "hello_world");
+        assert_eq!(normalize_skill_name("café"), "café"); // Unicode остаётся
+    }
+
+    #[test]
+    fn fingerprint_stable_for_same_input() {
+        let calls = vec![ToolCallRecord {
+            name: "storage_read_file".into(),
+            arguments: serde_json::json!({"path": "a.txt"}),
+        }];
+        let a = compute_fingerprint("read the file", &calls);
+        let b = compute_fingerprint("read the file", &calls);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn fingerprint_ignores_whitespace_and_case() {
+        let calls = vec![ToolCallRecord {
+            name: "x".into(),
+            arguments: serde_json::json!({}),
+        }];
+        let a = compute_fingerprint("  Read  THE File  ", &calls);
+        let b = compute_fingerprint("read the file", &calls);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn fingerprint_changes_with_tool_calls() {
+        let a = compute_fingerprint(
+            "task",
+            &[ToolCallRecord {
+                name: "a".into(),
+                arguments: serde_json::json!({}),
+            }],
+        );
+        let b = compute_fingerprint(
+            "task",
+            &[ToolCallRecord {
+                name: "b".into(),
+                arguments: serde_json::json!({}),
+            }],
+        );
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn parse_tool_calls_extracts_json() {
+        let content = "SKILL: x\nFOR: agent\n\nTOOL_CALLS:\n[{\"name\":\"a\",\"arguments\":{}}]";
+        let calls = parse_tool_calls(content).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "a");
+    }
+
+    #[test]
+    fn parse_tool_calls_missing_marker_returns_none() {
+        assert!(parse_tool_calls("no marker here").is_none());
+    }
+
+    #[test]
+    fn parse_tool_calls_invalid_json_returns_none() {
+        assert!(parse_tool_calls("TOOL_CALLS:\n{not json").is_none());
+    }
+
+    #[test]
+    fn index_file_for_adds_suffix() {
+        assert_eq!(index_file_for("skill.txt"), "skill_index.txt");
+        assert_eq!(index_file_for("a/b/c.txt"), "a/b/c_index.txt");
+    }
+
+    #[test]
+    fn success_rate_zero_when_no_stats() {
+        let rec = SkillRecord {
+            skill_file: "s".into(),
+            agent_name: "a".into(),
+            description: String::new(),
+            prompt: String::new(),
+            entities: vec![],
+            success_count: 0,
+            fail_count: 0,
+            fingerprint: String::new(),
+            created_at: 0,
+        };
+        assert_eq!(success_rate(&rec), 0.0);
+    }
+
+    #[test]
+    fn success_rate_one_when_all_success() {
+        let rec = SkillRecord {
+            skill_file: "s".into(),
+            agent_name: "a".into(),
+            description: String::new(),
+            prompt: String::new(),
+            entities: vec![],
+            success_count: 10,
+            fail_count: 0,
+            fingerprint: String::new(),
+            created_at: 0,
+        };
+        // 10 / (10 + 0 + 1) = 0.909..., не 1.0 из-за сглаживания +1
+        assert!(success_rate(&rec) > 0.9);
+    }
+
+    #[test]
+    fn select_best_prefers_higher_success_rate() {
+        let good = SkillRecord {
+            skill_file: "good".into(),
+            agent_name: "a".into(),
+            description: String::new(),
+            prompt: String::new(),
+            entities: vec![],
+            success_count: 9,
+            fail_count: 1,
+            fingerprint: String::new(),
+            created_at: 0,
+        };
+        let bad = SkillRecord {
+            skill_file: "bad".into(),
+            agent_name: "a".into(),
+            description: String::new(),
+            prompt: String::new(),
+            entities: vec![],
+            success_count: 1,
+            fail_count: 9,
+            fingerprint: String::new(),
+            created_at: 0,
+        };
+        let best = select_best_by_success_rate(&[(bad, 0.1), (good.clone(), 0.5)]);
+        assert_eq!(best.unwrap().0.skill_file, "good");
+    }
+
+    #[test]
+    fn select_best_empty_returns_none() {
+        assert!(select_best_by_success_rate(&[]).is_none());
+    }
+
+    #[test]
+    fn format_skill_truncates_long_arguments() {
+        let long = "x".repeat(500);
+        let rec = SkillRecord {
+            skill_file: "s".into(),
+            agent_name: "a".into(),
+            description: String::new(),
+            prompt: "задача".into(),
+            entities: vec![],
+            success_count: 0,
+            fail_count: 0,
+            fingerprint: String::new(),
+            created_at: 0,
+        };
+        let calls = vec![ToolCallRecord {
+            name: "t".into(),
+            arguments: serde_json::json!({ "data": long }),
+        }];
+        let out = format_skill_for_injection(&rec, &calls);
+        assert!(out.contains("..."));
+    }
+}

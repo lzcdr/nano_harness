@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 lzcdr
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 // src/lexicon.rs
 
 use anyhow::{Context, Result};
@@ -235,4 +239,90 @@ pub fn entities_subset(query: &[String], skill: &[String]) -> bool {
     }
     let set: HashSet<&String> = skill.iter().collect();
     query.iter().all(|q| set.contains(q))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tokenize_splits_words_and_quotes() {
+        let tokens = tokenize(r#"hello "world foo" bar-baz"#);
+        assert_eq!(tokens.len(), 3);
+        assert!(matches!(&tokens[0], Token::Word(w) if w == "hello"));
+        assert!(matches!(&tokens[1], Token::Quoted(q) if q == "world foo"));
+        assert!(matches!(&tokens[2], Token::Word(w) if w == "bar-baz"));
+    }
+
+    #[test]
+    fn tokenize_unclosed_quote_keeps_quote_char() {
+        let tokens = tokenize(r#"say "hello"#);
+        // незакрытая кавычка: '"' + содержимое сливается в одно слово
+        assert_eq!(tokens.len(), 2);
+        assert!(matches!(&tokens[0], Token::Word(w) if w == "say"));
+        match &tokens[1] {
+            Token::Word(w) => assert!(w.contains("hello")),
+            other => panic!("ожидалось Word, получено {:?}", other),
+        }
+    }
+
+    #[test]
+    fn tokenize_dotted_identifier_is_single_word() {
+        let tokens = tokenize("call std.io.print");
+        assert_eq!(tokens.len(), 2);
+        assert!(matches!(&tokens[0], Token::Word(w) if w == "call"));
+        assert!(matches!(&tokens[1], Token::Word(w) if w == "std.io.print"));
+    }
+
+    #[test]
+    fn extract_skeleton_replaces_unknown_words() {
+        // Без лексикона все слова становятся <ENT>
+        let (skel, ents) = extract_entities_and_skeleton("parse config.toml", None);
+        assert_eq!(skel, "<ENT> <ENT>");
+        assert_eq!(ents, vec!["parse", "config.toml"]);
+    }
+
+    #[test]
+    fn extract_skeleton_quoted_always_entity() {
+        let (skel, ents) = extract_entities_and_skeleton(r#"open "my file.txt""#, None);
+        assert_eq!(skel, "<ENT> <ENT>");
+        assert_eq!(ents, vec!["open", "my file.txt"]);
+    }
+
+    #[test]
+    fn entities_subset_empty_skill_matches_any_query() {
+        assert!(entities_subset(&["a".into(), "b".into()], &[]));
+    }
+
+    #[test]
+    fn entities_subset_requires_all_query_in_skill() {
+        let skill = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        assert!(entities_subset(&["a".into(), "b".into()], &skill));
+        assert!(!entities_subset(&["a".into(), "z".into()], &skill));
+    }
+
+    #[test]
+    fn entities_subset_query_empty_always_true() {
+        let skill = vec!["a".to_string()];
+        assert!(entities_subset(&[], &skill));
+    }
+
+    #[test]
+    fn load_dic_skips_header_and_strips_slashes() {
+        // Проверяем через публичный API: складываем .dic в tempdir и грузим
+        use std::fs;
+        let dir = tempfile::tempdir().unwrap();
+        let dic = dir.path().join("test.dic");
+        fs::write(&dic, "5\nhello/SM\nworld\nfoo/AB\n").unwrap();
+        let lex = Lexicon::load(dir.path()).unwrap();
+        assert!(lex.contains("hello"));
+        assert!(lex.contains("world"));
+        assert!(lex.contains("foo"));
+    }
+
+    #[test]
+    fn load_dic_missing_dir_errors() {
+        let res = Lexicon::load(std::path::Path::new("/nonexistent/path/xyz"));
+        assert!(res.is_err());
+    }
 }

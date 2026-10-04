@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 lzcdr
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 // src/tool_runtime/context.rs
 
 use crate::agent_core::{OutgoingTasks, PendingCalls};

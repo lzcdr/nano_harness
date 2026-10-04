@@ -1,9 +1,11 @@
+// SPDX-FileCopyrightText: 2026 lzcdr
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 // src/tool_runtime/tools/storage_search_similar.rs
 
 use crate::tool_runtime::context::ToolContext;
-use crate::tool_runtime::primitives::{
-    err, ok_text, optional_int, parse_input, require_string,
-};
+use crate::tool_runtime::primitives::{err, ok_text, optional_int, parse_input, require_string};
 use crate::tool_runtime::ToolImpl;
 
 pub struct StorageSearchSimilar;
@@ -47,7 +49,10 @@ impl ToolImpl for StorageSearchSimilar {
             .http_client
             .get(&url)
             .query(&[("query", &query), ("top_k", &top_k.to_string())])
-            .header("Authorization", format!("Bearer {}", ctx.storage_auth_token))
+            .header(
+                "Authorization",
+                format!("Bearer {}", ctx.storage_auth_token),
+            )
             .header("X-NH-Project", &ctx.project_id)
             .send()
             .await;
@@ -69,4 +74,69 @@ impl ToolImpl for StorageSearchSimilar {
 
 inventory::submit! {
     &StorageSearchSimilar as &'static dyn crate::tool_runtime::ToolImpl
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tool_runtime::context::ToolContext;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    fn ctx() -> ToolContext {
+        ToolContext {
+            http_client: reqwest::Client::new(),
+            storage_root_path: std::path::PathBuf::from("/tmp/nh_test"),
+            storage_base_url: "http://127.0.0.1:1".to_string(),
+            storage_auth_token: String::new(),
+            board_base_url: "http://127.0.0.1:1".to_string(),
+            board_auth_token: String::new(),
+            project_id: "test".to_string(),
+            session_id: None,
+            parent_chain: vec![],
+            self_agent_name: "test".to_string(),
+            pending_calls: Arc::new(Mutex::new(HashMap::new())),
+            outgoing_tasks: Arc::new(Mutex::new(HashMap::new())),
+            agent_call_timeout_sec: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_invalid_json() {
+        let r = StorageSearchSimilar.run("{not json", &ctx()).await;
+        assert!(r.contains("\"ok\":false"));
+    }
+
+    #[tokio::test]
+    async fn rejects_missing_query() {
+        let r = StorageSearchSimilar.run("{}", &ctx()).await;
+        assert!(r.contains("\"ok\":false"));
+        assert!(r.contains("query"));
+    }
+
+    #[tokio::test]
+    async fn rejects_empty_query() {
+        let r = StorageSearchSimilar.run(r#"{"query":""}"#, &ctx()).await;
+        assert!(r.contains("\"ok\":false"));
+    }
+
+    #[tokio::test]
+    async fn accepts_top_k_optional() {
+        let r = StorageSearchSimilar
+            .run(r#"{"query":"rust"}"#, &ctx())
+            .await;
+        // top_k не указан — не должно быть ошибки валидации параметра.
+        // HTTP-ошибка к недостижимому порту ожидаема.
+        assert!(r.contains("\"ok\":false"));
+        assert!(!r.contains("не указан обязательный параметр"));
+    }
+
+    #[tokio::test]
+    async fn unreachable_storage_returns_error() {
+        let r = StorageSearchSimilar
+            .run(r#"{"query":"rust"}"#, &ctx())
+            .await;
+        assert!(r.contains("\"ok\":false"));
+    }
 }

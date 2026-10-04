@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 lzcdr
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 // src/knowledge_manager.rs
 
 use anyhow::{Context, Result};
@@ -220,3 +224,124 @@ pub async fn delete_knowledge(
 
 #[allow(dead_code)]
 pub const DIR: &str = KNOWLEDGE_DIR;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_name_accepts_alphanumeric() {
+        assert!(validate_name("rust"));
+        assert!(validate_name("my_knowledge"));
+        assert!(validate_name("my-knowledge"));
+        assert!(validate_name("rust2026"));
+    }
+
+    #[test]
+    fn validate_name_rejects_empty() {
+        assert!(!validate_name(""));
+    }
+
+    #[test]
+    fn validate_name_rejects_spaces_and_punct() {
+        assert!(!validate_name("my knowledge"));
+        assert!(!validate_name("my/knowledge"));
+        assert!(!validate_name("my.knowledge"));
+    }
+
+    #[test]
+    fn validate_name_rejects_cyrillic() {
+        assert!(!validate_name("знание"));
+    }
+
+    #[test]
+    fn parse_frontmatter_ok() {
+        let content = "---\nname: rust\ndescription: язык\n---\n\nтело";
+        let (name, desc, body) = parse_frontmatter(content).unwrap();
+        assert_eq!(name, "rust");
+        assert_eq!(desc, "язык");
+        assert_eq!(body, "тело");
+    }
+
+    #[test]
+    fn parse_frontmatter_missing_opener_errors() {
+        assert!(parse_frontmatter("name: rust\n---\nbody").is_err());
+    }
+
+    #[test]
+    fn parse_frontmatter_missing_closer_errors() {
+        assert!(parse_frontmatter("---\nname: rust\nbody").is_err());
+    }
+
+    #[test]
+    fn parse_frontmatter_missing_name_errors() {
+        assert!(parse_frontmatter("---\ndescription: x\n---\nbody").is_err());
+    }
+
+    #[test]
+    fn parse_frontmatter_missing_description_errors() {
+        assert!(parse_frontmatter("---\nname: x\n---\nbody").is_err());
+    }
+
+    #[test]
+    fn parse_frontmatter_empty_name_errors() {
+        assert!(parse_frontmatter("---\nname: \ndescription: x\n---\nbody").is_err());
+    }
+
+    #[test]
+    fn parse_frontmatter_empty_description_errors() {
+        assert!(parse_frontmatter("---\nname: x\ndescription: \n---\nbody").is_err());
+    }
+
+    #[test]
+    fn parse_frontmatter_strips_bom() {
+        let content = "\u{feff}---\nname: x\ndescription: y\n---\nbody";
+        assert!(parse_frontmatter(content).is_ok());
+    }
+
+    #[test]
+    fn parse_frontmatter_body_strips_leading_newlines() {
+        let content = "---\nname: x\ndescription: y\n---\n\n\n\nbody";
+        let (_, _, body) = parse_frontmatter(content).unwrap();
+        assert_eq!(body, "body");
+    }
+
+    #[test]
+    fn build_catalog_prompt_empty() {
+        assert_eq!(build_catalog_prompt(&[]), "");
+    }
+
+    #[test]
+    fn build_catalog_prompt_lists_entries() {
+        let entries = vec![
+            KnowledgeEntry {
+                name: "a".into(),
+                description: "first".into(),
+            },
+            KnowledgeEntry {
+                name: "b".into(),
+                description: "second".into(),
+            },
+        ];
+        let prompt = build_catalog_prompt(&entries);
+        assert!(prompt.contains("- a — first"));
+        assert!(prompt.contains("- b — second"));
+        assert!(prompt.contains("knowledge_load"));
+        assert!(prompt.contains("knowledge_unload"));
+    }
+
+    #[test]
+    fn ensure_scheme_adds_http() {
+        assert_eq!(ensure_scheme("localhost:8080"), "http://localhost:8080");
+    }
+
+    #[test]
+    fn ensure_scheme_keeps_http() {
+        assert_eq!(ensure_scheme("http://x"), "http://x");
+    }
+
+    #[test]
+    fn ensure_scheme_keeps_https() {
+        assert_eq!(ensure_scheme("https://x"), "https://x");
+    }
+}
