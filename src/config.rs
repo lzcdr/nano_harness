@@ -31,7 +31,20 @@ pub struct TomlConfig {
     pub max_cost_rub: Option<f64>,
     pub prefix_message_count: Option<usize>,
     pub tail_message_count: Option<usize>,
+    pub max_iterations: Option<usize>,
     pub system_prompt: Option<String>,
+
+    // Авто-инжект знаний в контекст (чат и агенты).
+    pub knowledge_auto_top_n: Option<usize>,
+    pub knowledge_auto_top_k: Option<usize>,
+    pub knowledge_auto_threshold: Option<f32>,
+
+    pub skill_mode: Option<String>,
+    pub skill_min_tool_calls: Option<usize>,
+    pub skill_phrases_top_n: Option<usize>,
+    pub skill_phrase_min_words: Option<usize>,
+    pub skill_search_threshold: Option<f32>,
+    pub skill_min_hits: Option<usize>,
 
     // Глобальный таймаут Rhai для CLI (чата), секунды
     pub rhai_timeout_sec: Option<u64>,

@@ -26,6 +26,7 @@ const RESERVED_NAMES: &[&str] = &[
     META_FILE,
 ];
 pub const SKILLS_PROJECT: &str = "_skills";
+pub const KNOWLEDGE_PROJECT: &str = "_knowledge";
 const PROJECTS_DIR: &str = "projects";
 
 pub fn is_reserved_name(name: &str) -> bool {
@@ -82,6 +83,32 @@ pub struct SearchResult {
     pub distance: f32,
     pub content_fragment: String,
     pub project_id: String,
+}
+
+struct DiskEntry {
+    project_id: String,
+    rel_path: PathBuf,
+    mtime: u64,
+    size: u64,
+}
+
+fn make_disk_entry(path: &Path, project_id: String, rel_path: PathBuf) -> Option<DiskEntry> {
+    let metadata = fs::metadata(path).ok()?;
+    if metadata.len() == 0 {
+        return None;
+    }
+    let mtime = metadata
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    Some(DiskEntry {
+        project_id,
+        rel_path,
+        mtime,
+        size: metadata.len(),
+    })
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -323,10 +350,10 @@ impl VectorDb {
     }
 
     fn index_text(&mut self, project_id: &str, rel_path: &Path, content: &str) -> io::Result<()> {
-        let storage_rel = if project_id == SKILLS_PROJECT {
-            Path::new(".skills").join(rel_path)
-        } else {
-            Path::new(PROJECTS_DIR).join(project_id).join(rel_path)
+        let storage_rel = match project_id {
+            SKILLS_PROJECT => Path::new(".skills").join(rel_path),
+            KNOWLEDGE_PROJECT => Path::new(".knowledge").join(rel_path),
+            _ => Path::new(PROJECTS_DIR).join(project_id).join(rel_path),
         };
         let label_prefix = format!("{}#", storage_rel.to_string_lossy());
         let mut old_labels = Vec::new();
@@ -345,6 +372,9 @@ impl VectorDb {
 
         let chunks_with_pos =
             chunk_text(content, self.config.chunk_size, self.config.chunk_overlap);
+        if chunks_with_pos.is_empty() {
+            return Ok(());
+        }
         let chunk_texts: Vec<String> = chunks_with_pos
             .iter()
             .map(|(text, _, _)| text.clone())
@@ -510,6 +540,24 @@ impl VectorDb {
                 }
                 if let Ok(content) = fs::read_to_string(&file) {
                     self.index_text(SKILLS_PROJECT, &rel, &content)?;
+                }
+            }
+        }
+
+        let knowledge_root = root.join(".knowledge");
+        if knowledge_root.exists() {
+            for entry in fs::read_dir(&knowledge_root)? {
+                let entry = entry?;
+                let path = entry.path();
+                if !path.is_file() {
+                    continue;
+                }
+                let name = entry.file_name().to_string_lossy().to_string();
+                if !name.ends_with(".md") {
+                    continue;
+                }
+                if let Ok(content) = fs::read_to_string(&path) {
+                    self.index_text(KNOWLEDGE_PROJECT, Path::new(&name), &content)?;
                 }
             }
         }
@@ -755,16 +803,15 @@ impl LocalStorage {
         Ok(())
     }
 
-    pub fn delete_skill_index(&mut self, rel_path: &str) -> io::Result<()> {
-        let rel = Path::new(rel_path.trim_start_matches('/'));
-        let storage_rel = Path::new(".skills").join(rel);
+    fn remove_index_entries_for_file(&mut self, storage_rel: &Path) {
         let label_prefix = format!("{}#", storage_rel.to_string_lossy());
-        let mut old_labels = Vec::new();
-        for (label, _) in &self.vector_db.entries {
-            if label.starts_with(&label_prefix) {
-                old_labels.push(label.clone());
-            }
-        }
+        let old_labels: Vec<String> = self
+            .vector_db
+            .entries
+            .iter()
+            .filter(|(label, _)| label.starts_with(&label_prefix))
+            .map(|(label, _)| label.clone())
+            .collect();
         for label in old_labels {
             if let Some(id) = self.vector_db.label_to_id.remove(&label) {
                 self.vector_db.deleted_ids.insert(id);
@@ -773,6 +820,25 @@ impl LocalStorage {
             }
             self.vector_db.entries.retain(|(l, _)| l != &label);
         }
+    }
+
+    pub fn delete_skill_index(&mut self, rel_path: &str) -> io::Result<()> {
+        let rel = Path::new(rel_path.trim_start_matches('/'));
+        self.remove_index_entries_for_file(&Path::new(".skills").join(rel));
+        self.vector_db.save(&self.root)?;
+        Ok(())
+    }
+
+    pub fn index_knowledge_file(&mut self, rel_path: &str, content: &str) -> io::Result<()> {
+        let rel = Path::new(rel_path.trim_start_matches('/'));
+        self.vector_db.index_text(KNOWLEDGE_PROJECT, rel, content)?;
+        self.vector_db.save(&self.root)?;
+        Ok(())
+    }
+
+    pub fn delete_knowledge_index(&mut self, rel_path: &str) -> io::Result<()> {
+        let rel = Path::new(rel_path.trim_start_matches('/'));
+        self.remove_index_entries_for_file(&Path::new(".knowledge").join(rel));
         self.vector_db.save(&self.root)?;
         Ok(())
     }
@@ -932,6 +998,140 @@ impl LocalStorage {
 
     pub fn read_summary(&self, project_id: &str, dir_path: &str) -> io::Result<String> {
         fs::read_to_string(self.resolve(project_id, dir_path)?.join(".summary"))
+    }
+
+    /// Синхронизирует индекс с файловой системой:
+    /// переиндексирует изменённые файлы, убирает удалённые, добавляет новые.
+    pub fn sync_index(&mut self) -> io::Result<()> {
+        let on_disk = self.scan_disk_state()?;
+        let in_index: std::collections::HashMap<PathBuf, (u64, u64)> = self
+            .vector_db
+            .entries
+            .iter()
+            .map(|(_, meta)| (meta.file_path.clone(), (meta.modified, meta.file_size)))
+            .collect();
+
+        let mut to_remove: Vec<PathBuf> = Vec::new();
+        let mut to_index: Vec<(String, PathBuf)> = Vec::new();
+
+        for (storage_rel, (mtime, size)) in &in_index {
+            match on_disk.get(storage_rel) {
+                None => to_remove.push(storage_rel.clone()),
+                Some(entry) if entry.mtime != *mtime || entry.size != *size => {
+                    to_remove.push(storage_rel.clone());
+                    to_index.push((entry.project_id.clone(), entry.rel_path.clone()));
+                }
+                Some(_) => {}
+            }
+        }
+
+        for (storage_rel, entry) in &on_disk {
+            if !in_index.contains_key(storage_rel) {
+                to_index.push((entry.project_id.clone(), entry.rel_path.clone()));
+            }
+        }
+
+        if to_remove.is_empty() && to_index.is_empty() {
+            return Ok(());
+        }
+
+        for storage_rel in to_remove {
+            self.remove_index_entries_for_file(&storage_rel);
+        }
+
+        for (project_id, rel_path) in to_index {
+            let full_path = self.storage_path_for(&project_id, &rel_path);
+            if let Ok(content) = fs::read_to_string(&full_path) {
+                if let Err(e) = self.vector_db.index_text(&project_id, &rel_path, &content) {
+                    eprintln!("⚠️ sync_index: {}: {}", full_path.display(), e);
+                }
+            }
+        }
+
+        self.vector_db.save(&self.root)?;
+        Ok(())
+    }
+
+    fn storage_path_for(&self, project_id: &str, rel_path: &Path) -> PathBuf {
+        match project_id {
+            SKILLS_PROJECT => self.root.join(".skills").join(rel_path),
+            KNOWLEDGE_PROJECT => self.root.join(".knowledge").join(rel_path),
+            _ => self.root.join(PROJECTS_DIR).join(project_id).join(rel_path),
+        }
+    }
+
+    fn scan_disk_state(&self) -> io::Result<std::collections::HashMap<PathBuf, DiskEntry>> {
+        use std::collections::HashMap;
+        let mut out: HashMap<PathBuf, DiskEntry> = HashMap::new();
+
+        let projects_root = self.root.join(PROJECTS_DIR);
+        if projects_root.exists() {
+            let mut files = Vec::new();
+            collect_files(&projects_root, &mut files)?;
+            for file in files {
+                let storage_rel = match file.strip_prefix(&self.root) {
+                    Ok(p) => p.to_path_buf(),
+                    Err(_) => continue,
+                };
+                let mut comps = storage_rel.components();
+                if comps.next().map(|c| c.as_os_str()) != Some(std::ffi::OsStr::new(PROJECTS_DIR)) {
+                    continue;
+                }
+                let project_id = match comps.next().and_then(|c| c.as_os_str().to_str()) {
+                    Some(s) => s.to_string(),
+                    None => continue,
+                };
+                let rel_path: PathBuf = comps.collect();
+                if rel_path.as_os_str().is_empty() {
+                    continue;
+                }
+                if let Some(entry) = make_disk_entry(&file, project_id, rel_path) {
+                    out.insert(storage_rel, entry);
+                }
+            }
+        }
+
+        let skills_root = self.root.join(".skills");
+        if skills_root.exists() {
+            let mut files = Vec::new();
+            collect_files(&skills_root, &mut files)?;
+            for file in files {
+                let rel_path = match file.strip_prefix(&skills_root) {
+                    Ok(p) => p.to_path_buf(),
+                    Err(_) => continue,
+                };
+                if rel_path.as_os_str().is_empty() {
+                    continue;
+                }
+                let storage_rel = Path::new(".skills").join(&rel_path);
+                if let Some(entry) = make_disk_entry(&file, SKILLS_PROJECT.to_string(), rel_path) {
+                    out.insert(storage_rel, entry);
+                }
+            }
+        }
+
+        let knowledge_root = self.root.join(".knowledge");
+        if knowledge_root.exists() {
+            for entry in fs::read_dir(&knowledge_root)? {
+                let entry = entry?;
+                let path = entry.path();
+                if !path.is_file() {
+                    continue;
+                }
+                let name = entry.file_name().to_string_lossy().to_string();
+                if !name.ends_with(".md") {
+                    continue;
+                }
+                let storage_rel = Path::new(".knowledge").join(&name);
+                if let Some(disk_entry) =
+                    make_disk_entry(&path, KNOWLEDGE_PROJECT.to_string(), PathBuf::from(&name))
+                {
+                    out.insert(storage_rel, disk_entry);
+                }
+            }
+        }
+
+        Ok(out)
     }
 }
 

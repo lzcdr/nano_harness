@@ -14,7 +14,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::timeout;
 
-use crate::engine::{ChatEngine, EngineConfig, Role, ToolCall};
+use crate::engine::{ChatEngine, EngineConfig, Role};
+use crate::knowledge_auto::{build_knowledge_context, KnowledgeAutoConfig};
 
 pub struct PendingCall {
     pub tx: tokio::sync::oneshot::Sender<String>,
@@ -72,12 +73,10 @@ pub struct AgentConfig {
     pub agent_type: AgentType,
     #[serde(default)]
     pub session_ttl_secs: Option<u64>,
-    #[serde(default = "default_skill_mode")]
-    pub skill_mode: String,
-    #[serde(default = "default_skill_semantic_threshold")]
-    pub skill_semantic_threshold: f32,
-    #[serde(default = "default_skill_min_tool_calls")]
-    pub skill_min_tool_calls: usize,
+    #[serde(default)]
+    pub skill_mode: Option<String>,
+    #[serde(default)]
+    pub skill_min_tool_calls: Option<usize>,
     #[serde(default)]
     pub agent_call_timeout_sec: Option<u64>,
     #[serde(default)]
@@ -86,16 +85,20 @@ pub struct AgentConfig {
     pub compact_threshold_bytes: Option<usize>,
     #[serde(default)]
     pub tail_byte_budget: Option<usize>,
-}
-
-fn default_skill_mode() -> String {
-    "auto".to_string()
-}
-fn default_skill_semantic_threshold() -> f32 {
-    0.5
-}
-fn default_skill_min_tool_calls() -> usize {
-    2
+    #[serde(default)]
+    pub knowledge_auto_top_n: Option<usize>,
+    #[serde(default)]
+    pub knowledge_auto_top_k: Option<usize>,
+    #[serde(default)]
+    pub knowledge_auto_threshold: Option<f32>,
+    #[serde(default)]
+    pub skill_phrases_top_n: Option<usize>,
+    #[serde(default)]
+    pub skill_phrase_min_words: Option<usize>,
+    #[serde(default)]
+    pub skill_search_threshold: Option<f32>,
+    #[serde(default)]
+    pub skill_min_hits: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -120,7 +123,7 @@ pub struct AgentResponse {
     pub session_id: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 pub struct ToolCallLogEntry {
     pub name: String,
     pub arguments: String,
@@ -209,13 +212,7 @@ fn write_log(file: &mut fs::File, role: &str, content: &str) -> Result<()> {
 }
 
 pub fn build_engine_config(config: &AgentConfig) -> EngineConfig {
-    let mut allowed_tools = config.tools.clone();
-
-    for extra in ["knowledge_load", "knowledge_unload"] {
-        if !allowed_tools.iter().any(|n| n == extra) {
-            allowed_tools.push(extra.to_string());
-        }
-    }
+    let allowed_tools = config.tools.clone();
 
     EngineConfig {
         api_key: config.api_key.clone(),
@@ -277,47 +274,6 @@ fn tool_context_for_agent(
     }
 }
 
-async fn handle_knowledge_load(
-    context: &AgentContext,
-    engine: &mut ChatEngine,
-    tool_call: &ToolCall,
-) -> String {
-    let parsed: serde_json::Value =
-        serde_json::from_str(&tool_call.function.arguments).unwrap_or(serde_json::json!({}));
-    let name = match parsed.get("name").and_then(|v| v.as_str()) {
-        Some(n) if !n.trim().is_empty() => n.trim().to_string(),
-        _ => return "Ошибка: не указано имя знания".to_string(),
-    };
-
-    match crate::knowledge_manager::load_knowledge(
-        &context.http_client,
-        &context.storage_base_url,
-        &context.storage_auth_token,
-        &name,
-    )
-    .await
-    {
-        Ok(content) => {
-            let bytes = content.len();
-            engine.set_knowledge_context(&name, content);
-            format!(
-                "Знание '{}' загружено в контекст ({} байт). Оно будет доступно в последующих ходах.",
-                name, bytes
-            )
-        }
-        Err(e) => format!("Ошибка загрузки знания '{}': {:#}", name, e),
-    }
-}
-
-fn handle_knowledge_unload(engine: &mut ChatEngine) -> String {
-    if engine.has_knowledge_context() {
-        engine.clear_knowledge_context();
-        "Знание снято из контекста".to_string()
-    } else {
-        "Активного знания не было".to_string()
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 pub async fn process_agent_turns(
     engine: &mut ChatEngine,
@@ -330,7 +286,7 @@ pub async fn process_agent_turns(
     parent_chain: Vec<String>,
 ) -> Result<AgentResponse> {
     let max_iterations = request.max_iterations.unwrap_or(config.max_iterations);
-    let mut tool_calls_log = Vec::new();
+    let mut tool_calls_log: Vec<ToolCallLogEntry> = Vec::new();
     let mut final_response = None;
     let mut posted_any = false;
 
@@ -338,13 +294,19 @@ pub async fn process_agent_turns(
 
     engine.clear_skill_context();
 
+    let skill_mode = config.skill_mode.as_deref().unwrap_or("auto");
+    let skill_min_tool_calls = config.skill_min_tool_calls.unwrap_or(2);
+
     // ==================== Поиск и инжект скилла ====================
-    if config.skill_mode == "auto" && !request.prompt.trim().is_empty() {
+    if skill_mode == "auto" && !request.prompt.trim().is_empty() {
         let storage_base_url = context.storage_base_url.clone();
         let storage_auth_token = context.storage_auth_token.clone();
         let current_agent = config.name.clone();
         let prompt = request.prompt.clone();
-        let threshold = config.skill_semantic_threshold;
+        let phrases_top_n = config.skill_phrases_top_n.unwrap_or(15);
+        let phrase_min_words = config.skill_phrase_min_words.unwrap_or(2);
+        let threshold = config.skill_search_threshold.unwrap_or(0.45);
+        let min_hits = config.skill_min_hits.unwrap_or(3);
 
         let skill_result = tokio::task::spawn_blocking(
             move || -> Result<Option<(crate::skill_manager::SkillRecord, f32)>> {
@@ -355,8 +317,10 @@ pub async fn process_agent_turns(
                     &storage_auth_token,
                     &current_agent,
                     &prompt,
+                    phrases_top_n,
+                    phrase_min_words,
                     threshold,
-                    10,
+                    min_hits,
                 )
             },
         )
@@ -398,6 +362,66 @@ pub async fn process_agent_turns(
         }
     }
 
+    // ==================== Авто-инжект знаний ====================
+    {
+        let auto_cfg = KnowledgeAutoConfig {
+            top_n: config.knowledge_auto_top_n.unwrap_or(7),
+            top_k: config.knowledge_auto_top_k.unwrap_or(3),
+            threshold: config.knowledge_auto_threshold.unwrap_or(0.70),
+            per_phrase: 5,
+        };
+        let turn_text = if !request.prompt.trim().is_empty() {
+            Some(request.prompt.clone())
+        } else {
+            engine.pending_turn_text()
+        };
+
+        if let Some(text) = turn_text {
+            match build_knowledge_context(
+                &context.http_client,
+                &context.storage_base_url,
+                &context.storage_auth_token,
+                &text,
+                &auto_cfg,
+            )
+            .await
+            {
+                Ok(Some(ctx_str)) => {
+                    let names: Vec<String> = ctx_str
+                        .lines()
+                        .filter_map(|l| {
+                            let t = l.trim();
+                            t.strip_prefix("=== ")
+                                .and_then(|r| r.strip_suffix(" ==="))
+                                .map(|s| s.to_string())
+                        })
+                        .collect();
+                    engine.set_knowledge_context("auto", ctx_str);
+                    eprintln!(
+                        "📚 knowledge auto-inject (agent {}): injected [{}]",
+                        config.name,
+                        names.join(", ")
+                    );
+                }
+                Ok(None) => {
+                    engine.clear_knowledge_context();
+                    eprintln!(
+                        "📚 knowledge auto-inject (agent {}): nothing relevant",
+                        config.name
+                    );
+                }
+                Err(e) => {
+                    eprintln!(
+                        "⚠️ knowledge auto-inject (agent {}) failed: {:#}",
+                        config.name, e
+                    );
+                }
+            }
+        } else {
+            engine.clear_knowledge_context();
+        }
+    }
+
     // ==================== Цикл LLM ====================
     for _ in 0..=max_iterations {
         let response = timeout(Duration::from_secs(config.timeout_sec), engine.send())
@@ -419,15 +443,7 @@ pub async fn process_agent_turns(
             }
 
             for tc in &tool_calls {
-                let (result, posted) = if tc.function.name == "knowledge_load" {
-                    let r = handle_knowledge_load(context, engine, tc).await;
-                    eprintln!("✅ Результат '{}': {}", tc.function.name, r);
-                    (r, false)
-                } else if tc.function.name == "knowledge_unload" {
-                    let r = handle_knowledge_unload(engine);
-                    eprintln!("✅ Результат '{}': {}", tc.function.name, r);
-                    (r, false)
-                } else if crate::tool_runtime::find(&tc.function.name).is_some() {
+                let (result, posted) = if crate::tool_runtime::find(&tc.function.name).is_some() {
                     let tool_ctx = tool_context_for_agent(
                         context,
                         &project_id,
@@ -515,13 +531,13 @@ pub async fn process_agent_turns(
     };
 
     // ==================== Auto-save скилла ====================
-    if config.skill_mode == "auto" {
+    if skill_mode == "auto" {
         let successful: Vec<&ToolCallLogEntry> = tool_calls_log
             .iter()
             .filter(|t| !t.result.contains("\"ok\":false") && !t.result.starts_with("Ошибка"))
             .collect();
 
-        let min_calls = config.skill_min_tool_calls;
+        let min_calls = skill_min_tool_calls;
 
         if successful.len() < min_calls {
             write_log(
@@ -566,6 +582,9 @@ pub async fn process_agent_turns(
                 let prompt = request.prompt.clone();
                 let skill_name_for_log = skill_name.clone();
 
+                let skill_phrases_top_n = config.skill_phrases_top_n.unwrap_or(15);
+                let skill_phrase_min_words = config.skill_phrase_min_words.unwrap_or(2);
+
                 let outcome = match tokio::task::spawn_blocking(move || {
                     let client = reqwest::blocking::Client::new();
                     crate::skill_manager::save_skill(
@@ -578,6 +597,8 @@ pub async fn process_agent_turns(
                         &prompt,
                         &tool_records,
                         min_calls,
+                        skill_phrases_top_n,
+                        skill_phrase_min_words,
                     )
                 })
                 .await
@@ -740,34 +761,25 @@ mod tests {
             reasoning_effort: None,
             agent_type: AgentType::default(),
             session_ttl_secs: None,
-            skill_mode: default_skill_mode(),
-            skill_semantic_threshold: default_skill_semantic_threshold(),
-            skill_min_tool_calls: default_skill_min_tool_calls(),
+            skill_mode: None,
+            skill_min_tool_calls: None,
             agent_call_timeout_sec: None,
             max_cost_rub: None,
             compact_threshold_bytes: None,
             tail_byte_budget: None,
+            knowledge_auto_top_n: None,
+            knowledge_auto_top_k: None,
+            knowledge_auto_threshold: None,
+            skill_phrases_top_n: None,
+            skill_phrase_min_words: None,
+            skill_search_threshold: None,
+            skill_min_hits: None,
         }
     }
 
     #[test]
     fn agent_type_default_is_stateless() {
         assert_eq!(AgentType::default(), AgentType::Stateless);
-    }
-
-    #[test]
-    fn skill_mode_default_is_auto() {
-        assert_eq!(default_skill_mode(), "auto");
-    }
-
-    #[test]
-    fn skill_semantic_threshold_default() {
-        assert_eq!(default_skill_semantic_threshold(), 0.5);
-    }
-
-    #[test]
-    fn skill_min_tool_calls_default() {
-        assert_eq!(default_skill_min_tool_calls(), 2);
     }
 
     #[test]
@@ -781,36 +793,6 @@ mod tests {
         assert!(!engine.stream);
         assert_eq!(engine.prefix_message_count, Some(2));
         assert_eq!(engine.tail_message_count, Some(3));
-    }
-
-    #[test]
-    fn build_engine_config_adds_knowledge_tools() {
-        let cfg = dummy_agent_config();
-        let engine = build_engine_config(&cfg);
-        let allowed = engine.allowed_tools.unwrap();
-        let names: Vec<&str> = allowed.iter().map(|t| t.name.as_str()).collect();
-        assert!(names.contains(&"storage_read_file"));
-        assert!(names.contains(&"knowledge_load"));
-        assert!(names.contains(&"knowledge_unload"));
-    }
-
-    #[test]
-    fn build_engine_config_does_not_duplicate_knowledge_tools() {
-        let mut cfg = dummy_agent_config();
-        cfg.tools.push("knowledge_load".into());
-        cfg.tools.push("knowledge_unload".into());
-        let engine = build_engine_config(&cfg);
-        let allowed = engine.allowed_tools.unwrap();
-        let load_count = allowed
-            .iter()
-            .filter(|t| t.name == "knowledge_load")
-            .count();
-        let unload_count = allowed
-            .iter()
-            .filter(|t| t.name == "knowledge_unload")
-            .count();
-        assert_eq!(load_count, 1);
-        assert_eq!(unload_count, 1);
     }
 
     #[test]

@@ -6,12 +6,11 @@
 
 use anyhow::Result;
 use reqwest::blocking::Client;
-use reqwest::Client as AsyncClient;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::engine::{ChatEngine, EngineConfig, Role};
+use crate::yake::{extract as yake_extract, YakeConfig};
 
 // ==================== Типы ====================
 
@@ -70,20 +69,27 @@ fn sha256(input: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-fn compute_fingerprint(prompt: &str, tool_calls: &[ToolCallRecord]) -> String {
-    let normalized: String = prompt
+fn compute_fingerprint(prompt: &str) -> String {
+    let (skeleton, _entities) =
+        crate::lexicon::extract_entities_and_skeleton(prompt, crate::lexicon::get_lexicon());
+    let normalized: String = skeleton
         .to_lowercase()
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
-    let prompt_part: String = normalized.chars().take(2000).collect();
-    let calls_part = serde_json::to_string(tool_calls).unwrap_or_default();
-    sha256(&format!("{}|{}", prompt_part, calls_part))
+    sha256(&normalized)
 }
 
-fn index_file_for(skill_file: &str) -> String {
-    let base = skill_file.trim_end_matches(".txt");
-    format!("{}_index.txt", base)
+/// Из имени индексного файла `.skills/<stem>_index_<N>.idx`
+/// достаёт имя основного файла скилла `<stem>.md`.
+///
+/// Универсально для unix- и windows-разделителей пути.
+fn skill_file_from_index_path(path: &str) -> Option<String> {
+    let name = path.rsplit(|c| c == '/' || c == '\\').next()?;
+    let stem = name.strip_suffix(".idx")?;
+    let without_n = stem.rsplit_once('_')?.0;
+    let base = without_n.strip_suffix("_index")?;
+    Some(format!("{}.md", base))
 }
 
 // ==================== HTTP к хранилищу ====================
@@ -149,6 +155,23 @@ pub fn format_skill_for_injection(record: &SkillRecord, tool_calls: &[ToolCallRe
 
 // ==================== Сохранение ====================
 
+/// Извлекает многословные фразы YAKE из промпта.
+fn extract_index_phrases(prompt: &str, top_n: usize, min_words: usize) -> Vec<String> {
+    let phrases = yake_extract(
+        prompt,
+        &YakeConfig {
+            top_n,
+            ..Default::default()
+        },
+    );
+    phrases
+        .into_iter()
+        .map(|(p, _)| p)
+        .filter(|p| p.split_whitespace().count() >= min_words)
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn save_skill(
     client: &Client,
     base_url: &str,
@@ -159,6 +182,8 @@ pub fn save_skill(
     prompt: &str,
     tool_calls: &[ToolCallRecord],
     min_tool_calls: usize,
+    phrases_top_n: usize,
+    phrase_min_words: usize,
 ) -> Result<SaveSkillOutcome> {
     if tool_calls.len() < min_tool_calls {
         return Ok(SaveSkillOutcome::SkippedTooFewCalls {
@@ -167,7 +192,7 @@ pub fn save_skill(
         });
     }
 
-    let fingerprint = compute_fingerprint(prompt, tool_calls);
+    let fingerprint = compute_fingerprint(prompt);
 
     let catalog = list_skills(client, base_url, auth_token)?;
     if catalog
@@ -185,13 +210,14 @@ pub fn save_skill(
     };
 
     let skill_file = format!(
-        "skill_agent_{}_{}_{}.txt",
+        "skill_agent_{}_{}_{}.md",
         agent_name, normalized_name, timestamp
     );
-    let index_file = index_file_for(&skill_file);
 
-    let (skeleton, entities) =
+    let (_, entities) =
         crate::lexicon::extract_entities_and_skeleton(prompt, crate::lexicon::get_lexicon());
+
+    let index_phrases = extract_index_phrases(prompt, phrases_top_n, phrase_min_words);
 
     let display_name = if skill_name.trim().is_empty() {
         "task"
@@ -227,10 +253,9 @@ pub fn save_skill(
 
     let body = serde_json::json!({
         "content": content,
-        "index": skeleton,
+        "index_files": index_phrases,
         "record": record,
         "skill_file": skill_file,
-        "index_file": index_file,
     });
 
     let base = ensure_scheme(base_url);
@@ -277,110 +302,136 @@ pub fn record_usage(
 
 // ==================== Поиск ====================
 
+fn success_rate(rec: &SkillRecord) -> f32 {
+    rec.success_count as f32 / (rec.success_count + rec.fail_count + 1) as f32
+}
+
+/// Ищет лучший скилл под заданный промпт.
+///
+/// Алгоритм:
+/// 1. YAKE по промпту → фразы запроса (>= 2 слов).
+/// 2. По каждой фразе — векторный поиск по фразам скиллов.
+/// 3. Порог distance <= threshold.
+/// 4. Агрегация hits по файлу скилла.
+/// 5. Фильтр hits >= min_hits.
+/// 6. Top-1 с приоритетом: свой агент → success_rate → min distance.
+#[allow(clippy::too_many_arguments)]
 pub fn search_best_skill(
     client: &Client,
     base_url: &str,
     auth_token: &str,
     current_agent: &str,
     prompt: &str,
-    semantic_threshold: f32,
-    top_k: usize,
+    phrases_top_n: usize,
+    phrase_min_words: usize,
+    threshold: f32,
+    min_hits: usize,
 ) -> Result<Option<(SkillRecord, f32)>> {
     let catalog = list_skills(client, base_url, auth_token)?;
     if catalog.is_empty() {
         return Ok(None);
     }
 
-    let (query_skeleton, query_entities) =
-        crate::lexicon::extract_entities_and_skeleton(prompt, crate::lexicon::get_lexicon());
+    let query_phrases = extract_index_phrases(prompt, phrases_top_n, phrase_min_words);
+    if query_phrases.is_empty() {
+        return Ok(None);
+    }
 
     let base = ensure_scheme(base_url);
     let search_url = format!("{}/skills/search", base.trim_end_matches('/'));
-    let top_k_str = (top_k * 4).to_string();
-    let resp = client
-        .get(&search_url)
-        .query(&[("query", &query_skeleton), ("top_k", &top_k_str)])
-        .header("Authorization", format!("Bearer {}", auth_token))
-        .send()?;
-    if !resp.status().is_success() {
-        return Err(anyhow::anyhow!("Search request failed"));
-    }
-    let results: Vec<serde_json::Value> = resp.json()?;
 
-    // Карта: нормализованный путь индексного файла → запись каталога.
-    let mut by_index: HashMap<String, SkillRecord> = HashMap::new();
-    for rec in &catalog {
-        let idx = index_file_for(&rec.skill_file);
-        by_index.insert(idx, rec.clone());
-    }
+    let mut hits: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut min_dist: HashMap<String, f32> = HashMap::new();
 
-    let mut own_candidates: Vec<(SkillRecord, f32)> = Vec::new();
-    let mut all_candidates: Vec<(SkillRecord, f32)> = Vec::new();
+    // top_k для одного запроса: с запасом покрыть все индексные чанки.
+    let per_query_top_k = 100usize;
 
-    for item in results {
-        let file_path = item.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
-        let distance = item.get("distance").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
-
-        if distance > semantic_threshold {
+    for phrase in &query_phrases {
+        let resp = client
+            .get(&search_url)
+            .query(&[
+                ("query", phrase.as_str()),
+                ("top_k", per_query_top_k.to_string().as_str()),
+            ])
+            .header("Authorization", format!("Bearer {}", auth_token))
+            .send()?;
+        if !resp.status().is_success() {
             continue;
         }
+        let results: Vec<serde_json::Value> = resp.json()?;
 
-        let normalized = file_path.replace('\\', "/");
-        let index_name = normalized
-            .strip_prefix(".skills/")
-            .unwrap_or(&normalized)
-            .to_string();
-
-        let Some(rec) = by_index.get(&index_name) else {
-            continue;
-        };
-
-        if !crate::lexicon::entities_subset(&query_entities, &rec.entities) {
-            eprintln!(
-                "🔍 отсеян скилл {}: сущности запроса {:?} не входят в {:?}",
-                rec.skill_file, query_entities, rec.entities
-            );
-            continue;
+        for r in results {
+            let dist = r.get("distance").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+            if dist > threshold {
+                continue;
+            }
+            let file_path = r.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
+            let Some(skill_file) = skill_file_from_index_path(file_path) else {
+                continue;
+            };
+            hits.entry(skill_file.clone())
+                .or_default()
+                .insert(phrase.clone());
+            let e = min_dist.entry(skill_file).or_insert(f32::MAX);
+            if dist < *e {
+                *e = dist;
+            }
         }
-
-        if rec.agent_name == current_agent {
-            own_candidates.push((rec.clone(), distance));
-        }
-        all_candidates.push((rec.clone(), distance));
     }
 
-    if let Some(best_own) = select_best_by_success_rate(&own_candidates) {
-        return Ok(Some(best_own));
+    if hits.is_empty() {
+        return Ok(None);
     }
 
-    let best_all = select_best_by_success_rate(&all_candidates);
-    Ok(best_all)
-}
+    let by_file: HashMap<String, SkillRecord> = catalog
+        .into_iter()
+        .map(|r| (r.skill_file.clone(), r))
+        .collect();
 
-fn select_best_by_success_rate(candidates: &[(SkillRecord, f32)]) -> Option<(SkillRecord, f32)> {
-    candidates
-        .iter()
-        .max_by(|a, b| {
-            let ra = success_rate(&a.0);
-            let rb = success_rate(&b.0);
-            ra.partial_cmp(&rb)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
+    let mut candidates: Vec<(String, usize, f32)> = hits
+        .into_iter()
+        .map(|(f, set)| {
+            let d = min_dist.get(&f).copied().unwrap_or(1.0);
+            (f, set.len(), d)
         })
-        .cloned()
-}
+        .filter(|(f, h, _)| *h >= min_hits && by_file.contains_key(f))
+        .collect();
 
-fn success_rate(rec: &SkillRecord) -> f32 {
-    rec.success_count as f32 / (rec.success_count + rec.fail_count + 1) as f32
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+
+    candidates.sort_by(|a, b| {
+        let ra = by_file.get(&a.0);
+        let rb = by_file.get(&b.0);
+        let own_a = ra.map(|r| r.agent_name == current_agent).unwrap_or(false);
+        let own_b = rb.map(|r| r.agent_name == current_agent).unwrap_or(false);
+        own_b
+            .cmp(&own_a)
+            .then_with(|| {
+                let sa = ra.map(success_rate).unwrap_or(0.0);
+                let sb = rb.map(success_rate).unwrap_or(0.0);
+                sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal))
+    });
+
+    let (skill_file, _hits, dist) = candidates.into_iter().next().unwrap();
+    let Some(record) = by_file.get(&skill_file).cloned() else {
+        return Ok(None);
+    };
+    Ok(Some((record, dist)))
 }
 
 // ==================== Метаданные через LLM ====================
 
 pub async fn generate_skill_metadata(
-    engine_config: &EngineConfig,
+    engine_config: &crate::engine::EngineConfig,
     prompt: &str,
 ) -> Result<(String, String)> {
-    let client = AsyncClient::new();
+    use crate::engine::{ChatEngine, Role};
+
+    let client = reqwest::Client::new();
     let mut temp_engine = ChatEngine::new(engine_config.clone(), client);
     temp_engine.add_message(
         Role::System,
@@ -404,6 +455,8 @@ pub async fn generate_skill_metadata(
     Ok((name, description))
 }
 
+// ==================== Тесты ====================
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -412,47 +465,38 @@ mod tests {
     fn normalize_replaces_non_alnum_with_underscore() {
         assert_eq!(normalize_skill_name("My Task!"), "my_task_");
         assert_eq!(normalize_skill_name("hello-world"), "hello_world");
-        assert_eq!(normalize_skill_name("café"), "café"); // Unicode остаётся
+        assert_eq!(normalize_skill_name("café"), "café");
     }
 
     #[test]
     fn fingerprint_stable_for_same_input() {
-        let calls = vec![ToolCallRecord {
-            name: "storage_read_file".into(),
-            arguments: serde_json::json!({"path": "a.txt"}),
-        }];
-        let a = compute_fingerprint("read the file", &calls);
-        let b = compute_fingerprint("read the file", &calls);
+        let a = compute_fingerprint("read the file");
+        let b = compute_fingerprint("read the file");
         assert_eq!(a, b);
     }
 
     #[test]
     fn fingerprint_ignores_whitespace_and_case() {
-        let calls = vec![ToolCallRecord {
-            name: "x".into(),
-            arguments: serde_json::json!({}),
-        }];
-        let a = compute_fingerprint("  Read  THE File  ", &calls);
-        let b = compute_fingerprint("read the file", &calls);
+        let a = compute_fingerprint("  Read  THE File  ");
+        let b = compute_fingerprint("read the file");
         assert_eq!(a, b);
     }
 
     #[test]
-    fn fingerprint_changes_with_tool_calls() {
+    fn fingerprint_same_skeleton_different_params() {
         let a = compute_fingerprint(
-            "task",
-            &[ToolCallRecord {
-                name: "a".into(),
-                arguments: serde_json::json!({}),
-            }],
+            "создай файл config.txt с текстом \"hello\", потом создай файл notes.txt с текстом \"world\"",
         );
         let b = compute_fingerprint(
-            "task",
-            &[ToolCallRecord {
-                name: "b".into(),
-                arguments: serde_json::json!({}),
-            }],
+            "создай файл settings.json с текстом \"{}\", потом создай файл log.txt с текстом \"start\"",
         );
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn fingerprint_differs_for_different_procedures() {
+        let a = compute_fingerprint("создай файл config.txt с текстом hello");
+        let b = compute_fingerprint("удали файл config.txt");
         assert_ne!(a, b);
     }
 
@@ -475,12 +519,6 @@ mod tests {
     }
 
     #[test]
-    fn index_file_for_adds_suffix() {
-        assert_eq!(index_file_for("skill.txt"), "skill_index.txt");
-        assert_eq!(index_file_for("a/b/c.txt"), "a/b/c_index.txt");
-    }
-
-    #[test]
     fn success_rate_zero_when_no_stats() {
         let rec = SkillRecord {
             skill_file: "s".into(),
@@ -497,7 +535,7 @@ mod tests {
     }
 
     #[test]
-    fn success_rate_one_when_all_success() {
+    fn success_rate_high_when_all_success() {
         let rec = SkillRecord {
             skill_file: "s".into(),
             agent_name: "a".into(),
@@ -509,41 +547,7 @@ mod tests {
             fingerprint: String::new(),
             created_at: 0,
         };
-        // 10 / (10 + 0 + 1) = 0.909..., не 1.0 из-за сглаживания +1
         assert!(success_rate(&rec) > 0.9);
-    }
-
-    #[test]
-    fn select_best_prefers_higher_success_rate() {
-        let good = SkillRecord {
-            skill_file: "good".into(),
-            agent_name: "a".into(),
-            description: String::new(),
-            prompt: String::new(),
-            entities: vec![],
-            success_count: 9,
-            fail_count: 1,
-            fingerprint: String::new(),
-            created_at: 0,
-        };
-        let bad = SkillRecord {
-            skill_file: "bad".into(),
-            agent_name: "a".into(),
-            description: String::new(),
-            prompt: String::new(),
-            entities: vec![],
-            success_count: 1,
-            fail_count: 9,
-            fingerprint: String::new(),
-            created_at: 0,
-        };
-        let best = select_best_by_success_rate(&[(bad, 0.1), (good.clone(), 0.5)]);
-        assert_eq!(best.unwrap().0.skill_file, "good");
-    }
-
-    #[test]
-    fn select_best_empty_returns_none() {
-        assert!(select_best_by_success_rate(&[]).is_none());
     }
 
     #[test]
@@ -566,5 +570,27 @@ mod tests {
         }];
         let out = format_skill_for_injection(&rec, &calls);
         assert!(out.contains("..."));
+    }
+
+    #[test]
+    fn skill_file_from_index_path_unix() {
+        assert_eq!(
+            skill_file_from_index_path("skill_agent_x_build_index_123_index_0.idx"),
+            Some("skill_agent_x_build_index_123.md".to_string())
+        );
+    }
+
+    #[test]
+    fn skill_file_from_index_path_windows() {
+        assert_eq!(
+            skill_file_from_index_path(".skills\\skill_agent_x_task_99_index_5.idx"),
+            Some("skill_agent_x_task_99.md".to_string())
+        );
+    }
+
+    #[test]
+    fn skill_file_from_index_path_rejects_non_idx() {
+        assert_eq!(skill_file_from_index_path("skill.md"), None);
+        assert_eq!(skill_file_from_index_path("skill_index.txt"), None);
     }
 }

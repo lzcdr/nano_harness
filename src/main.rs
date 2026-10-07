@@ -15,13 +15,15 @@ use std::time::Duration;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio_stream::StreamExt;
 
-use nano_harness::agent_core::{OutgoingTasks, PendingCalls};
+use nano_harness::agent_core::{OutgoingTasks, PendingCalls, ToolCallLogEntry};
 use nano_harness::config::{build_engine_config, TomlConfig};
 use nano_harness::engine::{ChatEngine, EngineConfig, Message, Role};
 use nano_harness::godfather::GodfatherConfig;
+use nano_harness::knowledge_auto::{build_knowledge_context, KnowledgeAutoConfig};
 use nano_harness::knowledge_manager::KnowledgeEntry;
 use nano_harness::local_storage_http_api::LocalStorageServerConfig;
 use nano_harness::message_board::BoardEvent;
+use nano_harness::rebuke_manager;
 use nano_harness::session_store::{self, ContextBlock, Session};
 
 #[derive(Parser, Debug)]
@@ -96,6 +98,8 @@ struct ChatRuntime {
     project_id: String,
     outgoing_tasks: OutgoingTasks,
     pending_calls: PendingCalls,
+    tool_calls_log: Vec<ToolCallLogEntry>,
+    injected_skill: Option<nano_harness::skill_manager::SkillRecord>,
 }
 
 type SharedChat = Arc<AsyncMutex<ChatRuntime>>;
@@ -108,6 +112,7 @@ struct ReplyContext {
     agent_call_timeout_sec: u64,
     board_url: String,
     board_token: String,
+    knowledge_auto: Arc<KnowledgeAutoConfig>,
 }
 
 // ==================== Утилиты ====================
@@ -526,6 +531,49 @@ async fn handle_chat_result(
 
 async fn continue_chat_turn(shared: &SharedChat, ctx: &ReplyContext) {
     const MAX_ITER: usize = 5;
+
+    // Авто-инжект знаний.
+    {
+        let turn_text = {
+            let rt = shared.lock().await;
+            rt.engine.pending_turn_text()
+        };
+        if let Some(text) = turn_text {
+            let storage_url = &ctx.storage_http_config.bind_addr;
+            let token = &ctx.storage_http_config.auth_token;
+            match build_knowledge_context(
+                &ctx.client,
+                storage_url,
+                token,
+                &text,
+                &ctx.knowledge_auto,
+            )
+            .await
+            {
+                Ok(Some(ctx_str)) => {
+                    let names: Vec<String> = ctx_str
+                        .lines()
+                        .filter_map(|l| {
+                            let t = l.trim();
+                            t.strip_prefix("=== ")
+                                .and_then(|r| r.strip_suffix(" ==="))
+                                .map(|s| s.to_string())
+                        })
+                        .collect();
+                    let mut rt = shared.lock().await;
+                    rt.engine.set_knowledge_context("auto", ctx_str);
+                    eprintln!("📚 knowledge auto-inject: injected [{}]", names.join(", "));
+                }
+                Ok(None) => {
+                    let mut rt = shared.lock().await;
+                    rt.engine.clear_knowledge_context();
+                    eprintln!("📚 knowledge auto-inject: nothing relevant");
+                }
+                Err(e) => eprintln!("⚠️ knowledge auto-inject failed: {:#}", e),
+            }
+        }
+    }
+
     for _ in 0..=MAX_ITER {
         let response = {
             let mut rt = shared.lock().await;
@@ -618,6 +666,11 @@ async fn continue_chat_turn(shared: &SharedChat, ctx: &ReplyContext) {
                     &format!("{} ({}) -> {}", name, tc.function.arguments, result),
                 );
                 rt.engine.add_tool_result(tc.id.clone(), result.clone());
+                rt.tool_calls_log.push(ToolCallLogEntry {
+                    name: name.clone(),
+                    arguments: tc.function.arguments.clone(),
+                    result: result.clone(),
+                });
             }
 
             if posted {
@@ -673,11 +726,35 @@ async fn main() -> Result<()> {
         .timeout(Duration::from_secs(args.timeout_sec))
         .build()?;
 
-    let system_prompt = args
+    let base_system_prompt = args
         .system_prompt
         .clone()
         .or(toml_config.system_prompt.clone())
         .unwrap_or_else(|| "Ты полезный ассистент. Отвечай кратко и по делу.".to_string());
+
+    let mut storage_http_config = toml_config
+        .local_storage_http_server
+        .clone()
+        .unwrap_or_else(|| LocalStorageServerConfig {
+            bind_addr: "127.0.0.1:8080".to_string(),
+            storage_name: "default_storage".to_string(),
+            auth_token: String::new(),
+        });
+    if storage_http_config.auth_token.is_empty() {
+        storage_http_config.auth_token =
+            std::env::var("LOCAL_STORAGE_AUTH_TOKEN").unwrap_or_default();
+    }
+
+    let chat_rebuke = rebuke_manager::load_rebuke(
+        &client,
+        &storage_http_config.bind_addr,
+        &storage_http_config.auth_token,
+        "chat",
+    )
+    .await
+    .unwrap_or_default();
+
+    let system_prompt = rebuke_manager::build_system_with_rebuke(&base_system_prompt, &chat_rebuke);
 
     let board_url = toml_config
         .message_board
@@ -773,6 +850,8 @@ async fn main() -> Result<()> {
         project_id: project_id.clone(),
         outgoing_tasks: Arc::new(AsyncMutex::new(std::collections::HashMap::new())),
         pending_calls: Arc::new(AsyncMutex::new(std::collections::HashMap::new())),
+        tool_calls_log: Vec::new(),
+        injected_skill: None,
     }));
 
     {
@@ -820,7 +899,7 @@ async fn main() -> Result<()> {
     println!("     /unfreeze              — вернуть всё из архива godfather");
     println!("     /unfreeze last         — вернуть последний сжатый ход");
     println!("     /knowledge             — управление базой знаний");
-    println!("     /rebuke <агент> <текст> — добавить замечание агенту");
+    println!("     /rebuke <агент> <текст> — добавить замечание агенту или чату");
     println!("     /rebuke_edit <агент>   — редактировать замечания в редакторе");
     println!("     /project               — управление проектами");
     println!("       list                 — список проектов");
@@ -831,22 +910,16 @@ async fn main() -> Result<()> {
     println!("       purge <id> [--force] — удалить файлы");
     println!();
 
-    let mut storage_http_config = toml_config
-        .local_storage_http_server
-        .clone()
-        .unwrap_or_else(|| LocalStorageServerConfig {
-            bind_addr: "127.0.0.1:8080".to_string(),
-            storage_name: "default_storage".to_string(),
-            auth_token: String::new(),
-        });
-
-    if storage_http_config.auth_token.is_empty() {
-        storage_http_config.auth_token =
-            std::env::var("LOCAL_STORAGE_AUTH_TOKEN").unwrap_or_default();
-    }
-
     let agent_call_timeout_sec = args.agent_call_timeout_sec;
     let godfather_timeout_sec = args.godfather_timeout_sec;
+    let max_iterations = toml_config.max_iterations.unwrap_or(5);
+
+    let knowledge_auto_cfg = KnowledgeAutoConfig {
+        top_n: toml_config.knowledge_auto_top_n.unwrap_or(7),
+        top_k: toml_config.knowledge_auto_top_k.unwrap_or(3),
+        threshold: toml_config.knowledge_auto_threshold.unwrap_or(0.70),
+        per_phrase: toml_config.vector_db.as_ref().map(|v| v.top_k).unwrap_or(5),
+    };
 
     let reply_ctx = Arc::new(ReplyContext {
         engine_config: Arc::new(engine_config.clone()),
@@ -855,6 +928,7 @@ async fn main() -> Result<()> {
         agent_call_timeout_sec,
         board_url: board_url.clone(),
         board_token: board_token.clone(),
+        knowledge_auto: Arc::new(knowledge_auto_cfg),
     });
 
     {
@@ -925,11 +999,11 @@ async fn main() -> Result<()> {
                 continue;
             }
             "/rebuke" => {
-                println!("Использование: /rebuke <agent> <TEXT>");
+                println!("Использование: /rebuke <agent|chat> <TEXT>");
                 continue;
             }
             "/rebuke_edit" => {
-                println!("Использование: /rebuke_edit <agent>");
+                println!("Использование: /rebuke_edit <agent|chat>");
                 continue;
             }
             _ if user_input.starts_with("/rebuke ") => {
@@ -938,14 +1012,14 @@ async fn main() -> Result<()> {
                 let agent = parts.next().unwrap_or("").trim();
                 let text = parts.next().unwrap_or("").trim();
                 if agent.is_empty() {
-                    println!("Использование: /rebuke <agent> <TEXT>");
+                    println!("Использование: /rebuke <agent|chat> <TEXT>");
                     continue;
                 }
                 if text.is_empty() {
                     println!("Нужен текст замечания.");
                     continue;
                 }
-                if !toml_config.agents.iter().any(|a| a.name == agent) {
+                if agent != "chat" && !toml_config.agents.iter().any(|a| a.name == agent) {
                     println!("Агент '{}' не найден в конфиге.", agent);
                     continue;
                 }
@@ -959,10 +1033,14 @@ async fn main() -> Result<()> {
                 .await
                 {
                     Ok(_) => {
-                        println!(
-                            "Rebuke добавлен агенту '{}'. Перезапусти агента, чтобы он его увидел.",
-                            agent
-                        );
+                        if agent == "chat" {
+                            println!("Rebuke добавлен чату. Перезапусти чат, чтобы он его увидел.");
+                        } else {
+                            println!(
+                                "Rebuke добавлен агенту '{}'. Перезапусти агента, чтобы он его увидел.",
+                                agent
+                            );
+                        }
                     }
                     Err(e) => println!("Ошибка: {:#}", e),
                 }
@@ -971,10 +1049,10 @@ async fn main() -> Result<()> {
             _ if user_input.starts_with("/rebuke_edit ") => {
                 let agent = user_input[13..].trim();
                 if agent.is_empty() {
-                    println!("Использование: /rebuke_edit <agent>");
+                    println!("Использование: /rebuke_edit <agent|chat>");
                     continue;
                 }
-                if !toml_config.agents.iter().any(|a| a.name == agent) {
+                if agent != "chat" && !toml_config.agents.iter().any(|a| a.name == agent) {
                     println!("Агент '{}' не найден в конфиге.", agent);
                     continue;
                 }
@@ -1007,10 +1085,16 @@ async fn main() -> Result<()> {
                 )
                 .await
                 {
-                    Ok(_) => println!(
-                        "Rebuke для '{}' сохранён. Перезапусти агента, чтобы он увидел изменения.",
-                        agent
-                    ),
+                    Ok(_) => {
+                        if agent == "chat" {
+                            println!("Rebuke для чата сохранён. Перезапусти чат.");
+                        } else {
+                            println!(
+                                "Rebuke для '{}' сохранён. Перезапусти агента, чтобы он увидел изменения.",
+                                agent
+                            );
+                        }
+                    }
                     Err(e) => println!("Ошибка сохранения: {:#}", e),
                 }
                 continue;
@@ -1022,8 +1106,6 @@ async fn main() -> Result<()> {
                 println!("  /knowledge new <name>        — создать знание");
                 println!("  /knowledge edit <name>       — редактировать знание");
                 println!("  /knowledge delete <name>     — удалить знание");
-                println!("  /knowledge load <name>       — загрузить знание в контекст чата");
-                println!("  /knowledge unload            — снять знание из контекста");
                 continue;
             }
             _ if user_input.starts_with("/knowledge ") => {
@@ -1212,43 +1294,9 @@ async fn main() -> Result<()> {
                             Err(e) => println!("Ошибка: {:#}", e),
                         }
                     }
-                    "load" => {
-                        if arg.is_empty() {
-                            println!("Использование: /knowledge load <name>");
-                            continue;
-                        }
-                        match nano_harness::knowledge_manager::load_knowledge(
-                            &client,
-                            &storage_http_config.bind_addr,
-                            &storage_http_config.auth_token,
-                            arg,
-                        )
-                        .await
-                        {
-                            Ok(body) => {
-                                let bytes = body.len();
-                                let mut rt = shared.lock().await;
-                                rt.engine.set_knowledge_context(arg, body);
-                                println!(
-                                    "Знание '{}' загружено в контекст чата ({} байт).",
-                                    arg, bytes
-                                );
-                            }
-                            Err(e) => println!("Ошибка: {:#}", e),
-                        }
-                    }
-                    "unload" => {
-                        let mut rt = shared.lock().await;
-                        if rt.engine.has_knowledge_context() {
-                            rt.engine.clear_knowledge_context();
-                            println!("Знание снято из контекста чата.");
-                        } else {
-                            println!("Активного знания не было.");
-                        }
-                    }
                     other => {
                         println!("Неизвестная подкоманда '{}'.", other);
-                        println!("Доступно: list | show | new | edit | delete | load | unload");
+                        println!("Доступно: list | show | new | edit | delete");
                     }
                 }
                 continue;
@@ -1479,6 +1527,8 @@ async fn main() -> Result<()> {
                     rt.engine = new_engine;
                     rt.log_file = new_log;
                     rt.project_id = id.clone();
+                    rt.tool_calls_log.clear();
+                    rt.injected_skill = None;
                     session_store::add_or_update_log(&mut rt.session, "chat", None)?;
                     session_store::save_session(&rt.session)?;
                     println!("🆕 Создан проект {} ({})", name, id);
@@ -1501,6 +1551,8 @@ async fn main() -> Result<()> {
                                 rt.engine = new_engine;
                                 rt.log_file = new_log;
                                 rt.project_id = s.session_id.clone();
+                                rt.tool_calls_log.clear();
+                                rt.injected_skill = None;
                                 println!(
                                     "🔄 Переключено на проект {} ({})",
                                     rt.session.display_name, rt.project_id
@@ -1544,6 +1596,8 @@ async fn main() -> Result<()> {
                             rt.engine = new_engine;
                             rt.log_file = new_log;
                             rt.project_id = s.session_id.clone();
+                            rt.tool_calls_log.clear();
+                            rt.injected_skill = None;
                             println!(
                                 "🔄 Переключено на {} ({})",
                                 rt.session.display_name, rt.project_id
@@ -1617,6 +1671,8 @@ async fn main() -> Result<()> {
                             rt.engine = new_engine;
                             rt.log_file = new_log;
                             rt.project_id = new_id;
+                            rt.tool_calls_log.clear();
+                            rt.injected_skill = None;
                             session_store::add_or_update_log(&mut rt.session, "chat", None)?;
                             session_store::save_session(&rt.session)?;
                         }
@@ -1700,44 +1756,181 @@ async fn main() -> Result<()> {
             let mut rt = shared.lock().await;
             rt.engine.add_message(Role::User, user_input.to_string());
             write_log(&mut rt.log_file, "user", user_input)?;
+            rt.tool_calls_log.clear();
+            rt.injected_skill = None;
         }
 
-        let response = {
-            let mut rt = shared.lock().await;
-            match rt.engine.send().await {
-                Ok(resp) => resp,
-                Err(e) => {
-                    println!("\n❌ Ошибка: {:#}", e);
-                    write_log(&mut rt.log_file, "error", &format!("{:#}", e))?;
-                    rt.engine.rollback_pending_turn();
-                    continue;
+        // Авто-инжект знаний по текущему ходу.
+        {
+            let turn_text = {
+                let rt = shared.lock().await;
+                rt.engine.pending_turn_text()
+            };
+            if let Some(text) = turn_text {
+                let storage_url = &reply_ctx.storage_http_config.bind_addr;
+                let token = &reply_ctx.storage_http_config.auth_token;
+                match build_knowledge_context(
+                    &reply_ctx.client,
+                    storage_url,
+                    token,
+                    &text,
+                    &reply_ctx.knowledge_auto,
+                )
+                .await
+                {
+                    Ok(Some(ctx_str)) => {
+                        let names: Vec<String> = ctx_str
+                            .lines()
+                            .filter_map(|l| {
+                                let t = l.trim();
+                                t.strip_prefix("=== ")
+                                    .and_then(|r| r.strip_suffix(" ==="))
+                                    .map(|s| s.to_string())
+                            })
+                            .collect();
+                        let mut rt = shared.lock().await;
+                        rt.engine.set_knowledge_context("auto", ctx_str);
+                        eprintln!("📚 knowledge auto-inject: injected [{}]", names.join(", "));
+                    }
+                    Ok(None) => {
+                        let mut rt = shared.lock().await;
+                        rt.engine.clear_knowledge_context();
+                        eprintln!("📚 knowledge auto-inject: nothing relevant");
+                    }
+                    Err(e) => {
+                        eprintln!("⚠️ knowledge auto-inject failed: {:#}", e);
+                    }
                 }
             }
-        };
+        }
 
-        println!();
-
-        let has_content = !response.content.trim().is_empty();
+        // Авто-инжект скилла по текущему ходу.
         {
-            let mut rt = shared.lock().await;
-            let answer = if has_content {
-                response.content.clone()
-            } else {
-                response.reasoning.clone()
+            let storage_url = reply_ctx.storage_http_config.bind_addr.clone();
+            let token = reply_ctx.storage_http_config.auth_token.clone();
+            let prompt_for_skill = user_input.to_string();
+            let phrases_top_n = toml_config.skill_phrases_top_n.unwrap_or(15);
+            let phrase_min_words = toml_config.skill_phrase_min_words.unwrap_or(2);
+            let threshold = toml_config.skill_search_threshold.unwrap_or(0.45);
+            let min_hits = toml_config.skill_min_hits.unwrap_or(3);
+
+            let skill_result = tokio::task::spawn_blocking(
+                move || -> anyhow::Result<Option<(nano_harness::skill_manager::SkillRecord, f32)>> {
+                    let client = reqwest::blocking::Client::new();
+                    nano_harness::skill_manager::search_best_skill(
+                        &client,
+                        &storage_url,
+                        &token,
+                        "chat",
+                        &prompt_for_skill,
+                        phrases_top_n,
+                        phrase_min_words,
+                        threshold,
+                        min_hits,
+                    )
+                },
+            )
+            .await;
+
+            let record_opt = match skill_result {
+                Ok(Ok(r)) => r,
+                Ok(Err(e)) => {
+                    eprintln!("⚠️ skill search failed: {:#}", e);
+                    None
+                }
+                Err(e) => {
+                    eprintln!("⚠️ skill search join error: {:#}", e);
+                    None
+                }
             };
-            if !answer.is_empty() {
-                write_log(&mut rt.log_file, "assistant", &answer)?;
+
+            if let Some((record, distance)) = record_opt {
+                let storage_url = reply_ctx.storage_http_config.bind_addr.clone();
+                let token = reply_ctx.storage_http_config.auth_token.clone();
+                let skill_file = record.skill_file.clone();
+
+                let content_result = tokio::task::spawn_blocking(move || {
+                    let client = reqwest::blocking::Client::new();
+                    nano_harness::skill_manager::load_skill(
+                        &client,
+                        &storage_url,
+                        &token,
+                        &skill_file,
+                    )
+                })
+                .await;
+
+                match content_result {
+                    Ok(Ok(content)) => {
+                        if let Some(calls) = nano_harness::skill_manager::parse_tool_calls(&content)
+                        {
+                            let injection = nano_harness::skill_manager::format_skill_for_injection(
+                                &record, &calls,
+                            );
+                            let mut rt = shared.lock().await;
+                            rt.engine.set_skill_context(injection);
+                            rt.injected_skill = Some(record.clone());
+                            eprintln!(
+                                "🔍 skill auto-inject: {} (distance: {:.4})",
+                                record.skill_file, distance
+                            );
+                        } else {
+                            eprintln!("⚠️ skill parse failed for {}", record.skill_file);
+                        }
+                    }
+                    Ok(Err(e)) => eprintln!("⚠️ skill load failed: {:#}", e),
+                    Err(e) => eprintln!("⚠️ skill load join error: {:#}", e),
+                }
+            } else {
+                let mut rt = shared.lock().await;
+                rt.engine.clear_skill_context();
+                rt.injected_skill = None;
             }
+        }
+
+        let allowed = engine_config.allowed_tools.clone();
+
+        for _iter in 0..=max_iterations {
+            let response = {
+                let mut rt = shared.lock().await;
+                match rt.engine.send().await {
+                    Ok(resp) => resp,
+                    Err(e) => {
+                        println!("\n❌ Ошибка: {:#}", e);
+                        write_log(&mut rt.log_file, "error", &format!("{:#}", e))?;
+                        rt.engine.rollback_pending_turn();
+                        break;
+                    }
+                }
+            };
+
+            println!();
+
+            let has_content = !response.content.trim().is_empty();
+            {
+                let mut rt = shared.lock().await;
+                let answer = if has_content {
+                    response.content.clone()
+                } else {
+                    response.reasoning.clone()
+                };
+                if !answer.is_empty() {
+                    write_log(&mut rt.log_file, "assistant", &answer)?;
+                }
+                if !response.reasoning.is_empty() && has_content {
+                    write_log(&mut rt.log_file, "reasoning", &response.reasoning)?;
+                }
+            }
+
             if !response.reasoning.is_empty() && has_content {
-                write_log(&mut rt.log_file, "reasoning", &response.reasoning)?;
+                println!("\n\x1b[90m🧠 Reasoning:\n{}\x1b[0m\n", response.reasoning);
             }
-        }
 
-        if !response.reasoning.is_empty() && has_content {
-            println!("\n\x1b[90m🧠 Reasoning:\n{}\x1b[0m\n", response.reasoning);
-        }
+            let tool_calls = match response.tool_calls {
+                Some(tc) if !tc.is_empty() => tc,
+                _ => break,
+            };
 
-        if let Some(tool_calls) = response.tool_calls {
             println!("\n⚠️ Модель запросила инструменты:");
             {
                 let mut rt = shared.lock().await;
@@ -1751,7 +1944,6 @@ async fn main() -> Result<()> {
                 }
             }
 
-            let allowed = &engine_config.allowed_tools;
             let get_mode = |name: &str| -> Option<String> {
                 allowed
                     .as_ref()
@@ -1828,6 +2020,11 @@ async fn main() -> Result<()> {
                         &format!("{} ({}) -> {}", name, tc.function.arguments, result),
                     )?;
                     rt.engine.add_tool_result(tc.id.clone(), result.clone());
+                    rt.tool_calls_log.push(ToolCallLogEntry {
+                        name: name.clone(),
+                        arguments: tc.function.arguments.clone(),
+                        result: result.clone(),
+                    });
                 }
 
                 if posted {
@@ -1842,43 +2039,129 @@ async fn main() -> Result<()> {
             if posted_async {
                 let mut rt = shared.lock().await;
                 save_current(&mut *rt)?;
-                continue;
+                break;
+            }
+        }
+
+        // Auto-save скилла и record_usage.
+        {
+            let (successful, injected, prompt_for_skill) = {
+                let rt = shared.lock().await;
+                let successful: Vec<ToolCallLogEntry> = rt
+                    .tool_calls_log
+                    .iter()
+                    .filter(|t| {
+                        !t.result.contains("\"ok\":false") && !t.result.starts_with("Ошибка")
+                    })
+                    .cloned()
+                    .collect();
+                (
+                    successful,
+                    rt.injected_skill.clone(),
+                    user_input.to_string(),
+                )
+            };
+
+            let min_calls = toml_config.skill_min_tool_calls.unwrap_or(2);
+
+            if let Some(rec) = injected {
+                let storage_url = reply_ctx.storage_http_config.bind_addr.clone();
+                let token = reply_ctx.storage_http_config.auth_token.clone();
+                let skill_file = rec.skill_file.clone();
+                let success = !successful.is_empty();
+                tokio::task::spawn_blocking(move || {
+                    let client = reqwest::blocking::Client::new();
+                    if let Err(e) = nano_harness::skill_manager::record_usage(
+                        &client,
+                        &storage_url,
+                        &token,
+                        &skill_file,
+                        success,
+                    ) {
+                        eprintln!("⚠️ record_usage failed: {:#}", e);
+                    }
+                });
             }
 
-            println!("\nЗапрашиваю финальный ответ...");
-            let final_response = {
-                let mut rt = shared.lock().await;
-                match rt.engine.send().await {
-                    Ok(resp) => resp,
-                    Err(e) => {
-                        println!("\n❌ Ошибка: {:#}", e);
-                        write_log(&mut rt.log_file, "error", &format!("{:#}", e))?;
-                        rt.engine.rollback_pending_turn();
-                        continue;
+            if successful.len() >= min_calls {
+                let engine_config = reply_ctx.engine_config.clone();
+                let prompt_for_metadata = prompt_for_skill.clone();
+
+                let (skill_name, skill_description) =
+                    match nano_harness::skill_manager::generate_skill_metadata(
+                        &engine_config,
+                        &prompt_for_metadata,
+                    )
+                    .await
+                    {
+                        Ok(meta) => meta,
+                        Err(e) => {
+                            eprintln!("⚠️ skill metadata failed: {:#}", e);
+                            (String::new(), String::new())
+                        }
+                    };
+
+                if !skill_name.is_empty() || !skill_description.is_empty() {
+                    let tool_records: Vec<nano_harness::skill_manager::ToolCallRecord> = successful
+                        .iter()
+                        .filter_map(|t| {
+                            let args: serde_json::Value =
+                                serde_json::from_str(&t.arguments).unwrap_or(serde_json::json!({}));
+                            Some(nano_harness::skill_manager::ToolCallRecord {
+                                name: t.name.clone(),
+                                arguments: args,
+                            })
+                        })
+                        .collect();
+
+                    let storage_url = reply_ctx.storage_http_config.bind_addr.clone();
+                    let token = reply_ctx.storage_http_config.auth_token.clone();
+                    let agent_name = "chat".to_string();
+                    let prompt_for_save = prompt_for_skill.clone();
+                    let skill_name_for_log = skill_name.clone();
+                    let phrases_top_n = toml_config.skill_phrases_top_n.unwrap_or(15);
+                    let phrase_min_words = toml_config.skill_phrase_min_words.unwrap_or(2);
+
+                    let outcome = tokio::task::spawn_blocking(move || {
+                        let client = reqwest::blocking::Client::new();
+                        nano_harness::skill_manager::save_skill(
+                            &client,
+                            &storage_url,
+                            &token,
+                            &skill_name,
+                            &agent_name,
+                            &skill_description,
+                            &prompt_for_save,
+                            &tool_records,
+                            min_calls,
+                            phrases_top_n,
+                            phrase_min_words,
+                        )
+                    })
+                    .await;
+
+                    match outcome {
+                        Ok(Ok(nano_harness::skill_manager::SaveSkillOutcome::Saved)) => {
+                            eprintln!("💾 Скилл сохранён: {}", skill_name_for_log);
+                        }
+                        Ok(Ok(nano_harness::skill_manager::SaveSkillOutcome::SkippedDuplicate)) => {
+                            eprintln!("♻️ Скилл пропущен (дубликат): {}", skill_name_for_log);
+                        }
+                        Ok(Ok(
+                            nano_harness::skill_manager::SaveSkillOutcome::SkippedTooFewCalls {
+                                actual,
+                                min,
+                            },
+                        )) => {
+                            eprintln!(
+                                "⏭️ Скилл не сохранён: {} ({} < {})",
+                                skill_name_for_log, actual, min
+                            );
+                        }
+                        Ok(Err(e)) => eprintln!("⚠️ skill save failed: {:#}", e),
+                        Err(e) => eprintln!("⚠️ skill save join error: {:#}", e),
                     }
                 }
-            };
-            println!();
-            let has_content = !final_response.content.trim().is_empty();
-            {
-                let mut rt = shared.lock().await;
-                let answer = if has_content {
-                    final_response.content.clone()
-                } else {
-                    final_response.reasoning.clone()
-                };
-                if !answer.is_empty() {
-                    write_log(&mut rt.log_file, "assistant", &answer)?;
-                }
-                if !final_response.reasoning.is_empty() && has_content {
-                    write_log(&mut rt.log_file, "reasoning", &final_response.reasoning)?;
-                }
-            }
-            if !final_response.reasoning.is_empty() && has_content {
-                println!(
-                    "\n\x1b[90m🧠 Reasoning:\n{}\x1b[0m\n",
-                    final_response.reasoning
-                );
             }
         }
 

@@ -290,6 +290,30 @@ impl ChatEngine {
         self.knowledge_context.is_some()
     }
 
+    /// Текст текущего хода: сообщения `User` и `Assistant` из `pending_turn`.
+    /// Возвращает None, если ход пуст или содержит только tool-сообщения.
+    pub fn pending_turn_text(&self) -> Option<String> {
+        let turn = self.pending_turn.as_ref()?;
+        let mut parts: Vec<String> = Vec::new();
+        for msg in &turn.messages {
+            match msg.role {
+                Role::User | Role::Assistant => {
+                    if let Some(c) = &msg.content {
+                        if !c.trim().is_empty() {
+                            parts.push(c.clone());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join("\n\n"))
+        }
+    }
+
     pub fn clear_context(&mut self) {
         self.finalize_pending_turn();
         self.prefix_turns.clear();
