@@ -13,10 +13,13 @@ use axum::{
 };
 use serde::Deserialize;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
 
 use crate::knowledge_manager::KnowledgeEntry;
-use crate::local_storage::{valid_project_id, LocalStorage, VectorDbConfig, SKILLS_PROJECT};
+use crate::local_storage::{
+    valid_project_id, LocalStorage, VectorDbConfig, KNOWLEDGE_PROJECT, SKILLS_PROJECT,
+};
 use crate::skill_manager::SkillRecord;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -31,8 +34,8 @@ struct AppState {
     files: Arc<RwLock<FileStorage>>,
     search_tx: mpsc::Sender<SearchTask>,
     index_tx: mpsc::Sender<IndexTask>,
-    skill_index_tx: mpsc::Sender<SkillIndexTask>,
-    skill_delete_tx: mpsc::Sender<SkillDeleteTask>,
+    aux_index_tx: mpsc::Sender<AuxIndexTask>,
+    aux_delete_tx: mpsc::Sender<AuxDeleteTask>,
     knowledge_catalog: Arc<RwLock<Vec<KnowledgeEntry>>>,
     skills_catalog: Arc<RwLock<Vec<SkillRecord>>>,
     auth_token: String,
@@ -168,6 +171,9 @@ impl FileStorage {
         path: &str,
     ) -> std::io::Result<Vec<crate::local_storage::Entry>> {
         let full = self.resolve(project_id, path)?;
+        if !full.exists() {
+            return Ok(Vec::new());
+        }
         let project_root = self.root.join("projects").join(project_id);
         let mut entries = Vec::new();
         let mut dir = tokio::fs::read_dir(full).await?;
@@ -203,6 +209,9 @@ impl FileStorage {
         path: &str,
     ) -> std::io::Result<Vec<crate::local_storage::Entry>> {
         let full = self.resolve(project_id, path)?;
+        if !full.exists() {
+            return Ok(Vec::new());
+        }
         let project_root = self.root.join("projects").join(project_id);
         let mut result = Vec::new();
         let mut stack = vec![full];
@@ -287,6 +296,28 @@ impl FileStorage {
         tokio::fs::remove_file(self.resolve_skill(path)?).await
     }
 
+    /// Удаляет все `<stem>_index_<N>.idx` в `.skills/`.
+    /// Возвращает имена удалённых файлов (без директории).
+    async fn delete_index_files(&self, stem: &str) -> std::io::Result<Vec<String>> {
+        let skills_dir = self.root.join(".skills");
+        let prefix = format!("{}_index_", stem);
+
+        let mut removed = Vec::new();
+        let mut dir = match tokio::fs::read_dir(&skills_dir).await {
+            Ok(d) => d,
+            Err(_) => return Ok(removed),
+        };
+        while let Ok(Some(entry)) = dir.next_entry().await {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with(&prefix) && name.ends_with(".idx") {
+                if tokio::fs::remove_file(entry.path()).await.is_ok() {
+                    removed.push(name);
+                }
+            }
+        }
+        Ok(removed)
+    }
+
     fn resolve_knowledge(&self, name: &str) -> std::io::Result<std::path::PathBuf> {
         if !crate::knowledge_manager::validate_name(name) {
             return Err(std::io::Error::new(
@@ -349,6 +380,7 @@ struct SearchTask {
     project_id: Option<String>,
     query: String,
     top_k: Option<usize>,
+    sync_first: bool,
     response_tx:
         tokio::sync::oneshot::Sender<std::io::Result<Vec<crate::local_storage::SearchResult>>>,
 }
@@ -361,15 +393,20 @@ struct IndexTask {
 }
 
 #[derive(Debug)]
-struct SkillIndexTask {
+struct AuxIndexTask {
+    project_id: String,
     path: std::path::PathBuf,
     content: String,
 }
 
 #[derive(Debug)]
-struct SkillDeleteTask {
-    path: std::path::PathBuf,
+struct AuxDeleteTask {
+    project_id: String,
+    paths: Vec<std::path::PathBuf>,
 }
+
+#[derive(Debug)]
+struct SyncTask;
 
 struct ProjectId(String);
 
@@ -563,6 +600,7 @@ async fn search_similar(
             project_id: Some(project_id),
             query: query.query.clone(),
             top_k: query.top_k,
+            sync_first: true,
             response_tx: tx,
         })
         .await
@@ -683,30 +721,55 @@ async fn skill_get(State(state): State<AppState>, Query(query): Query<PathQuery>
 #[derive(Deserialize)]
 struct SkillPutRequest {
     content: String,
-    index: String,
+    index_files: Vec<String>,
     record: SkillRecord,
     skill_file: String,
-    index_file: String,
 }
 
 async fn skill_put(State(state): State<AppState>, Json(req): Json<SkillPutRequest>) -> Response {
+    let stem = match req.skill_file.strip_suffix(".md") {
+        Some(s) => s.to_string(),
+        None => {
+            return (StatusCode::BAD_REQUEST, "skill_file must end with .md").into_response();
+        }
+    };
+
+    let mut index_tasks: Vec<(String, String)> = Vec::new();
+
     {
         let files = state.files.read().await;
+
+        // Удаляем старые index-файлы этого скилла (если были).
+        if let Err(e) = files.delete_index_files(&stem).await {
+            eprintln!("cleanup index files for {}: {}", stem, e);
+        }
+
+        // Пишем основной .md.
         if let Err(e) = files.write_skill_file(&req.skill_file, &req.content).await {
             return io_error_response(e);
         }
-        if let Err(e) = files.write_skill_file(&req.index_file, &req.index).await {
-            return io_error_response(e);
+
+        // Пишем index-файлы.
+        for (i, phrase) in req.index_files.iter().enumerate() {
+            let name = format!("{}_index_{}.idx", stem, i);
+            if let Err(e) = files.write_skill_file(&name, phrase).await {
+                eprintln!("write index file {}: {}", name, e);
+                continue;
+            }
+            index_tasks.push((name, phrase.clone()));
         }
     }
 
-    let _ = state
-        .skill_index_tx
-        .send(SkillIndexTask {
-            path: std::path::PathBuf::from(&req.index_file),
-            content: req.index,
-        })
-        .await;
+    for (name, content) in index_tasks {
+        let _ = state
+            .aux_index_tx
+            .send(AuxIndexTask {
+                project_id: SKILLS_PROJECT.to_string(),
+                path: std::path::PathBuf::from(name),
+                content,
+            })
+            .await;
+    }
 
     {
         let mut catalog = state.skills_catalog.write().await;
@@ -719,20 +782,42 @@ async fn skill_put(State(state): State<AppState>, Json(req): Json<SkillPutReques
 
 async fn skill_delete(State(state): State<AppState>, Query(query): Query<PathQuery>) -> Response {
     let path = query.path.clone();
-    match state.files.read().await.delete_skill_file(&path).await {
-        Ok(_) => {
-            let _ = state
-                .skill_delete_tx
-                .send(SkillDeleteTask {
-                    path: std::path::PathBuf::from(&path),
-                })
-                .await;
-            let mut catalog = state.skills_catalog.write().await;
-            catalog.retain(|r| r.skill_file != path);
-            StatusCode::OK.into_response()
+    let stem = match path.strip_suffix(".md") {
+        Some(s) => s.to_string(),
+        None => {
+            return (StatusCode::BAD_REQUEST, "skill_file must end with .md").into_response();
         }
-        Err(e) => io_error_response(e),
+    };
+
+    if let Err(e) = state.files.read().await.delete_skill_file(&path).await {
+        return io_error_response(e);
     }
+
+    let removed_indexes = state
+        .files
+        .read()
+        .await
+        .delete_index_files(&stem)
+        .await
+        .unwrap_or_default();
+
+    let mut paths_to_delete: Vec<std::path::PathBuf> = vec![std::path::PathBuf::from(&path)];
+    for name in removed_indexes {
+        paths_to_delete.push(std::path::PathBuf::from(name));
+    }
+
+    let _ = state
+        .aux_delete_tx
+        .send(AuxDeleteTask {
+            project_id: SKILLS_PROJECT.to_string(),
+            paths: paths_to_delete,
+        })
+        .await;
+
+    let mut catalog = state.skills_catalog.write().await;
+    catalog.retain(|r| r.skill_file != path);
+
+    StatusCode::OK.into_response()
 }
 
 async fn skill_list(State(state): State<AppState>) -> Response {
@@ -748,6 +833,33 @@ async fn skill_search(State(state): State<AppState>, Query(query): Query<SearchQ
             project_id: Some(SKILLS_PROJECT.to_string()),
             query: query.query.clone(),
             top_k: query.top_k,
+            sync_first: true,
+            response_tx: tx,
+        })
+        .await
+        .is_err()
+    {
+        return (StatusCode::SERVICE_UNAVAILABLE, "Search queue closed").into_response();
+    }
+    match rx.await {
+        Ok(Ok(results)) => Json(results).into_response(),
+        Ok(Err(e)) => io_error_response(e),
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Search task cancelled").into_response(),
+    }
+}
+
+async fn knowledge_search(
+    State(state): State<AppState>,
+    Query(query): Query<SearchQuery>,
+) -> Response {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    if state
+        .search_tx
+        .send(SearchTask {
+            project_id: Some(KNOWLEDGE_PROJECT.to_string()),
+            query: query.query.clone(),
+            top_k: query.top_k,
+            sync_first: true,
             response_tx: tx,
         })
         .await
@@ -925,7 +1037,7 @@ async fn scan_skills_catalog(skills_root: &std::path::Path) -> Vec<SkillRecord> 
     };
     while let Ok(Some(entry)) = dir.next_entry().await {
         let name = entry.file_name().to_string_lossy().to_string();
-        if !name.ends_with(".txt") || name.ends_with("_index.txt") {
+        if !name.ends_with(".md") {
             continue;
         }
         let content = match tokio::fs::read_to_string(entry.path()).await {
@@ -1044,6 +1156,15 @@ async fn knowledge_put(
         }
     }
 
+    let _ = state
+        .aux_index_tx
+        .send(AuxIndexTask {
+            project_id: KNOWLEDGE_PROJECT.to_string(),
+            path: std::path::PathBuf::from(format!("{}.md", query.name)),
+            content: body,
+        })
+        .await;
+
     let new_catalog = {
         let files = state.files.read().await;
         scan_knowledge_catalog(&files.root).await
@@ -1064,6 +1185,14 @@ async fn knowledge_delete(
             Err(e) => return io_error_response(e),
         }
     }
+
+    let _ = state
+        .aux_delete_tx
+        .send(AuxDeleteTask {
+            project_id: KNOWLEDGE_PROJECT.to_string(),
+            paths: vec![std::path::PathBuf::from(format!("{}.md", query.name))],
+        })
+        .await;
 
     let new_catalog = {
         let files = state.files.read().await;
@@ -1092,8 +1221,9 @@ pub async fn run_server(
 
     let (search_tx, mut search_rx) = mpsc::channel::<SearchTask>(100);
     let (index_tx, mut index_rx) = mpsc::channel::<IndexTask>(100);
-    let (skill_index_tx, mut skill_index_rx) = mpsc::channel::<SkillIndexTask>(100);
-    let (skill_delete_tx, mut skill_delete_rx) = mpsc::channel::<SkillDeleteTask>(100);
+    let (aux_index_tx, mut aux_index_rx) = mpsc::channel::<AuxIndexTask>(100);
+    let (aux_delete_tx, mut aux_delete_rx) = mpsc::channel::<AuxDeleteTask>(100);
+    let (sync_tx, mut sync_rx) = mpsc::channel::<SyncTask>(16);
 
     let vector_db_config_clone = vector_db_config.clone();
     let storage_name = config.storage_name.clone();
@@ -1113,7 +1243,12 @@ pub async fn run_server(
         rt.block_on(async move {
             loop {
                 tokio::select! {
-                    Some(task) = search_rx.recv() => {
+                                        Some(task) = search_rx.recv() => {
+                        if task.sync_first {
+                            if let Err(e) = storage.sync_index() {
+                                eprintln!("⚠️ sync_index перед поиском: {}", e);
+                            }
+                        }
                         let result = storage.search_similar(
                             task.project_id.as_deref(),
                             &task.query,
@@ -1130,19 +1265,39 @@ pub async fn run_server(
                             eprintln!("⚠️ Indexing failed for {:?}: {}", task.path, e);
                         }
                     }
-                    Some(task) = skill_index_rx.recv() => {
-                        if let Err(e) = storage.create_skill_file(
-                            &task.path.to_string_lossy(),
-                            &task.content,
-                        ) {
-                            eprintln!("⚠️ Skill indexing failed for {:?}: {}", task.path, e);
+                    Some(task) = aux_index_rx.recv() => {
+                        let res = match task.project_id.as_str() {
+                            SKILLS_PROJECT => storage
+                                .create_skill_file(&task.path.to_string_lossy(), &task.content),
+                            KNOWLEDGE_PROJECT => storage
+                                .index_knowledge_file(&task.path.to_string_lossy(), &task.content),
+                            other => {
+                                eprintln!("⚠️ aux_index: неизвестный project_id '{}'", other);
+                                continue;
+                            }
+                        };
+                        if let Err(e) = res {
+                            eprintln!("⚠️ Aux indexing failed for {:?}: {}", task.path, e);
                         }
                     }
-                    Some(task) = skill_delete_rx.recv() => {
-                        if let Err(e) = storage.delete_skill_index(
-                            &task.path.to_string_lossy(),
-                        ) {
-                            eprintln!("⚠️ Skill deindex failed for {:?}: {}", task.path, e);
+                    Some(task) = aux_delete_rx.recv() => {
+                        for path in &task.paths {
+                            let res = match task.project_id.as_str() {
+                                SKILLS_PROJECT => storage.delete_skill_index(&path.to_string_lossy()),
+                                KNOWLEDGE_PROJECT => storage.delete_knowledge_index(&path.to_string_lossy()),
+                                other => {
+                                    eprintln!("⚠️ aux_delete: неизвестный project_id '{}'", other);
+                                    continue;
+                                }
+                            };
+                            if let Err(e) = res {
+                                eprintln!("⚠️ Aux deindex failed for {:?}: {}", path, e);
+                            }
+                        }
+                    }
+                    Some(_) = sync_rx.recv() => {
+                        if let Err(e) = storage.sync_index() {
+                            eprintln!("⚠️ Периодический sync_index: {}", e);
                         }
                     }
                     else => break,
@@ -1151,12 +1306,26 @@ pub async fn run_server(
         });
     });
 
+    {
+        let sync_tx_bg = sync_tx.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                if sync_tx_bg.send(SyncTask).await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
+
     let state = AppState {
         files,
         search_tx,
         index_tx,
-        skill_index_tx,
-        skill_delete_tx,
+        aux_index_tx,
+        aux_delete_tx,
         knowledge_catalog,
         skills_catalog,
         auth_token: config.auth_token,
@@ -1186,6 +1355,7 @@ pub async fn run_server(
         .route("/knowledge/get", get(knowledge_get))
         .route("/knowledge/put", post(knowledge_put))
         .route("/knowledge/delete", post(knowledge_delete))
+        .route("/knowledge/search", get(knowledge_search))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,

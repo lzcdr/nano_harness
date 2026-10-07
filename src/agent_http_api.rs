@@ -141,16 +141,6 @@ async fn load_or_create_engine(
         .clone()
         .unwrap_or_else(|| "Вы - полезный ассистент.".to_string());
 
-    let knowledge_catalog = crate::knowledge_manager::list_knowledge(
-        &context.http_client,
-        &context.storage_base_url,
-        &context.storage_auth_token,
-    )
-    .await
-    .unwrap_or_default();
-
-    let knowledge_block = crate::knowledge_manager::build_catalog_prompt(&knowledge_catalog);
-
     let rebuke = crate::rebuke_manager::load_rebuke(
         &context.http_client,
         &context.storage_base_url,
@@ -160,14 +150,7 @@ async fn load_or_create_engine(
     .await
     .unwrap_or_default();
 
-    let mut system_prompt = base_prompt;
-
-    if !knowledge_block.is_empty() {
-        system_prompt.push_str("\n\n");
-        system_prompt.push_str(&knowledge_block);
-    }
-
-    let system_prompt = crate::rebuke_manager::build_system_with_rebuke(&system_prompt, &rebuke);
+    let system_prompt = crate::rebuke_manager::build_system_with_rebuke(&base_prompt, &rebuke);
 
     if let Some(ref session) = store_session {
         if let Some(ctx) = &session.context {
