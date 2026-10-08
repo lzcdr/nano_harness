@@ -46,6 +46,12 @@ pub struct TomlConfig {
     pub skill_search_threshold: Option<f32>,
     pub skill_min_hits: Option<usize>,
 
+    pub tools_search_top_n: Option<usize>,
+    pub tools_search_phrase_min_words: Option<usize>,
+    pub tools_search_threshold: Option<f32>,
+    pub tools_search_slots: Option<usize>,
+    pub tools_search_min_score: Option<f32>,
+
     // Глобальный таймаут Rhai для CLI (чата), секунды
     pub rhai_timeout_sec: Option<u64>,
 

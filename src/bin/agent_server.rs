@@ -43,6 +43,10 @@ async fn main() -> anyhow::Result<()> {
         agent_config.max_cost_rub = config.max_cost_rub;
     }
 
+    if agent_config.vector_db_top_k.is_none() {
+        agent_config.vector_db_top_k = config.vector_db.as_ref().map(|v| v.top_k);
+    }
+
     if agent_config.auth_token.is_empty() {
         let key = format!(
             "AGENT_{}_AUTH_TOKEN",

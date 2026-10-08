@@ -19,6 +19,7 @@ use tokio::sync::{mpsc, RwLock};
 use crate::knowledge_manager::KnowledgeEntry;
 use crate::local_storage::{
     valid_project_id, LocalStorage, VectorDbConfig, KNOWLEDGE_PROJECT, SKILLS_PROJECT,
+    TOOLS_PROJECT,
 };
 use crate::skill_manager::SkillRecord;
 
@@ -848,6 +849,29 @@ async fn skill_search(State(state): State<AppState>, Query(query): Query<SearchQ
     }
 }
 
+async fn tool_search(State(state): State<AppState>, Query(query): Query<SearchQuery>) -> Response {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    if state
+        .search_tx
+        .send(SearchTask {
+            project_id: Some(TOOLS_PROJECT.to_string()),
+            query: query.query.clone(),
+            top_k: query.top_k,
+            sync_first: true,
+            response_tx: tx,
+        })
+        .await
+        .is_err()
+    {
+        return (StatusCode::SERVICE_UNAVAILABLE, "Search queue closed").into_response();
+    }
+    match rx.await {
+        Ok(Ok(results)) => Json(results).into_response(),
+        Ok(Err(e)) => io_error_response(e),
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Search task cancelled").into_response(),
+    }
+}
+
 async fn knowledge_search(
     State(state): State<AppState>,
     Query(query): Query<SearchQuery>,
@@ -1241,9 +1265,24 @@ pub async fn run_server(
             .build()
             .expect("Failed to build runtime");
         rt.block_on(async move {
+            // Пересобрать .tools/ из inventory.
+            if let Err(e) = storage.clear_tools_dir() {
+                eprintln!("⚠️ clear_tools_dir: {}", e);
+            }
+            let tools = crate::tool_runtime::all();
+            let total = tools.len();
+            for tool in tools {
+                let name = tool.name();
+                let content = format!("{} {}", name, tool.description());
+                if let Err(e) = storage.write_tool_file(name, &content) {
+                    eprintln!("⚠️ write_tool_file {}: {}", name, e);
+                }
+            }
+            eprintln!("🔧 .tools/ пересобран: {} тулзов", total);
+
             loop {
                 tokio::select! {
-                                        Some(task) = search_rx.recv() => {
+                    Some(task) = search_rx.recv() => {
                         if task.sync_first {
                             if let Err(e) = storage.sync_index() {
                                 eprintln!("⚠️ sync_index перед поиском: {}", e);
@@ -1349,6 +1388,7 @@ pub async fn run_server(
         .route("/skills/list", get(skill_list))
         .route("/skills/search", get(skill_search))
         .route("/skills/record_usage", post(skill_record_usage))
+        .route("/tools/search", get(tool_search))
         .route("/rebukes/get", get(rebuke_get))
         .route("/rebukes/put", post(rebuke_put))
         .route("/knowledge/list", get(knowledge_list))

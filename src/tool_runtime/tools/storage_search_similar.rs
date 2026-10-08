@@ -17,7 +17,9 @@ impl ToolImpl for StorageSearchSimilar {
     }
 
     fn description(&self) -> &'static str {
-        "Семантический поиск файлов по смыслу запроса. Возвращает JSON-массив \
+        "Семантический поиск файлов. \
+         Находит похожие файлы, похожие по смыслу на запрос. \
+         Возвращает JSON-массив \
          объектов {file_path, chunk_index, distance, content_fragment, project_id}, \
          отсортированный по возрастанию distance (меньше — ближе)."
     }
