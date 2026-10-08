@@ -326,6 +326,7 @@ pub fn search_best_skill(
     phrase_min_words: usize,
     threshold: f32,
     min_hits: usize,
+    per_query_top_k: usize,
 ) -> Result<Option<(SkillRecord, f32)>> {
     let catalog = list_skills(client, base_url, auth_token)?;
     if catalog.is_empty() {
@@ -342,9 +343,6 @@ pub fn search_best_skill(
 
     let mut hits: HashMap<String, HashSet<String>> = HashMap::new();
     let mut min_dist: HashMap<String, f32> = HashMap::new();
-
-    // top_k для одного запроса: с запасом покрыть все индексные чанки.
-    let per_query_top_k = 100usize;
 
     for phrase in &query_phrases {
         let resp = client

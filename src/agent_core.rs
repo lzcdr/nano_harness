@@ -16,6 +16,7 @@ use tokio::time::timeout;
 
 use crate::engine::{ChatEngine, EngineConfig, Role};
 use crate::knowledge_auto::{build_knowledge_context, KnowledgeAutoConfig};
+use crate::tool_search::{select_tools, ToolsSearchConfig};
 
 pub struct PendingCall {
     pub tx: tokio::sync::oneshot::Sender<String>,
@@ -99,6 +100,18 @@ pub struct AgentConfig {
     pub skill_search_threshold: Option<f32>,
     #[serde(default)]
     pub skill_min_hits: Option<usize>,
+    #[serde(default)]
+    pub vector_db_top_k: Option<usize>,
+    #[serde(default)]
+    pub tools_search_top_n: Option<usize>,
+    #[serde(default)]
+    pub tools_search_phrase_min_words: Option<usize>,
+    #[serde(default)]
+    pub tools_search_threshold: Option<f32>,
+    #[serde(default)]
+    pub tools_search_slots: Option<usize>,
+    #[serde(default)]
+    pub tools_search_min_score: Option<f32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -248,7 +261,11 @@ pub fn create_agent_engine(config: &AgentConfig) -> Result<ChatEngine> {
         .timeout(Duration::from_secs(config.timeout_sec))
         .build()
         .context("Failed to create HTTP client")?;
-    Ok(ChatEngine::new(engine_config, client))
+    let mut engine = ChatEngine::new(engine_config, client);
+    engine.on_tool_call_token = Some(Box::new(|s| {
+        eprint!("{}", s);
+    }));
+    Ok(engine)
 }
 
 fn tool_context_for_agent(
@@ -307,6 +324,7 @@ pub async fn process_agent_turns(
         let phrase_min_words = config.skill_phrase_min_words.unwrap_or(2);
         let threshold = config.skill_search_threshold.unwrap_or(0.45);
         let min_hits = config.skill_min_hits.unwrap_or(3);
+        let per_query_top_k = config.vector_db_top_k.unwrap_or(5);
 
         let skill_result = tokio::task::spawn_blocking(
             move || -> Result<Option<(crate::skill_manager::SkillRecord, f32)>> {
@@ -321,6 +339,7 @@ pub async fn process_agent_turns(
                     phrase_min_words,
                     threshold,
                     min_hits,
+                    per_query_top_k,
                 )
             },
         )
@@ -368,7 +387,7 @@ pub async fn process_agent_turns(
             top_n: config.knowledge_auto_top_n.unwrap_or(7),
             top_k: config.knowledge_auto_top_k.unwrap_or(3),
             threshold: config.knowledge_auto_threshold.unwrap_or(0.70),
-            per_phrase: 5,
+            per_phrase: config.vector_db_top_k.unwrap_or(5),
         };
         let turn_text = if !request.prompt.trim().is_empty() {
             Some(request.prompt.clone())
@@ -422,8 +441,69 @@ pub async fn process_agent_turns(
         }
     }
 
+    // ==================== Выбор тулзов под текущий ход ====================
+    {
+        let current_slots: Vec<String> = engine
+            .visible_tools()
+            .map(|s| s.to_vec())
+            .unwrap_or_default();
+        let allowed = config.tools.clone();
+        let prompt = request.prompt.clone();
+
+        if !prompt.trim().is_empty() {
+            let storage_base_url = context.storage_base_url.clone();
+            let storage_auth_token = context.storage_auth_token.clone();
+            let cfg = ToolsSearchConfig {
+                top_n: config.tools_search_top_n.unwrap_or(7),
+                phrase_min_words: config.tools_search_phrase_min_words.unwrap_or(2),
+                threshold: config.tools_search_threshold.unwrap_or(0.45),
+                slots: config.tools_search_slots.unwrap_or(4),
+                min_score: config.tools_search_min_score.unwrap_or(0.20),
+                per_query_top_k: config.vector_db_top_k.unwrap_or(5),
+            };
+
+            let selection = tokio::task::spawn_blocking(move || {
+                let client = reqwest::blocking::Client::new();
+                select_tools(
+                    &client,
+                    &storage_base_url,
+                    &storage_auth_token,
+                    &prompt,
+                    &current_slots,
+                    &allowed,
+                    &cfg,
+                )
+            })
+            .await;
+
+            match selection {
+                Ok(Ok(names)) if !names.is_empty() => {
+                    write_log(log_file, "visible_tools", &format!("{:?}", names))?;
+                    eprintln!("🔧 visible_tools (agent {}): {:?}", config.name, names);
+                    engine.set_visible_tools(names);
+                }
+                Ok(Ok(_)) => {
+                    eprintln!(
+                        "🔧 visible_tools (agent {}): пусто — слоты не трогаем",
+                        config.name
+                    );
+                }
+                Ok(Err(e)) => {
+                    eprintln!("⚠️ select_tools (agent {}) failed: {:#}", config.name, e);
+                }
+                Err(e) => {
+                    eprintln!(
+                        "⚠️ select_tools (agent {}) join error: {:#}",
+                        config.name, e
+                    );
+                }
+            }
+        }
+    }
+
     // ==================== Цикл LLM ====================
     for _ in 0..=max_iterations {
+        eprint!("💭 ");
         let response = timeout(Duration::from_secs(config.timeout_sec), engine.send())
             .await
             .map_err(|_| anyhow::anyhow!("Agent timed out"))??;
@@ -432,9 +512,7 @@ pub async fn process_agent_turns(
         if has_tool_calls {
             let tool_calls = response.tool_calls.clone().unwrap();
 
-            eprintln!("⚠️ Модель запросила инструменты:");
             for tc in &tool_calls {
-                eprintln!("   - {} ({})", tc.function.name, tc.function.arguments);
                 write_log(
                     log_file,
                     "tool_request",
@@ -774,6 +852,12 @@ mod tests {
             skill_phrase_min_words: None,
             skill_search_threshold: None,
             skill_min_hits: None,
+            vector_db_top_k: None,
+            tools_search_top_n: None,
+            tools_search_phrase_min_words: None,
+            tools_search_threshold: None,
+            tools_search_slots: None,
+            tools_search_min_score: None,
         }
     }
 

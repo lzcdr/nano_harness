@@ -25,6 +25,7 @@ use nano_harness::local_storage_http_api::LocalStorageServerConfig;
 use nano_harness::message_board::BoardEvent;
 use nano_harness::rebuke_manager;
 use nano_harness::session_store::{self, ContextBlock, Session};
+use nano_harness::tool_search::{select_tools, ToolsSearchConfig};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "CLI чат с Polza AI")]
@@ -113,6 +114,8 @@ struct ReplyContext {
     board_url: String,
     board_token: String,
     knowledge_auto: Arc<KnowledgeAutoConfig>,
+    tools_search: Arc<ToolsSearchConfig>,
+    allowed_tools_chat: Arc<Vec<String>>,
 }
 
 // ==================== Утилиты ====================
@@ -307,6 +310,10 @@ fn open_project(
     }));
     engine.on_reasoning_token = Some(Box::new(|token| {
         print!("\x1b[90m{}\x1b[0m", token);
+        let _ = io::stdout().flush();
+    }));
+    engine.on_tool_call_token = Some(Box::new(|s| {
+        print!("\x1b[36m{}\x1b[0m", s);
         let _ = io::stdout().flush();
     }));
 
@@ -574,7 +581,49 @@ async fn continue_chat_turn(shared: &SharedChat, ctx: &ReplyContext) {
         }
     }
 
+    // ==================== Выбор тулзов ====================
+    {
+        let (current_slots, prompt) = {
+            let rt = shared.lock().await;
+            let slots = rt
+                .engine
+                .visible_tools()
+                .map(|s| s.to_vec())
+                .unwrap_or_default();
+            let prompt = rt.engine.pending_turn_text().unwrap_or_default();
+            (slots, prompt)
+        };
+        let allowed = ctx.allowed_tools_chat.clone();
+        let storage_url = ctx.storage_http_config.bind_addr.clone();
+        let token = ctx.storage_http_config.auth_token.clone();
+        let cfg = ctx.tools_search.clone();
+
+        let selection = tokio::task::spawn_blocking(move || {
+            let client = reqwest::blocking::Client::new();
+            select_tools(
+                &client,
+                &storage_url,
+                &token,
+                &prompt,
+                &current_slots,
+                &allowed,
+                &cfg,
+            )
+        })
+        .await;
+
+        match selection {
+            Ok(Ok(names)) if !names.is_empty() => {
+                let mut rt = shared.lock().await;
+                rt.engine.set_visible_tools(names);
+            }
+            _ => {}
+        }
+    }
+
     for _ in 0..=MAX_ITER {
+        print!("💭 ");
+        let _ = io::stdout().flush();
         let response = {
             let mut rt = shared.lock().await;
             match rt.engine.send().await {
@@ -921,6 +970,21 @@ async fn main() -> Result<()> {
         per_phrase: toml_config.vector_db.as_ref().map(|v| v.top_k).unwrap_or(5),
     };
 
+    let tools_search_cfg = ToolsSearchConfig {
+        top_n: toml_config.tools_search_top_n.unwrap_or(7),
+        phrase_min_words: toml_config.tools_search_phrase_min_words.unwrap_or(2),
+        threshold: toml_config.tools_search_threshold.unwrap_or(0.45),
+        slots: toml_config.tools_search_slots.unwrap_or(4),
+        min_score: toml_config.tools_search_min_score.unwrap_or(0.20),
+        per_query_top_k: toml_config.vector_db.as_ref().map(|v| v.top_k).unwrap_or(5),
+    };
+
+    let allowed_tools_chat: Vec<String> = toml_config
+        .tools
+        .as_ref()
+        .map(|v| v.iter().map(|t| t.name.clone()).collect())
+        .unwrap_or_default();
+
     let reply_ctx = Arc::new(ReplyContext {
         engine_config: Arc::new(engine_config.clone()),
         client: client.clone(),
@@ -929,6 +993,8 @@ async fn main() -> Result<()> {
         board_url: board_url.clone(),
         board_token: board_token.clone(),
         knowledge_auto: Arc::new(knowledge_auto_cfg),
+        tools_search: Arc::new(tools_search_cfg),
+        allowed_tools_chat: Arc::new(allowed_tools_chat),
     });
 
     {
@@ -1813,6 +1879,7 @@ async fn main() -> Result<()> {
             let phrase_min_words = toml_config.skill_phrase_min_words.unwrap_or(2);
             let threshold = toml_config.skill_search_threshold.unwrap_or(0.45);
             let min_hits = toml_config.skill_min_hits.unwrap_or(3);
+            let per_query_top_k = toml_config.vector_db.as_ref().map(|v| v.top_k).unwrap_or(5);
 
             let skill_result = tokio::task::spawn_blocking(
                 move || -> anyhow::Result<Option<(nano_harness::skill_manager::SkillRecord, f32)>> {
@@ -1827,6 +1894,7 @@ async fn main() -> Result<()> {
                         phrase_min_words,
                         threshold,
                         min_hits,
+                        per_query_top_k,
                     )
                 },
             )
@@ -1888,9 +1956,58 @@ async fn main() -> Result<()> {
             }
         }
 
+        // ==================== Выбор тулзов под текущий ход ====================
+        {
+            let current_slots: Vec<String> = {
+                let rt = shared.lock().await;
+                rt.engine
+                    .visible_tools()
+                    .map(|s| s.to_vec())
+                    .unwrap_or_default()
+            };
+            let allowed = reply_ctx.allowed_tools_chat.clone();
+            let prompt = user_input.to_string();
+            let storage_url = reply_ctx.storage_http_config.bind_addr.clone();
+            let token = reply_ctx.storage_http_config.auth_token.clone();
+            let cfg = reply_ctx.tools_search.clone();
+
+            let selection = tokio::task::spawn_blocking(move || {
+                let client = reqwest::blocking::Client::new();
+                select_tools(
+                    &client,
+                    &storage_url,
+                    &token,
+                    &prompt,
+                    &current_slots,
+                    &allowed,
+                    &cfg,
+                )
+            })
+            .await;
+
+            match selection {
+                Ok(Ok(names)) if !names.is_empty() => {
+                    eprintln!("🔧 visible_tools: {:?}", names);
+                    let mut rt = shared.lock().await;
+                    rt.engine.set_visible_tools(names);
+                }
+                Ok(Ok(_)) => {
+                    eprintln!("🔧 visible_tools: пусто — слоты не трогаем");
+                }
+                Ok(Err(e)) => {
+                    eprintln!("⚠️ select_tools failed: {:#}", e);
+                }
+                Err(e) => {
+                    eprintln!("⚠️ select_tools join error: {:#}", e);
+                }
+            }
+        }
+
         let allowed = engine_config.allowed_tools.clone();
 
         for _iter in 0..=max_iterations {
+            print!("💭 ");
+            let _ = io::stdout().flush();
             let response = {
                 let mut rt = shared.lock().await;
                 match rt.engine.send().await {
@@ -1931,11 +2048,9 @@ async fn main() -> Result<()> {
                 _ => break,
             };
 
-            println!("\n⚠️ Модель запросила инструменты:");
             {
                 let mut rt = shared.lock().await;
                 for tc in &tool_calls {
-                    println!("   - {} ({})", tc.function.name, tc.function.arguments);
                     write_log(
                         &mut rt.log_file,
                         "tool_request",

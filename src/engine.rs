@@ -202,6 +202,9 @@ pub struct ChatEngine {
     skill_context: Option<Message>,
     /// Отдельный слот под загруженное знание. Не копится, перезаписывается.
     knowledge_context: Option<Message>,
+    /// Набор имён тулзов, отдаваемых LLM в текущем ходу. Не сохраняется
+    /// в EngineState — заполняется снаружи (select_tools) перед каждым send.
+    visible_tools: Option<Vec<String>>,
     prefix_turns: Vec<Turn>,
     tail_turns: Vec<Turn>,
     pending_turn: Option<Turn>,
@@ -209,6 +212,7 @@ pub struct ChatEngine {
     pub metrics: SessionMetrics,
     pub on_token: Option<Box<dyn Fn(&str) + Send + Sync>>,
     pub on_reasoning_token: Option<Box<dyn Fn(&str) + Send + Sync>>,
+    pub on_tool_call_token: Option<Box<dyn Fn(&str) + Send + Sync>>,
 }
 
 impl ChatEngine {
@@ -218,6 +222,7 @@ impl ChatEngine {
             system_messages: Vec::new(),
             skill_context: None,
             knowledge_context: None,
+            visible_tools: None,
             prefix_turns: Vec::new(),
             tail_turns: Vec::new(),
             pending_turn: None,
@@ -225,6 +230,7 @@ impl ChatEngine {
             metrics: SessionMetrics::default(),
             on_token: None,
             on_reasoning_token: None,
+            on_tool_call_token: None,
         }
     }
 
@@ -290,6 +296,14 @@ impl ChatEngine {
         self.knowledge_context.is_some()
     }
 
+    pub fn set_visible_tools(&mut self, names: Vec<String>) {
+        self.visible_tools = Some(names);
+    }
+
+    pub fn visible_tools(&self) -> Option<&[String]> {
+        self.visible_tools.as_deref()
+    }
+
     /// Текст текущего хода: сообщения `User` и `Assistant` из `pending_turn`.
     /// Возвращает None, если ход пуст или содержит только tool-сообщения.
     pub fn pending_turn_text(&self) -> Option<String> {
@@ -321,6 +335,7 @@ impl ChatEngine {
         self.pending_turn = None;
         self.skill_context = None;
         self.knowledge_context = None;
+        self.visible_tools = None;
     }
 
     pub fn set_system_prompt(&mut self, prompt: String) {
@@ -652,16 +667,23 @@ impl ChatEngine {
             req["stop"] = serde_json::json!(stop);
         }
 
-        if let Some(allowed) = &self.config.allowed_tools {
-            let names: Vec<String> = allowed.iter().map(|a| a.name.clone()).collect();
-            let filtered: Vec<ToolDefinition> = crate::tool_runtime::available_tools(Some(&names));
-            if !filtered.is_empty() {
+        // visible_tools задаёт снаружи точный набор тулзов на текущий ход.
+        // None — тулзы не отправляются вовсе (пустой tools: []).
+        // Some(names) — отправляются только они, пересечённые с реально
+        // зарегистрированными в inventory.
+        match &self.visible_tools {
+            Some(names) => {
+                let filtered: Vec<ToolDefinition> =
+                    crate::tool_runtime::available_tools(Some(names));
                 req["tools"] = serde_json::to_value(filtered).unwrap();
                 if let Some(choice) = &self.config.tool_choice {
                     req["tool_choice"] = choice.clone();
                 } else {
                     req["tool_choice"] = serde_json::json!("auto");
                 }
+            }
+            None => {
+                req["tools"] = serde_json::json!([]);
             }
         }
 
@@ -764,6 +786,11 @@ impl ChatEngine {
         let mut tool_calls_accumulator: HashMap<u32, StreamingToolCall> = HashMap::new();
         let mut final_usage: Option<Usage> = None;
 
+        let mut tool_header_printed = false;
+        let mut tool_open_index: Option<u32> = None;
+        let mut tool_printed_indexes: std::collections::HashSet<u32> =
+            std::collections::HashSet::new();
+
         while let Some(chunk) = byte_stream.next().await {
             let chunk = chunk?;
             buffer.push_str(&String::from_utf8_lossy(&chunk));
@@ -810,6 +837,13 @@ impl ChatEngine {
                                 }
                             }
                             if let Some(tc_stream) = delta.tool_calls {
+                                if !tool_header_printed {
+                                    if let Some(ref cb) = self.on_tool_call_token {
+                                        cb("⚠️ Модель запросила инструменты:\n");
+                                    }
+                                    tool_header_printed = true;
+                                }
+
                                 for tc in tc_stream {
                                     let entry = tool_calls_accumulator
                                         .entry(tc.index)
@@ -832,11 +866,33 @@ impl ChatEngine {
                                             entry.name.push_str(&name);
                                         }
                                     }
+
                                     if let Some(args) =
                                         tc.function.as_ref().and_then(|f| f.arguments.clone())
                                     {
                                         if !args.is_empty() {
+                                            // Открываем строку для нового index — только
+                                            // когда у нас уже есть имя и пошли аргументы.
+                                            if !tool_printed_indexes.contains(&tc.index) {
+                                                if let Some(prev) = tool_open_index {
+                                                    if prev != tc.index {
+                                                        if let Some(ref cb) =
+                                                            self.on_tool_call_token
+                                                        {
+                                                            cb(")\n");
+                                                        }
+                                                    }
+                                                }
+                                                tool_open_index = Some(tc.index);
+                                                if let Some(ref cb) = self.on_tool_call_token {
+                                                    cb(&format!("   - {} (", entry.name));
+                                                }
+                                                tool_printed_indexes.insert(tc.index);
+                                            }
                                             entry.arguments.push_str(&args);
+                                            if let Some(ref cb) = self.on_tool_call_token {
+                                                cb(&args);
+                                            }
                                         }
                                     }
                                 }
@@ -847,6 +903,12 @@ impl ChatEngine {
             }
             if done {
                 break;
+            }
+        }
+
+        if tool_open_index.is_some() {
+            if let Some(ref cb) = self.on_tool_call_token {
+                cb(")\n");
             }
         }
 

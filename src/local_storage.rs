@@ -23,10 +23,12 @@ const RESERVED_NAMES: &[&str] = &[
     ".skills",
     ".rebukes",
     ".knowledge",
+    ".tools",
     META_FILE,
 ];
 pub const SKILLS_PROJECT: &str = "_skills";
 pub const KNOWLEDGE_PROJECT: &str = "_knowledge";
+pub const TOOLS_PROJECT: &str = "_tools";
 const PROJECTS_DIR: &str = "projects";
 
 pub fn is_reserved_name(name: &str) -> bool {
@@ -353,6 +355,7 @@ impl VectorDb {
         let storage_rel = match project_id {
             SKILLS_PROJECT => Path::new(".skills").join(rel_path),
             KNOWLEDGE_PROJECT => Path::new(".knowledge").join(rel_path),
+            TOOLS_PROJECT => Path::new(".tools").join(rel_path),
             _ => Path::new(PROJECTS_DIR).join(project_id).join(rel_path),
         };
         let label_prefix = format!("{}#", storage_rel.to_string_lossy());
@@ -558,6 +561,24 @@ impl VectorDb {
                 }
                 if let Ok(content) = fs::read_to_string(&path) {
                     self.index_text(KNOWLEDGE_PROJECT, Path::new(&name), &content)?;
+                }
+            }
+        }
+
+        let tools_root = root.join(".tools");
+        if tools_root.exists() {
+            let mut files = Vec::new();
+            collect_files(&tools_root, &mut files)?;
+            for file in files {
+                let rel = match file.strip_prefix(&tools_root) {
+                    Ok(p) => p.to_path_buf(),
+                    Err(_) => continue,
+                };
+                if rel.as_os_str().is_empty() {
+                    continue;
+                }
+                if let Ok(content) = fs::read_to_string(&file) {
+                    self.index_text(TOOLS_PROJECT, &rel, &content)?;
                 }
             }
         }
@@ -843,6 +864,53 @@ impl LocalStorage {
         Ok(())
     }
 
+    /// Пишет `.tools/<name>.md` и индексирует содержимое как TOOLS_PROJECT.
+    pub fn write_tool_file(&mut self, name: &str, content: &str) -> io::Result<()> {
+        let dir = self.root.join(".tools");
+        if !dir.exists() {
+            fs::create_dir_all(&dir)?;
+        }
+        let filename = format!("{}.md", name);
+        let full_path = dir.join(&filename);
+        fs::write(&full_path, content)?;
+
+        let rel = Path::new(&filename);
+        self.vector_db.index_text(TOOLS_PROJECT, rel, content)?;
+        self.vector_db.save(&self.root)?;
+        Ok(())
+    }
+
+    /// Полностью сносит `.tools/` и все записи индекса, относящиеся к нему.
+    pub fn clear_tools_dir(&mut self) -> io::Result<()> {
+        let dir = self.root.join(".tools");
+        if dir.exists() {
+            fs::remove_dir_all(&dir)?;
+        }
+        fs::create_dir_all(&dir)?;
+
+        let prefix_unix = ".tools/";
+        let prefix_win = ".tools\\";
+        let old_labels: Vec<String> = self
+            .vector_db
+            .entries
+            .iter()
+            .filter(|(label, _)| label.starts_with(prefix_unix) || label.starts_with(prefix_win))
+            .map(|(label, _)| label.clone())
+            .collect();
+
+        for label in old_labels {
+            if let Some(id) = self.vector_db.label_to_id.remove(&label) {
+                self.vector_db.deleted_ids.insert(id);
+                self.vector_db.id_to_label.remove(&id);
+                self.vector_db.id_to_meta.remove(&id);
+            }
+            self.vector_db.entries.retain(|(l, _)| l != &label);
+        }
+
+        self.vector_db.save(&self.root)?;
+        Ok(())
+    }
+
     pub fn read_file(&self, project_id: &str, path: &str) -> io::Result<String> {
         fs::read_to_string(self.resolve(project_id, path)?)
     }
@@ -1056,6 +1124,7 @@ impl LocalStorage {
         match project_id {
             SKILLS_PROJECT => self.root.join(".skills").join(rel_path),
             KNOWLEDGE_PROJECT => self.root.join(".knowledge").join(rel_path),
+            TOOLS_PROJECT => self.root.join(".tools").join(rel_path),
             _ => self.root.join(PROJECTS_DIR).join(project_id).join(rel_path),
         }
     }
@@ -1127,6 +1196,25 @@ impl LocalStorage {
                     make_disk_entry(&path, KNOWLEDGE_PROJECT.to_string(), PathBuf::from(&name))
                 {
                     out.insert(storage_rel, disk_entry);
+                }
+            }
+        }
+
+        let tools_root = self.root.join(".tools");
+        if tools_root.exists() {
+            let mut files = Vec::new();
+            collect_files(&tools_root, &mut files)?;
+            for file in files {
+                let rel_path = match file.strip_prefix(&tools_root) {
+                    Ok(p) => p.to_path_buf(),
+                    Err(_) => continue,
+                };
+                if rel_path.as_os_str().is_empty() {
+                    continue;
+                }
+                let storage_rel = Path::new(".tools").join(&rel_path);
+                if let Some(entry) = make_disk_entry(&file, TOOLS_PROJECT.to_string(), rel_path) {
+                    out.insert(storage_rel, entry);
                 }
             }
         }
