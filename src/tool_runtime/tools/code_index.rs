@@ -845,8 +845,7 @@ impl ToolImpl for CodeIndex {
          экспорты с сигнатурами и комментариями, импорты с разделением на внешние \
          и внутренние, конфигурационные файлы. Полный индекс сохраняется в \
          CODE_INDEX.json в корне проекта. В ответ возвращается краткая сводка. \
-         Все пути в индексе относительны project_root. Для чтения файла используй \
-         storage_read_file('{project_root}/{path_from_index}')."
+         Все пути в индексе относительны project_root."
     }
 
     fn parameters(&self) -> Value {
@@ -1149,8 +1148,7 @@ impl ToolImpl for CodeIndex {
 
         let full_index = json!({
             "_description": "Индекс структуры проекта. Сгенерирован инструментом code_index. \
-                             Все пути относительны project_root. Для чтения файла используй \
-                             storage_read_file('{project_root}/{path}'). Содержит модули и файлы \
+                             Все пути относительны project_root. Содержит модули и файлы \
                              с метриками, экспорты с сигнатурами (для функций) и комментариями, \
                              импорты с разделением на внешние и внутренние, конфигурационные файлы.",
             "_generated_at": generated_at,
@@ -1223,8 +1221,7 @@ impl ToolImpl for CodeIndex {
 
         let summary = json!({
             "info": "Полный индекс записан в CODE_INDEX.json. Все пути в индексе \
-                     относительны project_root. Для чтения файла используй \
-                     storage_read_file('{project_root}/{path}').",
+                     относительны project_root.",
             "project_root": path,
             "generated_at": generated_at,
             "config_files": config_files,

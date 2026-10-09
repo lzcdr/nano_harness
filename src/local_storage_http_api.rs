@@ -1270,15 +1270,44 @@ pub async fn run_server(
                 eprintln!("⚠️ clear_tools_dir: {}", e);
             }
             let tools = crate::tool_runtime::all();
-            let total = tools.len();
+            let all_names: Vec<String> = tools.iter().map(|t| t.name().to_string()).collect();
+
+            let mut written = 0usize;
+            let mut skipped = 0usize;
+
             for tool in tools {
                 let name = tool.name();
-                let content = format!("{} {}", name, tool.description());
-                if let Err(e) = storage.write_tool_file(name, &content) {
-                    eprintln!("⚠️ write_tool_file {}: {}", name, e);
+                let desc = tool.description();
+
+                // Инвариант: описание тулза не должно упоминать имена других
+                // тулзов. Иначе модель видит это имя в описании доступного
+                // тулза, зовёт его, а в API-запросе его нет — провайдер
+                // падает с BAD_GATEWAY. См. README_tool_dev_roadmap.
+                let conflicts: Vec<&str> = all_names
+                    .iter()
+                    .filter(|other| other.as_str() != name && desc.contains(other.as_str()))
+                    .map(|s| s.as_str())
+                    .collect();
+
+                if !conflicts.is_empty() {
+                    eprintln!(
+                        "❌ Тулз '{}' невалиден: описание упоминает другие тулзы {:?}. Исключён из .tools/.",
+                        name, conflicts
+                    );
+                    skipped += 1;
+                    continue;
+                }
+
+                let content = format!("{} {}", name, desc);
+                match storage.write_tool_file(name, &content) {
+                    Ok(_) => written += 1,
+                    Err(e) => eprintln!("⚠️ write_tool_file {}: {}", name, e),
                 }
             }
-            eprintln!("🔧 .tools/ пересобран: {} тулзов", total);
+            eprintln!(
+                "🔧 .tools/ пересобран: {} записано, {} исключено",
+                written, skipped
+            );
 
             loop {
                 tokio::select! {

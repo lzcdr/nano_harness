@@ -543,7 +543,7 @@ async fn continue_chat_turn(shared: &SharedChat, ctx: &ReplyContext) {
     {
         let turn_text = {
             let rt = shared.lock().await;
-            rt.engine.pending_turn_text()
+            rt.engine.search_context_text_full()
         };
         if let Some(text) = turn_text {
             let storage_url = &ctx.storage_http_config.bind_addr;
@@ -583,15 +583,16 @@ async fn continue_chat_turn(shared: &SharedChat, ctx: &ReplyContext) {
 
     // ==================== Выбор тулзов ====================
     {
-        let (current_slots, prompt) = {
+        let (current_slots, prompt, mentioned) = {
             let rt = shared.lock().await;
             let slots = rt
                 .engine
                 .visible_tools()
                 .map(|s| s.to_vec())
                 .unwrap_or_default();
-            let prompt = rt.engine.pending_turn_text().unwrap_or_default();
-            (slots, prompt)
+            let prompt = rt.engine.search_context_text_short().unwrap_or_default();
+            let mentioned = rt.engine.mentioned_tools(&ctx.allowed_tools_chat);
+            (slots, prompt, mentioned)
         };
         let allowed = ctx.allowed_tools_chat.clone();
         let storage_url = ctx.storage_http_config.bind_addr.clone();
@@ -612,12 +613,20 @@ async fn continue_chat_turn(shared: &SharedChat, ctx: &ReplyContext) {
         })
         .await;
 
-        match selection {
-            Ok(Ok(names)) if !names.is_empty() => {
-                let mut rt = shared.lock().await;
-                rt.engine.set_visible_tools(names);
+        let mut final_names = match selection {
+            Ok(Ok(names)) => names,
+            _ => Vec::new(),
+        };
+
+        for name in mentioned {
+            if !final_names.contains(&name) {
+                final_names.push(name);
             }
-            _ => {}
+        }
+
+        if !final_names.is_empty() {
+            let mut rt = shared.lock().await;
+            rt.engine.set_visible_tools(final_names);
         }
     }
 
@@ -1830,7 +1839,7 @@ async fn main() -> Result<()> {
         {
             let turn_text = {
                 let rt = shared.lock().await;
-                rt.engine.pending_turn_text()
+                rt.engine.search_context_text_full()
             };
             if let Some(text) = turn_text {
                 let storage_url = &reply_ctx.storage_http_config.bind_addr;
@@ -1874,7 +1883,10 @@ async fn main() -> Result<()> {
         {
             let storage_url = reply_ctx.storage_http_config.bind_addr.clone();
             let token = reply_ctx.storage_http_config.auth_token.clone();
-            let prompt_for_skill = user_input.to_string();
+            let prompt_for_skill = {
+                let rt = shared.lock().await;
+                rt.engine.search_context_text_short().unwrap_or_default()
+            };
             let phrases_top_n = toml_config.skill_phrases_top_n.unwrap_or(15);
             let phrase_min_words = toml_config.skill_phrase_min_words.unwrap_or(2);
             let threshold = toml_config.skill_search_threshold.unwrap_or(0.45);
@@ -1958,15 +1970,18 @@ async fn main() -> Result<()> {
 
         // ==================== Выбор тулзов под текущий ход ====================
         {
-            let current_slots: Vec<String> = {
+            let (current_slots, prompt, mentioned) = {
                 let rt = shared.lock().await;
-                rt.engine
+                let slots = rt
+                    .engine
                     .visible_tools()
                     .map(|s| s.to_vec())
-                    .unwrap_or_default()
+                    .unwrap_or_default();
+                let prompt = rt.engine.search_context_text_short().unwrap_or_default();
+                let mentioned = rt.engine.mentioned_tools(&reply_ctx.allowed_tools_chat);
+                (slots, prompt, mentioned)
             };
             let allowed = reply_ctx.allowed_tools_chat.clone();
-            let prompt = user_input.to_string();
             let storage_url = reply_ctx.storage_http_config.bind_addr.clone();
             let token = reply_ctx.storage_http_config.auth_token.clone();
             let cfg = reply_ctx.tools_search.clone();
@@ -1985,21 +2000,30 @@ async fn main() -> Result<()> {
             })
             .await;
 
-            match selection {
-                Ok(Ok(names)) if !names.is_empty() => {
-                    eprintln!("🔧 visible_tools: {:?}", names);
-                    let mut rt = shared.lock().await;
-                    rt.engine.set_visible_tools(names);
-                }
-                Ok(Ok(_)) => {
-                    eprintln!("🔧 visible_tools: пусто — слоты не трогаем");
-                }
+            let mut final_names = match selection {
+                Ok(Ok(names)) => names,
                 Ok(Err(e)) => {
                     eprintln!("⚠️ select_tools failed: {:#}", e);
+                    Vec::new()
                 }
                 Err(e) => {
                     eprintln!("⚠️ select_tools join error: {:#}", e);
+                    Vec::new()
                 }
+            };
+
+            for name in mentioned {
+                if !final_names.contains(&name) {
+                    final_names.push(name);
+                }
+            }
+
+            if !final_names.is_empty() {
+                eprintln!("🔧 visible_tools: {:?}", final_names);
+                let mut rt = shared.lock().await;
+                rt.engine.set_visible_tools(final_names);
+            } else {
+                eprintln!("🔧 visible_tools: пусто — слоты не трогаем");
             }
         }
 
