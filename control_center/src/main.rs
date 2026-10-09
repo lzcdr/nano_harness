@@ -1,4 +1,4 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+//#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 // SPDX-FileCopyrightText: 2026 lzcdr
 //
@@ -24,9 +24,13 @@ fn spawn_service(svc: &ServiceDef) -> Result<Child, String> {
     use std::os::windows::process::CommandExt;
     const CREATE_NEW_CONSOLE: u32 = 0x00000010;
 
-    let mut parts: Vec<String> = vec![svc.cmd.clone()];
+    let mut parts: Vec<String> = vec![format!("\"{}\"", svc.cmd)];
     for a in &svc.args {
-        parts.push(a.clone());
+        if a.contains(' ') {
+            parts.push(format!("\"{}\"", a));
+        } else {
+            parts.push(a.clone());
+        }
     }
     let svc_line = parts.join(" ");
     let full = format!("title \"{}\"&& {}", svc.title, svc_line);
@@ -35,6 +39,12 @@ fn spawn_service(svc: &ServiceDef) -> Result<Child, String> {
     cmd.raw_arg("/c");
     cmd.raw_arg(&full);
     cmd.creation_flags(CREATE_NEW_CONSOLE);
+
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            cmd.current_dir(dir);
+        }
+    }
 
     eprintln!("[cmd] spawn cmd.exe /c {}", full);
     cmd.spawn().map_err(|e| format!("spawn cmd.exe: {}", e))
@@ -45,6 +55,13 @@ fn spawn_service(svc: &ServiceDef) -> Result<Child, String> {
     eprintln!("[cmd] spawn '{}' {:?}", svc.cmd, svc.args);
     let mut cmd = Command::new(&svc.cmd);
     cmd.args(&svc.args);
+
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            cmd.current_dir(dir);
+        }
+    }
+
     cmd.spawn()
         .map_err(|e| format!("spawn '{}': {}", svc.cmd, e))
 }
@@ -121,7 +138,34 @@ struct ServiceDef {
     args: Vec<String>,
 }
 
-fn cargo_run(bin: &str, extra: &[&str]) -> Vec<String> {
+/// Ищет собранный бинарь рядом с control_center. Если найден —
+/// возвращает (путь_к_бинарю, args). Иначе — ("cargo", cargo-run args).
+/// Так control_center работает и из cargo-проекта (dev), и из папки
+/// с готовыми .exe (prod).
+fn service_command(bin: &str, extra: &[&str]) -> (String, Vec<String>) {
+    let exe_name = if cfg!(target_os = "windows") {
+        format!("{}.exe", bin)
+    } else {
+        bin.to_string()
+    };
+
+    let mut search_dirs: Vec<PathBuf> = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            search_dirs.push(dir.to_path_buf());
+        }
+    }
+    search_dirs.push(PathBuf::from("."));
+
+    for dir in &search_dirs {
+        let candidate = dir.join(&exe_name);
+        if candidate.is_file() {
+            let args: Vec<String> = extra.iter().map(|s| (*s).to_string()).collect();
+            return (candidate.to_string_lossy().to_string(), args);
+        }
+    }
+
+    // Fallback: запуск через cargo run (для разработки).
     let mut args: Vec<String> = vec!["run".into()];
     if !cfg!(debug_assertions) {
         args.push("--release".into());
@@ -131,7 +175,7 @@ fn cargo_run(bin: &str, extra: &[&str]) -> Vec<String> {
     for e in extra {
         args.push((*e).into());
     }
-    args
+    ("cargo".into(), args)
 }
 
 fn build_services(cfg: &TomlConfig) -> Vec<ServiceDef> {
@@ -142,47 +186,57 @@ fn build_services(cfg: &TomlConfig) -> Vec<ServiceDef> {
         .as_ref()
         .map(|b| b.bind_addr.clone())
         .unwrap_or_else(|| "127.0.0.1:8090".into());
-    out.push(ServiceDef {
-        key: "board".into(),
-        label: "Message Board".into(),
-        bind: board_bind,
-        title: "Message Board".into(),
-        cmd: "cargo".into(),
-        args: cargo_run("message_board_server", &[]),
-    });
+    {
+        let (cmd, args) = service_command("message_board_server", &[]);
+        out.push(ServiceDef {
+            key: "board".into(),
+            label: "Message Board".into(),
+            bind: board_bind,
+            title: "Message Board".into(),
+            cmd,
+            args,
+        });
+    }
 
     let storage_bind = cfg
         .local_storage_http_server
         .as_ref()
         .map(|s| s.bind_addr.clone())
         .unwrap_or_else(|| "127.0.0.1:8080".into());
-    out.push(ServiceDef {
-        key: "storage".into(),
-        label: "Local Storage".into(),
-        bind: storage_bind,
-        title: "Local Storage".into(),
-        cmd: "cargo".into(),
-        args: cargo_run("local_storage_http_server", &[]),
-    });
+    {
+        let (cmd, args) = service_command("local_storage_http_server", &[]);
+        out.push(ServiceDef {
+            key: "storage".into(),
+            label: "Local Storage".into(),
+            bind: storage_bind,
+            title: "Local Storage".into(),
+            cmd,
+            args,
+        });
+    }
 
-    out.push(ServiceDef {
-        key: "chat".into(),
-        label: "Chat".into(),
-        bind: "—".into(),
-        title: "Chat".into(),
-        cmd: "cargo".into(),
-        args: cargo_run("nano_harness", &[]),
-    });
+    {
+        let (cmd, args) = service_command("nano_harness", &[]);
+        out.push(ServiceDef {
+            key: "chat".into(),
+            label: "Chat".into(),
+            bind: "—".into(),
+            title: "Chat".into(),
+            cmd,
+            args,
+        });
+    }
 
     for a in &cfg.agents {
         let display = format!("Agent {}", a.name);
+        let (cmd, args) = service_command("agent_server", &["--agent-name", a.name.as_str()]);
         out.push(ServiceDef {
             key: format!("agent:{}", a.name),
             label: display.clone(),
             bind: a.bind_addr.clone(),
             title: display,
-            cmd: "cargo".into(),
-            args: cargo_run("agent_server", &["--", "--agent-name", a.name.as_str()]),
+            cmd,
+            args,
         });
     }
 

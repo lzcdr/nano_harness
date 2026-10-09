@@ -104,11 +104,19 @@ pub async fn build_knowledge_context(
         ..Default::default()
     };
     let phrases = yake_extract(turn_text, &yake_cfg);
-    eprintln!(
-        "🔬 knowledge_auto: turn_text={:?}, yake_phrases={:?}",
-        turn_text,
-        phrases.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>()
-    );
+    {
+        let turn_preview = if turn_text.chars().count() > 120 {
+            let cut: String = turn_text.chars().take(120).collect();
+            format!("{}…", cut)
+        } else {
+            turn_text.to_string()
+        };
+        let phrases_preview: Vec<String> = phrases.iter().take(7).map(|(p, _)| p.clone()).collect();
+        eprintln!(
+            "🔬 knowledge_auto: turn_text={:?}, yake_phrases={:?}",
+            turn_preview, phrases_preview
+        );
+    }
     if phrases.is_empty() {
         return Ok(None);
     }
@@ -195,13 +203,14 @@ pub async fn build_knowledge_context(
         })
         .collect();
 
-    eprintln!(
-        "🔬 knowledge_auto: ranked={:?}",
-        ranked
+    {
+        let ranked_preview: Vec<String> = ranked
             .iter()
+            .take(7)
             .map(|(p, h, d)| format!("{} h={} d={:.3}", p, h, d))
-            .collect::<Vec<_>>()
-    );
+            .collect();
+        eprintln!("🔬 knowledge_auto: ranked={:?}", ranked_preview);
+    }
 
     if ranked.is_empty() {
         return Ok(None);
