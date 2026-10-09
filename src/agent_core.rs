@@ -315,11 +315,12 @@ pub async fn process_agent_turns(
     let skill_min_tool_calls = config.skill_min_tool_calls.unwrap_or(2);
 
     // ==================== Поиск и инжект скилла ====================
-    if skill_mode == "auto" && !request.prompt.trim().is_empty() {
+    let skill_prompt = engine.search_context_text_short().unwrap_or_default();
+    if skill_mode == "auto" && !skill_prompt.trim().is_empty() {
         let storage_base_url = context.storage_base_url.clone();
         let storage_auth_token = context.storage_auth_token.clone();
         let current_agent = config.name.clone();
-        let prompt = request.prompt.clone();
+        let prompt = skill_prompt;
         let phrases_top_n = config.skill_phrases_top_n.unwrap_or(15);
         let phrase_min_words = config.skill_phrase_min_words.unwrap_or(2);
         let threshold = config.skill_search_threshold.unwrap_or(0.45);
@@ -389,11 +390,7 @@ pub async fn process_agent_turns(
             threshold: config.knowledge_auto_threshold.unwrap_or(0.70),
             per_phrase: config.vector_db_top_k.unwrap_or(5),
         };
-        let turn_text = if !request.prompt.trim().is_empty() {
-            Some(request.prompt.clone())
-        } else {
-            engine.pending_turn_text()
-        };
+        let turn_text = engine.search_context_text_full();
 
         if let Some(text) = turn_text {
             match build_knowledge_context(
@@ -448,7 +445,8 @@ pub async fn process_agent_turns(
             .map(|s| s.to_vec())
             .unwrap_or_default();
         let allowed = config.tools.clone();
-        let prompt = request.prompt.clone();
+        let prompt = engine.search_context_text_short().unwrap_or_default();
+        let mentioned = engine.mentioned_tools(&allowed);
 
         if !prompt.trim().is_empty() {
             let storage_base_url = context.storage_base_url.clone();
@@ -476,27 +474,39 @@ pub async fn process_agent_turns(
             })
             .await;
 
-            match selection {
-                Ok(Ok(names)) if !names.is_empty() => {
-                    write_log(log_file, "visible_tools", &format!("{:?}", names))?;
-                    eprintln!("🔧 visible_tools (agent {}): {:?}", config.name, names);
-                    engine.set_visible_tools(names);
-                }
-                Ok(Ok(_)) => {
-                    eprintln!(
-                        "🔧 visible_tools (agent {}): пусто — слоты не трогаем",
-                        config.name
-                    );
-                }
+            let mut final_names = match selection {
+                Ok(Ok(names)) => names,
                 Ok(Err(e)) => {
                     eprintln!("⚠️ select_tools (agent {}) failed: {:#}", config.name, e);
+                    Vec::new()
                 }
                 Err(e) => {
                     eprintln!(
                         "⚠️ select_tools (agent {}) join error: {:#}",
                         config.name, e
                     );
+                    Vec::new()
                 }
+            };
+
+            for name in mentioned {
+                if !final_names.contains(&name) {
+                    final_names.push(name);
+                }
+            }
+
+            if !final_names.is_empty() {
+                write_log(log_file, "visible_tools", &format!("{:?}", final_names))?;
+                eprintln!(
+                    "🔧 visible_tools (agent {}): {:?}",
+                    config.name, final_names
+                );
+                engine.set_visible_tools(final_names);
+            } else {
+                eprintln!(
+                    "🔧 visible_tools (agent {}): пусто — слоты не трогаем",
+                    config.name
+                );
             }
         }
     }
@@ -630,9 +640,13 @@ pub async fn process_agent_turns(
             );
         } else {
             let engine_config = build_engine_config(config);
+            let prompt_for_metadata = engine.search_context_text_short().unwrap_or_default();
             let (skill_name, skill_description) =
-                match crate::skill_manager::generate_skill_metadata(&engine_config, &request.prompt)
-                    .await
+                match crate::skill_manager::generate_skill_metadata(
+                    &engine_config,
+                    &prompt_for_metadata,
+                )
+                .await
                 {
                     Ok(meta) => meta,
                     Err(e) => {
@@ -657,7 +671,7 @@ pub async fn process_agent_turns(
                 let storage_base_url = context.storage_base_url.clone();
                 let storage_auth_token = context.storage_auth_token.clone();
                 let agent_name = config.name.clone();
-                let prompt = request.prompt.clone();
+                let prompt = engine.search_context_text_short().unwrap_or_default();
                 let skill_name_for_log = skill_name.clone();
 
                 let skill_phrases_top_n = config.skill_phrases_top_n.unwrap_or(15);

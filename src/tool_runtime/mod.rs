@@ -192,4 +192,36 @@ mod tests {
             agent_call_timeout_sec: 5,
         }
     }
+
+    #[test]
+    fn descriptions_must_not_mention_other_tools() {
+        let tools = all();
+        let names: Vec<&'static str> = tools.iter().map(|t| t.name()).collect();
+
+        let mut violations: Vec<(String, Vec<String>)> = Vec::new();
+        for tool in &tools {
+            let desc = tool.description();
+            let conflicts: Vec<String> = names
+                .iter()
+                .filter(|n| **n != tool.name() && desc.contains(**n))
+                .map(|n| n.to_string())
+                .collect();
+            if !conflicts.is_empty() {
+                violations.push((tool.name().to_string(), conflicts));
+            }
+        }
+
+        if !violations.is_empty() {
+            let mut msg = String::from(
+                "Описания тулзов не должны упоминать имена других тулзов.\n\
+                 Модель видит эти описания и попробует вызвать упомянутый тулз.\n\
+                 Если его нет в API-запросе — провайдер падает с BAD_GATEWAY.\n\n\
+                 Нарушения:\n",
+            );
+            for (tool, conflicts) in &violations {
+                msg.push_str(&format!("  {} -> {:?}\n", tool, conflicts));
+            }
+            panic!("{}", msg);
+        }
+    }
 }

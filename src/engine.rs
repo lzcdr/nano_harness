@@ -215,6 +215,17 @@ pub struct ChatEngine {
     pub on_tool_call_token: Option<Box<dyn Fn(&str) + Send + Sync>>,
 }
 
+fn push_msg_into(buf: &mut String, m: &Message) {
+    if let Some(c) = &m.content {
+        buf.push_str(c);
+        buf.push('\n');
+    }
+    if let Some(r) = &m.reasoning {
+        buf.push_str(r);
+        buf.push('\n');
+    }
+}
+
 impl ChatEngine {
     pub fn new(config: EngineConfig, client: Client) -> Self {
         Self {
@@ -304,23 +315,109 @@ impl ChatEngine {
         self.visible_tools.as_deref()
     }
 
-    /// Текст текущего хода: сообщения `User` и `Assistant` из `pending_turn`.
-    /// Возвращает None, если ход пуст или содержит только tool-сообщения.
-    pub fn pending_turn_text(&self) -> Option<String> {
+    /// Возвращает имена тулзов из `candidates`, которые упомянуты
+    /// в текущем контексте (system, скилл, знание, prefix/tail/pending,
+    /// content и reasoning). Используется для безусловного добавления
+    /// в visible_tools — например, если скилл в инструкции вызывает
+    /// storage_write_file, а он не прошёл отбор по score.
+    pub fn mentioned_tools(&self, candidates: &[String]) -> Vec<String> {
+        let mut buf = String::new();
+
+        for m in &self.system_messages {
+            push_msg_into(&mut buf, m);
+        }
+        if let Some(m) = &self.skill_context {
+            push_msg_into(&mut buf, m);
+        }
+        if let Some(m) = &self.knowledge_context {
+            push_msg_into(&mut buf, m);
+        }
+        for t in &self.prefix_turns {
+            for m in &t.messages {
+                push_msg_into(&mut buf, m);
+            }
+        }
+        for t in &self.tail_turns {
+            for m in &t.messages {
+                push_msg_into(&mut buf, m);
+            }
+        }
+        if let Some(t) = &self.pending_turn {
+            for m in &t.messages {
+                push_msg_into(&mut buf, m);
+            }
+        }
+
+        candidates
+            .iter()
+            .filter(|n| buf.contains(n.as_str()))
+            .cloned()
+            .collect()
+    }
+
+    // Единая точка входа для текста, по которому ищутся скиллы, знания
+    // и тулзы. Сейчас делегирует в `search_context_text_short`. Чтобы
+    // сменить стратегию — правится только тело этого метода.
+    //pub fn search_context_text(&self) -> Option<String> {
+    //    self.search_context_text_short()
+    //}
+
+    /// Текст только текущего хода: user-сообщения из `pending_turn`.
+    /// Ассистентские реплики текущего хода не включаются — на момент
+    /// вызова их ещё нет.
+    pub fn search_context_text_short(&self) -> Option<String> {
         let turn = self.pending_turn.as_ref()?;
         let mut parts: Vec<String> = Vec::new();
         for msg in &turn.messages {
-            match msg.role {
-                Role::User | Role::Assistant => {
+            if msg.role == Role::User {
+                if let Some(c) = &msg.content {
+                    if !c.trim().is_empty() {
+                        parts.push(c.clone());
+                    }
+                }
+            }
+        }
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join("\n\n"))
+        }
+    }
+
+    /// Расширенный текст для поиска: последний непустой ответ ассистента
+    /// из последнего завершённого хода + текущий user из `pending_turn`.
+    pub fn search_context_text_full(&self) -> Option<String> {
+        let mut parts: Vec<String> = Vec::new();
+
+        // Последний завершённый turn — tail, а если tail пуст, то prefix.
+        let last_finished = self.tail_turns.last().or_else(|| self.prefix_turns.last());
+
+        if let Some(turn) = last_finished {
+            for msg in turn.messages.iter().rev() {
+                if msg.role == Role::Assistant {
+                    if let Some(c) = &msg.content {
+                        if !c.trim().is_empty() {
+                            parts.push(c.clone());
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Текущий user.
+        if let Some(turn) = &self.pending_turn {
+            for msg in &turn.messages {
+                if msg.role == Role::User {
                     if let Some(c) = &msg.content {
                         if !c.trim().is_empty() {
                             parts.push(c.clone());
                         }
                     }
                 }
-                _ => {}
             }
         }
+
         if parts.is_empty() {
             None
         } else {
