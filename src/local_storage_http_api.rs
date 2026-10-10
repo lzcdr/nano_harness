@@ -130,6 +130,15 @@ impl FileStorage {
             tokio::fs::create_dir_all(&dir).await?;
         }
         Self::ensure_system_files(&dir)?;
+
+        let dst = dir.join(".storageignore");
+        if !dst.exists() {
+            if let Some(src) = crate::storage_ignore::global_ignore_path() {
+                if src.exists() {
+                    let _ = tokio::fs::copy(&src, &dst).await;
+                }
+            }
+        }
         Ok(())
     }
 
