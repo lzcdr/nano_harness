@@ -16,6 +16,7 @@ pub mod message_board;
 pub mod rebuke_manager;
 pub mod session_store;
 pub mod skill_manager;
+pub mod storage_ignore;
 pub mod tool_runtime;
 pub mod tool_search;
 pub mod yake;

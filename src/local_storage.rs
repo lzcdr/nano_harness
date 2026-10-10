@@ -24,6 +24,7 @@ const RESERVED_NAMES: &[&str] = &[
     ".rebukes",
     ".knowledge",
     ".tools",
+    ".storageignore",
     META_FILE,
 ];
 pub const SKILLS_PROJECT: &str = "_skills";
@@ -504,27 +505,33 @@ impl VectorDb {
 
         let projects_root = root.join(PROJECTS_DIR);
         if projects_root.exists() {
-            let mut files = Vec::new();
-            collect_files(&projects_root, &mut files)?;
-            for file in files {
-                let rel_to_root = match file.strip_prefix(root) {
-                    Ok(p) => p.to_path_buf(),
-                    Err(_) => continue,
-                };
-                let mut comps = rel_to_root.components();
-                if comps.next().map(|c| c.as_os_str()) != Some(std::ffi::OsStr::new(PROJECTS_DIR)) {
+            for entry in fs::read_dir(&projects_root)? {
+                let entry = entry?;
+                if !entry.file_type()?.is_dir() {
                     continue;
                 }
-                let project_id = match comps.next().and_then(|c| c.as_os_str().to_str()) {
-                    Some(s) => s.to_string(),
-                    None => continue,
-                };
-                let user_rel: PathBuf = comps.collect();
-                if user_rel.as_os_str().is_empty() {
+                let project_dir = entry.path();
+                let project_id = entry.file_name().to_string_lossy().to_string();
+                if !valid_project_id(&project_id) {
                     continue;
                 }
-                if let Ok(content) = fs::read_to_string(&file) {
-                    self.index_text(&project_id, &user_rel, &content)?;
+                let ignore =
+                    crate::storage_ignore::StorageIgnore::load(&project_dir.join(".storageignore"))
+                        .unwrap_or_else(|_| crate::storage_ignore::StorageIgnore::empty());
+
+                let mut files = Vec::new();
+                collect_files_filtered(&project_dir, &project_dir, &ignore, &mut files)?;
+                for file in files {
+                    let user_rel = match file.strip_prefix(&project_dir) {
+                        Ok(p) => p.to_path_buf(),
+                        Err(_) => continue,
+                    };
+                    if user_rel.as_os_str().is_empty() {
+                        continue;
+                    }
+                    if let Ok(content) = fs::read_to_string(&file) {
+                        self.index_text(&project_id, &user_rel, &content)?;
+                    }
                 }
             }
         }
@@ -677,6 +684,8 @@ fn chunk_text(text: &str, chunk_size: usize, overlap: usize) -> Vec<(String, u64
     chunks
 }
 
+/// Обход без фильтра. Используется для .skills/.knowledge/.tools,
+/// где .storageignore не применяется.
 fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) -> io::Result<()> {
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
@@ -694,6 +703,34 @@ fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) -> io::Result<()> {
     Ok(())
 }
 
+/// Обход с фильтром. `base` — корень, от которого считаем rel_path
+/// (совпадает с `dir` на первом вызове; для рекурсии передаётся исходный).
+fn collect_files_filtered(
+    base: &Path,
+    dir: &Path,
+    ignore: &crate::storage_ignore::StorageIgnore,
+    out: &mut Vec<PathBuf>,
+) -> io::Result<()> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name == META_FILE {
+            continue;
+        }
+        let rel = path.strip_prefix(base).unwrap_or(&path);
+        if ignore.is_ignored(rel) {
+            continue;
+        }
+        if path.is_dir() {
+            collect_files_filtered(base, &path, ignore, out)?;
+        } else {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
+
 pub struct LocalStorage {
     root: PathBuf,
     vector_db: VectorDb,
@@ -702,6 +739,14 @@ pub struct LocalStorage {
 impl LocalStorage {
     pub fn new(storage_name: &str, vector_db_config: VectorDbConfig) -> io::Result<Self> {
         let base = PathBuf::from(STORAGE_BASE);
+
+        if let Err(e) = crate::storage_ignore::ensure_global_ignore() {
+            eprintln!(
+                "⚠️ storage_ignore: не удалось создать глобальный .storageignore: {}",
+                e
+            );
+        }
+
         if !base.exists() {
             fs::create_dir_all(&base)?;
         }
@@ -743,6 +788,22 @@ impl LocalStorage {
             fs::create_dir_all(&dir)?;
         }
         Self::ensure_system_files(&dir)?;
+        Self::ensure_project_ignore(&dir)?;
+        Ok(())
+    }
+
+    /// Копирует глобальный .storageignore в проект, если своего нет.
+    fn ensure_project_ignore(project_dir: &Path) -> io::Result<()> {
+        let dst = project_dir.join(".storageignore");
+        if dst.exists() {
+            return Ok(());
+        }
+        if let Some(src) = crate::storage_ignore::global_ignore_path() {
+            if src.exists() {
+                fs::copy(&src, &dst)?;
+                return Ok(());
+            }
+        }
         Ok(())
     }
 
@@ -972,8 +1033,11 @@ impl LocalStorage {
     pub fn walk(&self, project_id: &str, path: &str) -> io::Result<Vec<Entry>> {
         let full = self.resolve(project_id, path)?;
         let project_root = self.root.join(PROJECTS_DIR).join(project_id);
+        let ignore =
+            crate::storage_ignore::StorageIgnore::load(&project_root.join(".storageignore"))
+                .unwrap_or_else(|_| crate::storage_ignore::StorageIgnore::empty());
         let mut result = Vec::new();
-        self.recursive_walk(&project_root, &full, &mut result)?;
+        self.recursive_walk(&project_root, &full, &ignore, &mut result)?;
         Ok(result)
     }
 
@@ -981,6 +1045,7 @@ impl LocalStorage {
         &self,
         project_root: &Path,
         base: &Path,
+        ignore: &crate::storage_ignore::StorageIgnore,
         out: &mut Vec<Entry>,
     ) -> io::Result<()> {
         for entry in fs::read_dir(base)? {
@@ -994,9 +1059,12 @@ impl LocalStorage {
                 .strip_prefix(project_root)
                 .unwrap_or(&path)
                 .to_path_buf();
+            if ignore.is_ignored(&rel) {
+                continue;
+            }
             if entry.file_type()?.is_dir() {
                 out.push(Entry::Dir { name, path: rel });
-                self.recursive_walk(project_root, &path, out)?;
+                self.recursive_walk(project_root, &path, ignore, out)?;
             } else {
                 out.push(Entry::File {
                     name,
@@ -1135,27 +1203,34 @@ impl LocalStorage {
 
         let projects_root = self.root.join(PROJECTS_DIR);
         if projects_root.exists() {
-            let mut files = Vec::new();
-            collect_files(&projects_root, &mut files)?;
-            for file in files {
-                let storage_rel = match file.strip_prefix(&self.root) {
-                    Ok(p) => p.to_path_buf(),
-                    Err(_) => continue,
-                };
-                let mut comps = storage_rel.components();
-                if comps.next().map(|c| c.as_os_str()) != Some(std::ffi::OsStr::new(PROJECTS_DIR)) {
+            for entry in fs::read_dir(&projects_root)? {
+                let entry = entry?;
+                if !entry.file_type()?.is_dir() {
                     continue;
                 }
-                let project_id = match comps.next().and_then(|c| c.as_os_str().to_str()) {
-                    Some(s) => s.to_string(),
-                    None => continue,
-                };
-                let rel_path: PathBuf = comps.collect();
-                if rel_path.as_os_str().is_empty() {
+                let project_dir = entry.path();
+                let project_id = entry.file_name().to_string_lossy().to_string();
+                if !valid_project_id(&project_id) {
                     continue;
                 }
-                if let Some(entry) = make_disk_entry(&file, project_id, rel_path) {
-                    out.insert(storage_rel, entry);
+                let ignore =
+                    crate::storage_ignore::StorageIgnore::load(&project_dir.join(".storageignore"))
+                        .unwrap_or_else(|_| crate::storage_ignore::StorageIgnore::empty());
+
+                let mut files = Vec::new();
+                collect_files_filtered(&project_dir, &project_dir, &ignore, &mut files)?;
+                for file in files {
+                    let rel_path = match file.strip_prefix(&project_dir) {
+                        Ok(p) => p.to_path_buf(),
+                        Err(_) => continue,
+                    };
+                    if rel_path.as_os_str().is_empty() {
+                        continue;
+                    }
+                    let storage_rel = Path::new(PROJECTS_DIR).join(&project_id).join(&rel_path);
+                    if let Some(e) = make_disk_entry(&file, project_id.clone(), rel_path) {
+                        out.insert(storage_rel, e);
+                    }
                 }
             }
         }
@@ -1310,6 +1385,7 @@ mod tests {
         assert!(is_reserved_name(".rebukes"));
         assert!(is_reserved_name(".knowledge"));
         assert!(is_reserved_name("vector_meta.json"));
+        assert!(is_reserved_name(".storageignore"));
     }
 
     #[test]
@@ -1405,7 +1481,6 @@ mod tests {
     fn chunk_text_overlap_zero_no_overlap() {
         let text = "a b c d e f g h i j k l m n o p q r s t ".repeat(10);
         let chunks = chunk_text(&text, 20, 0);
-        // С нулевым overlap каждая позиция start должна быть больше предыдущей end
         assert!(chunks.len() > 1);
     }
 }
