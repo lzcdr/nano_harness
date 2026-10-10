@@ -43,6 +43,10 @@ async fn main() -> anyhow::Result<()> {
         agent_config.max_cost_rub = config.max_cost_rub;
     }
 
+    if agent_config.timeout_sec.is_none() {
+        agent_config.timeout_sec = config.timeout_sec;
+    }
+
     if agent_config.vector_db_top_k.is_none() {
         agent_config.vector_db_top_k = config.vector_db.as_ref().map(|v| v.top_k);
     }
@@ -113,7 +117,7 @@ async fn main() -> anyhow::Result<()> {
         storage_config.bind_addr.clone(),
         storage_config.auth_token.clone(),
         storage_root_path,
-        agent_config.timeout_sec,
+        agent_config.timeout_sec.unwrap_or(60),
         Some(agent_config.name.clone()),
         agent_call_timeout,
         board_url,

@@ -33,6 +33,7 @@ pub struct TomlConfig {
     pub tail_message_count: Option<usize>,
     pub max_iterations: Option<usize>,
     pub system_prompt: Option<String>,
+    pub timeout_sec: Option<u64>,
 
     // Авто-инжект знаний в контекст (чат и агенты).
     pub knowledge_auto_top_n: Option<usize>,
