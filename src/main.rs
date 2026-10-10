@@ -70,8 +70,8 @@ struct Args {
     )]
     config_path: PathBuf,
 
-    #[arg(long, default_value = "60", help = "Таймаут HTTP в секундах")]
-    timeout_sec: u64,
+    #[arg(long, help = "Таймаут HTTP в секундах (переопределяет config.toml)")]
+    timeout_sec: Option<u64>,
 
     #[arg(
         long,
@@ -789,8 +789,10 @@ async fn main() -> Result<()> {
         &toml_config,
     )?;
 
+    let timeout_sec = args.timeout_sec.or(toml_config.timeout_sec).unwrap_or(60);
+
     let client = Client::builder()
-        .timeout(Duration::from_secs(args.timeout_sec))
+        .timeout(Duration::from_secs(timeout_sec))
         .build()?;
 
     let base_system_prompt = args

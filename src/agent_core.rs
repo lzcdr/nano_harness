@@ -55,7 +55,8 @@ pub struct AgentConfig {
     pub name: String,
     pub bind_addr: String,
     pub auth_token: String,
-    pub timeout_sec: u64,
+    #[serde(default)]
+    pub timeout_sec: Option<u64>,
     pub max_iterations: usize,
     pub tools: Vec<String>,
     pub system_prompt: Option<String>,
@@ -258,7 +259,7 @@ pub fn build_engine_config(config: &AgentConfig) -> EngineConfig {
 pub fn create_agent_engine(config: &AgentConfig) -> Result<ChatEngine> {
     let engine_config = build_engine_config(config);
     let client = Client::builder()
-        .timeout(Duration::from_secs(config.timeout_sec))
+        .timeout(Duration::from_secs(config.timeout_sec.unwrap_or(60)))
         .build()
         .context("Failed to create HTTP client")?;
     let mut engine = ChatEngine::new(engine_config, client);
@@ -528,9 +529,12 @@ pub async fn process_agent_turns(
     // ==================== Цикл LLM ====================
     for _ in 0..=max_iterations {
         eprint!("💭 ");
-        let response = timeout(Duration::from_secs(config.timeout_sec), engine.send())
-            .await
-            .map_err(|_| anyhow::anyhow!("Agent timed out"))??;
+        let response = timeout(
+            Duration::from_secs(config.timeout_sec.unwrap_or(60)),
+            engine.send(),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("Agent timed out"))??;
 
         let has_tool_calls = response.tool_calls.is_some();
         if has_tool_calls {
@@ -851,7 +855,7 @@ mod tests {
             name: "test".into(),
             bind_addr: "127.0.0.1:0".into(),
             auth_token: String::new(),
-            timeout_sec: 60,
+            timeout_sec: Some(60),
             max_iterations: 3,
             tools: vec!["storage_read_file".into()],
             system_prompt: None,
