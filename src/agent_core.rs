@@ -511,6 +511,20 @@ pub async fn process_agent_turns(
         }
     }
 
+    // ==================== Сохранение после фазы поиска ====================
+    if let Some(ref sid) = session_id {
+        if let Ok(mut store_session) = crate::session_store::load_session(sid, Some(&config.name)) {
+            store_session.context = Some(crate::session_store::ContextBlock {
+                engine_config: engine.get_config().clone(),
+                engine_state: engine.get_state(),
+            });
+            store_session.updated_at = crate::session_store::now_ts();
+            if let Err(e) = crate::session_store::save_session(&store_session) {
+                eprintln!("⚠️ save after search phase: {}", e);
+            }
+        }
+    }
+
     // ==================== Цикл LLM ====================
     for _ in 0..=max_iterations {
         eprint!("💭 ");

@@ -290,6 +290,7 @@ fn open_project(
                     }],
                     skill_context: None,
                     knowledge_context: None,
+                    visible_tools: vec![],
                     prefix_turns: vec![],
                     tail_turns: vec![],
                     pending_turn: None,
@@ -627,6 +628,14 @@ async fn continue_chat_turn(shared: &SharedChat, ctx: &ReplyContext) {
         if !final_names.is_empty() {
             let mut rt = shared.lock().await;
             rt.engine.set_visible_tools(final_names);
+        }
+    }
+
+    // ==================== Сохранение после фазы поиска ====================
+    {
+        let mut rt = shared.lock().await;
+        if let Err(e) = save_current(&mut *rt) {
+            eprintln!("⚠️ save after search phase: {}", e);
         }
     }
 
@@ -2024,6 +2033,14 @@ async fn main() -> Result<()> {
                 rt.engine.set_visible_tools(final_names);
             } else {
                 eprintln!("🔧 visible_tools: пусто — слоты не трогаем");
+            }
+        }
+
+        // ==================== Сохранение после фазы поиска ====================
+        {
+            let mut rt = shared.lock().await;
+            if let Err(e) = save_current(&mut *rt) {
+                eprintln!("⚠️ save after search phase: {}", e);
             }
         }
 
