@@ -623,6 +623,20 @@ async fn handle_task_result(
         eprintln!("Ошибка записи в лог: {}", e);
     }
 
+    // Сохранить сессию сразу после добавления ответа агента в контекст.
+    {
+        if let Ok(mut store) = session_store::load_session(&session_id, Some(&state.config.name)) {
+            store.context = Some(ContextBlock {
+                engine_config: guard.engine.get_config().clone(),
+                engine_state: guard.engine.get_state(),
+            });
+            store.updated_at = session_store::now_ts();
+            if let Err(e) = session_store::save_session(&store) {
+                eprintln!("Ошибка сохранения сессии после ответа агента: {}", e);
+            }
+        }
+    }
+
     let request = AgentRequest {
         prompt: String::new(),
         max_iterations: None,

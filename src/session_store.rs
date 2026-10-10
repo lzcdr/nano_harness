@@ -25,6 +25,8 @@ pub struct EngineState {
     pub skill_context: Option<Message>,
     #[serde(default)]
     pub knowledge_context: Option<Message>,
+    #[serde(default)]
+    pub visible_tools: Vec<String>,
     pub prefix_turns: Vec<Turn>,
     pub tail_turns: Vec<Turn>,
     pub pending_turn: Option<Turn>,

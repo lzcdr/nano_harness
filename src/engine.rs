@@ -1054,6 +1054,7 @@ impl ChatEngine {
             system_messages: self.system_messages.clone(),
             skill_context: self.skill_context.clone(),
             knowledge_context: self.knowledge_context.clone(),
+            visible_tools: self.visible_tools.clone().unwrap_or_default(),
             prefix_turns: self.prefix_turns.clone(),
             tail_turns: self.tail_turns.clone(),
             pending_turn: self.pending_turn.clone(),
@@ -1065,6 +1066,11 @@ impl ChatEngine {
         self.system_messages = state.system_messages;
         self.skill_context = state.skill_context;
         self.knowledge_context = state.knowledge_context;
+        self.visible_tools = if state.visible_tools.is_empty() {
+            None
+        } else {
+            Some(state.visible_tools)
+        };
         self.prefix_turns = state.prefix_turns;
         self.tail_turns = state.tail_turns;
         self.pending_turn = state.pending_turn;
